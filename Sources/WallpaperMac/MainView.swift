@@ -130,7 +130,7 @@ final class LibraryViewModel: ObservableObject {
     private var undoOperation: (() -> Void)?
     private var metadataEnrichmentTask: Task<Void, Never>?
     private var metadataEnrichmentGeneration = 0
-    private static let pageSize = 48
+    private static let pageSize = WallpaperLibraryPagination.defaultPageSize
 
     init() {
         let defaults = UserDefaults.standard

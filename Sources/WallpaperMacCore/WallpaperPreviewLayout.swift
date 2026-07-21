@@ -18,7 +18,7 @@ public enum WallpaperPreviewLayout {
 
 
 public enum WallpaperLibraryPagination {
-    public static let defaultPageSize = 48
+    public static let defaultPageSize = 20
 
     public static func page<Item>(from items: [Item], loadedCount: Int, pageSize: Int = defaultPageSize) -> [Item] {
         guard !items.isEmpty else { return [] }

@@ -557,12 +557,18 @@ func testLegacyPlaybackQueueWithoutVideoCompletionSettingDecodes() throws {
 
 func testWallpaperLibraryPaginationUsesSamePageContractForGroups() throws {
     let items = Array(1...100)
+    try expect(WallpaperLibraryPagination.defaultPageSize, equals: 20, "library and group pages should share a 20-item default page size")
     let firstPage = WallpaperLibraryPagination.page(from: items, loadedCount: 0)
-    try expect(firstPage.count, equals: 48, "library pages should load 48 items initially")
+    try expect(firstPage.count, equals: 20, "library pages should load 20 items initially")
     let secondCount = WallpaperLibraryPagination.nextLoadedCount(currentCount: firstPage.count, totalCount: items.count)
     let secondPage = WallpaperLibraryPagination.page(from: items, loadedCount: secondCount)
-    try expect(secondPage.count, equals: 96, "group pages should load the same next page size as the library")
-    try expect(WallpaperLibraryPagination.nextLoadedCount(currentCount: secondPage.count, totalCount: items.count), equals: 100, "pagination should clamp the final page")
+    try expect(secondPage.count, equals: 40, "group pages should load the same next page size as the library")
+    let thirdCount = WallpaperLibraryPagination.nextLoadedCount(currentCount: secondPage.count, totalCount: items.count)
+    try expect(thirdCount, equals: 60, "pagination should advance by 20 items per page")
+    let finalCount = (0..<2).reduce(thirdCount) { count, _ in
+        WallpaperLibraryPagination.nextLoadedCount(currentCount: count, totalCount: items.count)
+    }
+    try expect(finalCount, equals: 100, "pagination should clamp the final page")
 }
 
 func testWallpaperPreviewUsesLandscapeSixteenByNineLayout() throws {
