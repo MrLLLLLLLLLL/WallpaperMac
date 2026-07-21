@@ -1,0 +1,12 @@
+# Normalize text files while preserving platform-specific generated assets.
+* text=auto eol=lf
+*.sh text eol=lf
+*.swift text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.plist text eol=lf
+*.icns binary
+*.dmg binary
+*.zip binary
+*.app binary

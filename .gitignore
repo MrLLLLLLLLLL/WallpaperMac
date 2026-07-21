@@ -1,0 +1,40 @@
+# macOS Finder metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Swift Package Manager and Xcode build products
+.build/
+build/
+.swiftpm/
+DerivedData/
+*.xcworkspace/
+*.xcodeproj/
+WallpaperMac.xcworkspace
+xcuserdata/
+*.xcuserstate
+*.moved-aside
+*.xcscmblueprint
+
+# Coverage, profiling and diagnostic output
+*.profdata
+*.profraw
+*.gcda
+*.gcno
+*.dSYM
+*.dSYM.zip
+*.log
+
+# Release artifacts and local package staging
+dist/
+
+# Local application data accidentally placed in the checkout
+WallpaperMac Library/
+wallpapers.json
+display-assignments.json
+wallpaper-groups.json
+display-queues.json
+playback-queues.json
+display-playback-bindings.json
+Thumbnails/

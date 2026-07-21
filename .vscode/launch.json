@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:WallpaperMac}",
+            "name": "Debug WallpaperMac",
+            "target": "WallpaperMac",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug WallpaperMac"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:WallpaperMac}",
+            "name": "Release WallpaperMac",
+            "target": "WallpaperMac",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release WallpaperMac"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:WallpaperMac}",
+            "name": "Debug WallpaperMacCoreTests",
+            "target": "WallpaperMacCoreTests",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug WallpaperMacCoreTests"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:WallpaperMac}",
+            "name": "Release WallpaperMacCoreTests",
+            "target": "WallpaperMacCoreTests",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release WallpaperMacCoreTests"
+        }
+    ]
+}
