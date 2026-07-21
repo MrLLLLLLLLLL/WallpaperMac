@@ -135,6 +135,7 @@ private struct SettingsView: View {
         notifySettingsChanged()
     }
 
+    @MainActor
     private func updateLaunchAtLogin(_ enabled: Bool) {
         do {
             try LoginItemService.setEnabled(enabled)
