@@ -222,7 +222,6 @@ GitHub Actions 在 macOS runner 上自动验证网页模板、`swift build` 和 
 
 ```text
 WallpaperMac/
-├── .github/                         # CI、Issue 表单与 Pull Request 模板
 ├── Assets/                          # 应用图标与品牌资源
 ├── Sources/
 │   ├── WallpaperMac/                # SwiftUI + AppKit 应用层、窗口和播放器承载
@@ -244,7 +243,18 @@ WallpaperMac/
 └── VERSION                          # 当前版本号
 ```
 
-`dist/`、`.build/`、Finder 元数据、用户壁纸索引和日志被 `.gitignore` 排除。项目尚未声明开源许可证；在将仓库公开发布或接受外部代码前，请由项目所有者选择并添加适当的 `LICENSE`。
+`dist/`、`.build/`、Finder 元数据、用户壁纸索引、日志以及本地编辑器配置被 `.gitignore` 排除。
+
+## 许可证
+
+WallpaperMac 采用 [GNU General Public License v3.0 或更高版本（GPL-3.0-or-later）](LICENSE) 发布。
+
+- 允许个人、组织和商业用途使用、修改与分发本项目。
+- 当你**分发**基于 WallpaperMac 修改、或包含其受 GPL 覆盖代码的衍生作品时，必须以 GPL-3.0-or-later 发布，并向接收者提供与分发版本对应的完整源代码。
+- 仅在组织内部私下使用的修改版本不构成对外分发；GPL 的源码提供义务在分发时触发。
+- 本项目自身的许可证不改变第三方依赖、图标、壁纸素材或用户导入资源各自的许可证。
+
+贡献者向本仓库提交代码，即表示其同意该贡献可按 GPL-3.0-or-later 条款随本项目发布。
 
 ## 文档与支持
 
@@ -256,4 +266,4 @@ WallpaperMac/
 - [安全政策](SECURITY.md)
 - [更新记录](CHANGELOG.md)
 
-遇到问题时，请使用 GitHub 的 Bug Report 模板，提供 WallpaperMac 版本、macOS 版本、素材类型、导入方式和最小复现步骤。请不要上传私人壁纸、完整用户目录、Cookie、Token、证书或其他敏感信息。
+遇到问题时，请通过 GitHub Issue 提供 WallpaperMac 版本、macOS 版本、素材类型、导入方式和最小复现步骤。请不要上传私人壁纸、完整用户目录、Cookie、Token、证书或其他敏感信息。

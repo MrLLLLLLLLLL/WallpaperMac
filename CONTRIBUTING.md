@@ -2,6 +2,8 @@
 
 感谢你愿意改进 WallpaperMac。本仓库是一个 macOS 13+ 的 Swift Package：UI 层使用 SwiftUI 与 AppKit，核心数据模型和存储逻辑位于独立的 `WallpaperMacCore` Target。提交前请先熟悉 [README](README.md)、[开发与发布指南](docs/development/build-and-release.md) 和现有发布说明。
 
+本项目采用 [GPL-3.0-or-later](LICENSE)。向本仓库提交代码即表示你确认自己有权提交该内容，并同意该贡献按同一许可证随项目发布。
+
 ## 开始前
 
 1. 阅读现有 Issue，避免重复工作；新增功能请先说明具体的本地壁纸工作流和边界。

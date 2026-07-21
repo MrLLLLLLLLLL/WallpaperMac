@@ -38,3 +38,18 @@ display-queues.json
 playback-queues.json
 display-playback-bindings.json
 Thumbnails/
+
+# Local editor, IDE, task and environment files
+.vscode/
+.github/
+.idea/
+.fleet/
+plan.md
+*.code-workspace
+*.swp
+*.swo
+*.tmp
+*.bak
+.env
+.env.*
+!.env.example
