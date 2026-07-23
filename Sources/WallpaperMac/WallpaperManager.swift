@@ -1211,7 +1211,8 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
             layer?.addSublayer(imageLayer)
             self.imageLayer = imageLayer
         case .video:
-            let player = AVPlayer(url: item.sourceURL)
+            let playbackURL = item.playbackURL ?? item.sourceURL
+            let player = AVPlayer(url: playbackURL)
             let playerLayer = AVPlayerLayer(player: player)
             playerLayer.videoGravity = videoGravity
             layer?.addSublayer(playerLayer)

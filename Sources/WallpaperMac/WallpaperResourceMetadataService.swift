@@ -7,7 +7,17 @@ import WallpaperMacCore
 struct WallpaperResourceMetadataService {
     static func enrich(item: WallpaperItem, libraryURL: URL) async -> WallpaperItem? {
         guard item.availability == .available else { return nil }
-        let fileURL = item.type == .web ? (item.entryURL ?? item.sourceURL) : item.sourceURL
+        let fileURL: URL
+        switch item.type {
+        case .web:
+            fileURL = item.entryURL ?? item.sourceURL
+        case .video:
+            // Use the app-managed compatible copy when the original uses a
+            // HEVC `hev1` sample entry that AVFoundation cannot decode here.
+            fileURL = item.playbackURL ?? item.sourceURL
+        case .image:
+            fileURL = item.sourceURL
+        }
         guard FileManager.default.isReadableFile(atPath: fileURL.path) else { return nil }
 
         var updated = item

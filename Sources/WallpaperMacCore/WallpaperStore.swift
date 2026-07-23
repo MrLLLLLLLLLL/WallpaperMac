@@ -282,52 +282,57 @@ public final class WallpaperStore {
             storedURL = sourceURL
         }
 
-        let resolvedEntryURL: URL?
-        if type == .web {
-            let selectedEntry = entryURL ?? webEntryURL(for: sourceURL)
-            let entryValidationRoot = storageMode == .managedCopy ? managedCopySourceURL : sourceURL
-            guard let selectedEntry,
-                  isValidWebEntry(selectedEntry, for: entryValidationRoot) else {
-                if storageMode == .managedCopy, fileManager.fileExists(atPath: storedURL.path) {
-                    try? fileManager.removeItem(at: storedURL)
-                }
-                throw WallpaperStoreError.invalidHTMLEntry(sourceURL)
-            }
-            let relativePath = relativePath(of: selectedEntry, to: entryValidationRoot)
-            let candidateURL = storageMode == .managedCopy
-                ? storedURL.appendingPathComponent(relativePath)
-                : selectedEntry
-            guard fileManager.fileExists(atPath: candidateURL.path),
-                  fileManager.isReadableFile(atPath: candidateURL.path) else {
-                if storageMode == .managedCopy, fileManager.fileExists(atPath: storedURL.path) {
-                    try? fileManager.removeItem(at: storedURL)
-                }
-                throw WallpaperStoreError.invalidHTMLEntry(selectedEntry)
-            }
-            resolvedEntryURL = candidateURL
-        } else {
-            resolvedEntryURL = nil
-        }
-
-        let item = WallpaperItem(
-            id: id,
-            name: displayName(for: sourceURL),
-            type: type,
-            sourceURL: storedURL,
-            entryURL: resolvedEntryURL,
-            storageMode: storageMode
-        )
-        var currentItems = try items()
-        currentItems.append(item)
+        var playbackURL: URL?
         do {
+            let resolvedEntryURL: URL?
+            if type == .web {
+                let selectedEntry = entryURL ?? webEntryURL(for: sourceURL)
+                let entryValidationRoot = storageMode == .managedCopy ? managedCopySourceURL : sourceURL
+                guard let selectedEntry,
+                      isValidWebEntry(selectedEntry, for: entryValidationRoot) else {
+                    throw WallpaperStoreError.invalidHTMLEntry(sourceURL)
+                }
+                let relativePath = relativePath(of: selectedEntry, to: entryValidationRoot)
+                let candidateURL = storageMode == .managedCopy
+                    ? storedURL.appendingPathComponent(relativePath)
+                    : selectedEntry
+                guard fileManager.fileExists(atPath: candidateURL.path),
+                      fileManager.isReadableFile(atPath: candidateURL.path) else {
+                    throw WallpaperStoreError.invalidHTMLEntry(selectedEntry)
+                }
+                resolvedEntryURL = candidateURL
+            } else {
+                resolvedEntryURL = nil
+            }
+
+            if type == .video {
+                playbackURL = try prepareVideoPlaybackURL(
+                    sourceURL: storedURL,
+                    itemID: id,
+                    storageMode: storageMode
+                )
+            }
+
+            let item = WallpaperItem(
+                id: id,
+                name: displayName(for: sourceURL),
+                type: type,
+                sourceURL: storedURL,
+                playbackURL: playbackURL,
+                entryURL: resolvedEntryURL,
+                storageMode: storageMode
+            )
+            var currentItems = try items()
+            currentItems.append(item)
             try save(currentItems)
+            return item
         } catch {
             if storageMode == .managedCopy, fileManager.fileExists(atPath: storedURL.path) {
                 try? fileManager.removeItem(at: storedURL)
             }
+            removePlaybackProxyIfOwned(at: playbackURL)
             throw error
         }
-        return item
     }
 
     @discardableResult
@@ -369,6 +374,7 @@ public final class WallpaperStore {
 
         var updated = item
         var copiedReplacement = false
+        var generatedPlaybackURL: URL?
         do {
             switch item.storageMode {
             case .managedCopy:
@@ -377,6 +383,18 @@ public final class WallpaperStore {
                 copiedReplacement = true
             case .externalReference:
                 updated.sourceURL = replacementURL
+            }
+
+            if item.type == .video {
+                let preparedPlaybackURL = try prepareVideoPlaybackURL(
+                    sourceURL: updated.sourceURL,
+                    itemID: item.id,
+                    storageMode: item.storageMode
+                )
+                updated.playbackURL = preparedPlaybackURL
+                if preparedPlaybackURL != item.playbackURL {
+                    generatedPlaybackURL = preparedPlaybackURL
+                }
             }
 
             // The replacement may have different dimensions, duration, or artwork.
@@ -401,10 +419,17 @@ public final class WallpaperStore {
             }
 
             updated.availability = availability(for: updated)
-            return try update(item: updated)
+            let persisted = try update(item: updated)
+            if item.playbackURL != persisted.playbackURL {
+                removePlaybackProxyIfOwned(at: item.playbackURL)
+            }
+            return persisted
         } catch {
             if copiedReplacement, fileManager.fileExists(atPath: item.sourceURL.path) {
                 try? fileManager.removeItem(at: item.sourceURL)
+            }
+            if generatedPlaybackURL != item.playbackURL {
+                removePlaybackProxyIfOwned(at: generatedPlaybackURL)
             }
             throw error
         }
@@ -425,6 +450,7 @@ public final class WallpaperStore {
                 try fileManager.removeItem(at: item.sourceURL)
             }
             removeThumbnailIfOwned(by: item)
+            removePlaybackProxyIfOwned(at: item.playbackURL)
         }
         currentItems.removeAll { selectedIDs.contains($0.id) }
         try save(currentItems)
@@ -442,6 +468,7 @@ public final class WallpaperStore {
             try fileManager.removeItem(at: item.sourceURL)
         }
         removeThumbnailIfOwned(by: item)
+        removePlaybackProxyIfOwned(at: item.playbackURL)
         try save(currentItems)
         return item
     }
@@ -450,7 +477,8 @@ public final class WallpaperStore {
     public func refreshAllAvailability() throws -> [WallpaperItem] {
         let refreshed = try items().map { item in
             var updated = item
-            updated.availability = availability(for: item)
+            try refreshVideoPlaybackURL(for: &updated)
+            updated.availability = availability(for: updated)
             return updated
         }
         try save(refreshed)
@@ -465,6 +493,7 @@ public final class WallpaperStore {
         }
 
         var refreshed = currentItems[index]
+        try refreshVideoPlaybackURL(for: &refreshed)
         refreshed.availability = availability(for: refreshed)
         currentItems[index] = refreshed
         try save(currentItems)
@@ -514,7 +543,62 @@ public final class WallpaperStore {
 
     private func ensureLibraryDirectories() throws {
         let assetsURL = libraryURL.appendingPathComponent("Assets", isDirectory: true)
+        let proxiesURL = libraryURL.appendingPathComponent("VideoProxies", isDirectory: true)
         try fileManager.createDirectory(at: assetsURL, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: proxiesURL, withIntermediateDirectories: true)
+    }
+
+    /// Prepares the URL AVFoundation should open for a video wallpaper.
+    /// Managed imports can be safely normalized in their library copy; external
+    /// references retain the original file and receive a small app-owned proxy.
+    private func prepareVideoPlaybackURL(
+        sourceURL: URL,
+        itemID: UUID,
+        storageMode: StorageMode
+    ) throws -> URL? {
+        switch storageMode {
+        case .managedCopy:
+            _ = try VideoContainerCompatibility.normalizeHVC1InPlace(at: sourceURL, fileManager: fileManager)
+            return nil
+        case .externalReference:
+            guard try VideoContainerCompatibility.needsHVC1Normalization(at: sourceURL, fileManager: fileManager) else {
+                return nil
+            }
+            let proxiesURL = libraryURL.appendingPathComponent("VideoProxies", isDirectory: true)
+            let fileExtension = sourceURL.pathExtension.isEmpty ? "mp4" : sourceURL.pathExtension
+            let proxyURL = proxiesURL.appendingPathComponent("\(itemID.uuidString).\(fileExtension)")
+            removePlaybackProxyIfOwned(at: proxyURL)
+            _ = try VideoContainerCompatibility.copyNormalizedVideo(
+                from: sourceURL,
+                to: proxyURL,
+                fileManager: fileManager
+            )
+            return proxyURL
+        }
+    }
+
+    private func refreshVideoPlaybackURL(for item: inout WallpaperItem) throws {
+        guard item.type == .video,
+              fileManager.fileExists(atPath: item.sourceURL.path),
+              fileManager.isReadableFile(atPath: item.sourceURL.path) else { return }
+        if let playbackURL = item.playbackURL,
+           fileManager.isReadableFile(atPath: playbackURL.path) {
+            return
+        }
+        item.playbackURL = try prepareVideoPlaybackURL(
+            sourceURL: item.sourceURL,
+            itemID: item.id,
+            storageMode: item.storageMode
+        )
+    }
+
+    private func removePlaybackProxyIfOwned(at url: URL?) {
+        guard let url else { return }
+        let proxiesURL = libraryURL.appendingPathComponent("VideoProxies", isDirectory: true).standardizedFileURL
+        let candidate = url.standardizedFileURL
+        let directoryPath = proxiesURL.path.hasSuffix("/") ? proxiesURL.path : proxiesURL.path + "/"
+        guard candidate.path.hasPrefix(directoryPath), fileManager.fileExists(atPath: candidate.path) else { return }
+        try? fileManager.removeItem(at: candidate)
     }
 
     private func save(_ items: [WallpaperItem]) throws {

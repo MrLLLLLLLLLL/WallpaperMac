@@ -83,7 +83,7 @@ public struct WallpaperMetadata: Codable, Equatable, Sendable {
 
 public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
-        case id, name, type, sourceURL, entryURL, storageMode, thumbnailURL, metadata, availability
+        case id, name, type, sourceURL, playbackURL, entryURL, storageMode, thumbnailURL, metadata, availability
         case createdAt, lastUsedAt, isFavorite, groupID
     }
 
@@ -91,6 +91,8 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
     public var name: String
     public var type: WallpaperType
     public var sourceURL: URL
+    /// Optional app-managed copy used when the source container needs a playback-only compatibility fix.
+    public var playbackURL: URL?
     public var entryURL: URL?
     public var storageMode: StorageMode
     public var thumbnailURL: URL?
@@ -107,6 +109,7 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
         name = try container.decode(String.self, forKey: .name)
         type = try container.decode(WallpaperType.self, forKey: .type)
         sourceURL = try container.decode(URL.self, forKey: .sourceURL)
+        playbackURL = try container.decodeIfPresent(URL.self, forKey: .playbackURL)
         entryURL = try container.decodeIfPresent(URL.self, forKey: .entryURL)
         storageMode = try container.decode(StorageMode.self, forKey: .storageMode)
         thumbnailURL = try container.decodeIfPresent(URL.self, forKey: .thumbnailURL)
@@ -123,6 +126,7 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
         name: String,
         type: WallpaperType,
         sourceURL: URL,
+        playbackURL: URL? = nil,
         entryURL: URL? = nil,
         storageMode: StorageMode,
         thumbnailURL: URL? = nil,
@@ -137,6 +141,7 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
         self.name = name
         self.type = type
         self.sourceURL = sourceURL
+        self.playbackURL = playbackURL
         self.entryURL = entryURL
         self.storageMode = storageMode
         self.thumbnailURL = thumbnailURL

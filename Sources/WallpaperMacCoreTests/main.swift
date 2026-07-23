@@ -99,6 +99,39 @@ func testDetectsWallpaperTypes() throws {
     try expect(WallpaperType.detect(from: URL(fileURLWithPath: "/tmp/site/index.html")), equals: .web, "detects web")
 }
 
+func testVideoContainerCompatibilityNormalizesHev1Entries() throws {
+    let fixture = try Fixture()
+    let source = fixture.root.appendingPathComponent("sample.mp4")
+    var bytes = Data(repeating: 0, count: 256)
+    let sampleEntryOffset = 80
+    bytes.replaceSubrange((sampleEntryOffset - 4)..<sampleEntryOffset, with: Data([0, 0, 0, 100]))
+    bytes.replaceSubrange(sampleEntryOffset..<(sampleEntryOffset + 4), with: Data("hev1".utf8))
+    try bytes.write(to: source)
+
+    let managed = try fixture.store.importItem(at: source, storageMode: .managedCopy)
+    let managedData = try Data(contentsOf: managed.sourceURL)
+    try expect(managedData.range(of: Data("hvc1".utf8)) != nil, "managed HEVC copy should use hvc1 sample entry")
+    try expect(managedData.range(of: Data("hev1".utf8)) == nil, "managed HEVC copy should not retain hev1 sample entry")
+    try expect(managed.playbackURL, equals: nil, "managed copy should normalize in place without a proxy")
+
+    let externalSource = fixture.root.appendingPathComponent("external.mp4")
+    try bytes.write(to: externalSource)
+    let external = try fixture.store.importItem(at: externalSource, storageMode: .externalReference)
+    guard let playbackURL = external.playbackURL else {
+        throw TestFailure(message: "external HEVC reference should receive a compatible playback proxy")
+    }
+    try expect(playbackURL != externalSource, "external HEVC reference should keep its original source")
+    try expect(FileManager.default.fileExists(atPath: playbackURL.path), "external HEVC playback proxy should exist")
+    let originalData = try Data(contentsOf: externalSource)
+    let proxyData = try Data(contentsOf: playbackURL)
+    try expect(originalData.range(of: Data("hev1".utf8)) != nil, "external source must remain unchanged")
+    try expect(proxyData.range(of: Data("hvc1".utf8)) != nil, "external proxy should use hvc1 sample entry")
+
+    _ = try fixture.store.remove(item: external)
+    try expect(!FileManager.default.fileExists(atPath: playbackURL.path), "removing an external reference should remove its owned playback proxy")
+    try expect(FileManager.default.fileExists(atPath: externalSource.path), "removing an external reference must not remove the source video")
+}
+
 func testManagedImportCopiesFile() throws {
     let fixture = try Fixture()
     let source = fixture.root.appendingPathComponent("sunset.jpg")
@@ -466,6 +499,7 @@ let tests: [(String, () throws -> Void)] = [
     ("bulk metadata save preserves wallpaper state", testBulkMetadataSavePreservesWallpaperState),
     ("detects wallpaper types", testDetectsWallpaperTypes),
     ("managed import copies file", testManagedImportCopiesFile),
+    ("normalizes HEVC sample entries for playback", testVideoContainerCompatibilityNormalizesHev1Entries),
     ("external import keeps reference", testExternalImportKeepsReference),
     ("reports missing external file", testReportsMissingExternalFile),
     ("detects nested HTML project", testNestedHTMLProjectIsDetected),
