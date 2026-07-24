@@ -115,9 +115,13 @@ final class LibraryViewModel: ObservableObject {
     @Published var isDropTargeted = false
     @Published var isImporting = false
     @Published var pendingImportURLs: [URL] = []
+    @Published private(set) var pendingImportCandidates: [WallpaperImportCandidate] = []
+    @Published private(set) var pendingWebEntryCandidates: [URL] = []
+    @Published private(set) var isImportInspectionInProgress = false
     @Published var importSummary: ImportSummary?
 
     private(set) var store: WallpaperStore
+    private var storeWorker: WallpaperStoreWorker
     let displayService = DisplayService()
     let wallpaperManager = WallpaperManager()
     private var settingsObserver: NSObjectProtocol?
@@ -130,6 +134,8 @@ final class LibraryViewModel: ObservableObject {
     private var undoOperation: (() -> Void)?
     private var metadataEnrichmentTask: Task<Void, Never>?
     private var metadataEnrichmentGeneration = 0
+    private var libraryLoadTask: Task<Void, Never>?
+    private var libraryLoadGeneration = 0
     private static let pageSize = WallpaperLibraryPagination.defaultPageSize
 
     init() {
@@ -146,6 +152,7 @@ final class LibraryViewModel: ObservableObject {
             defaults.set(resolvedURL.path, forKey: SettingsKey.libraryPath)
         }
         store = WallpaperStore(libraryURL: resolvedURL)
+        storeWorker = WallpaperStoreWorker(libraryURL: resolvedURL)
         storageMode = StorageMode(rawValue: defaults.string(forKey: SettingsKey.storageMode) ?? "") ?? .managedCopy
         playbackPolicy = PlaybackPolicy(
             isMuted: defaults.object(forKey: SettingsKey.muted) as? Bool ?? true,
@@ -173,8 +180,7 @@ final class LibraryViewModel: ObservableObject {
                 Task { @MainActor [weak self] in self?.toggleAllMute() }
             }
         ]
-        reload()
-        wallpaperManager.restoreAssignments(to: displayService.displays, policy: playbackPolicy, items: wallpapers)
+        reload(afterLoad: restoreWallpaperAssignments)
         wallpaperManager.objectWillChange
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -191,6 +197,7 @@ final class LibraryViewModel: ObservableObject {
         }
         statusBarObservers.forEach(NotificationCenter.default.removeObserver)
         metadataEnrichmentTask?.cancel()
+        libraryLoadTask?.cancel()
     }
 
     static var configurationDirectory: URL {
@@ -227,7 +234,7 @@ final class LibraryViewModel: ObservableObject {
             try FileManager.default.createDirectory(at: libraryURL, withIntermediateDirectories: true)
             try libraryAccess.persist(url: libraryURL)
             UserDefaults.standard.set(libraryURL.path, forKey: SettingsKey.libraryPath)
-            reload()
+            reload(afterLoad: restoreWallpaperAssignments)
         } catch {
             lastError = error.localizedDescription
         }
@@ -309,25 +316,63 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
-    func reload() {
+    /// Reconciles persisted display assignments after each completed library load.
+    ///
+    /// A launch normally triggers more than one `prepareLibrary()` call while SwiftUI
+    /// builds the root view. Keeping restoration inside the successful reload callback
+    /// prevents a later reload from cancelling the only task responsible for starting
+    /// persisted display queues.
+    private func restoreWallpaperAssignments() {
+        wallpaperManager.restoreAssignments(
+            to: displayService.displays,
+            policy: playbackPolicy,
+            items: wallpapers
+        )
+    }
+
+    func reload(afterLoad: (() -> Void)? = nil) {
+        metadataEnrichmentTask?.cancel()
+        metadataEnrichmentGeneration += 1
+        libraryLoadGeneration += 1
+        let metadataGeneration = metadataEnrichmentGeneration
+        let loadGeneration = libraryLoadGeneration
+        let worker = storeWorker
+        libraryLoadTask?.cancel()
+        libraryLoadTask = Task { [weak self] in
+            do {
+                let snapshot = try await worker.loadLibrary()
+                guard !Task.isCancelled,
+                      let self,
+                      self.libraryLoadGeneration == loadGeneration else { return }
+                self.applyLibrarySnapshot(snapshot)
+                self.startMetadataEnrichment(for: snapshot.items, generation: metadataGeneration)
+                afterLoad?()
+            } catch {
+                guard !Task.isCancelled, let self, self.libraryLoadGeneration == loadGeneration else { return }
+                self.lastError = error.localizedDescription
+                self.visibleWallpapers = []
+            }
+        }
+    }
+
+    private func applyLibrarySnapshot(_ snapshot: WallpaperLibrarySnapshot) {
+        wallpapers = snapshot.items
+        groups = snapshot.groups
+        resetPagination()
+        let validIDs = Set(wallpapers.map(\.id))
+        selectedWallpaperIDs = selectedWallpaperIDs.intersection(validIDs)
+        if let selectedWallpaperID, !validIDs.contains(selectedWallpaperID) {
+            self.selectedWallpaperID = nil
+        }
+    }
+
+    private func applyMutationSnapshot(_ snapshot: WallpaperLibrarySnapshot, enrichMetadata: Bool = true) {
         metadataEnrichmentTask?.cancel()
         metadataEnrichmentGeneration += 1
         let generation = metadataEnrichmentGeneration
-        do {
-            let loadedItems = try store.refreshAllAvailability()
-            wallpapers = loadedItems
-            groups = try store.groups()
-            resetPagination()
-            let validIDs = Set(wallpapers.map(\.id))
-            selectedWallpaperIDs = selectedWallpaperIDs.intersection(validIDs)
-            if let selectedWallpaperID, !validIDs.contains(selectedWallpaperID) {
-                self.selectedWallpaperID = nil
-            }
-            startMetadataEnrichment(for: loadedItems, generation: generation)
-        } catch {
-            lastError = error.localizedDescription
-            visibleWallpapers = []
-        }
+        applyLibrarySnapshot(snapshot)
+        guard enrichMetadata else { return }
+        startMetadataEnrichment(for: snapshot.items, generation: generation)
     }
 
     func loadNextPageIfNeeded(currentItem item: WallpaperItem) {
@@ -415,7 +460,8 @@ final class LibraryViewModel: ObservableObject {
             }
             guard changed else { return }
             do {
-                try self.store.save(items: mergedItems)
+                try await self.storeWorker.save(items: mergedItems)
+                guard !Task.isCancelled, self.metadataEnrichmentGeneration == generation else { return }
                 self.wallpapers = mergedItems
                 self.refreshVisibleWallpapersPreservingLoadedCount(loadedCount)
             } catch {
@@ -447,21 +493,18 @@ final class LibraryViewModel: ObservableObject {
             lastError = "已经存在同名分组。"
             return
         }
-        do {
-            let group = WallpaperGroup(name: trimmedName)
-            groups.append(group)
-            try store.save(groups: groups)
-            if !pendingGroupAssignmentIDs.isEmpty {
-                for item in wallpapers where pendingGroupAssignmentIDs.contains(item.id) {
-                    var updated = item
-                    updated.groupID = group.id
-                    _ = try store.update(item: updated)
-                }
-                pendingGroupAssignmentIDs.removeAll()
+        let group = WallpaperGroup(name: trimmedName)
+        let assignmentIDs = pendingGroupAssignmentIDs
+        let worker = storeWorker
+        Task { [weak self] in
+            do {
+                let snapshot = try await worker.createGroup(group, assigning: assignmentIDs)
+                guard let self else { return }
+                self.pendingGroupAssignmentIDs.removeAll()
+                self.applyMutationSnapshot(snapshot, enrichMetadata: false)
+            } catch {
+                self?.lastError = error.localizedDescription
             }
-            reload()
-        } catch {
-            lastError = error.localizedDescription
         }
     }
 
@@ -475,34 +518,37 @@ final class LibraryViewModel: ObservableObject {
     }
 
     func assignWallpapers(_ ids: Set<UUID>, to groupID: UUID?) {
-        let selectedItems = wallpapers.filter { ids.contains($0.id) }
-        guard !selectedItems.isEmpty else { return }
-        do {
-            for item in selectedItems {
-                var updated = item
-                updated.groupID = groupID
-                _ = try store.update(item: updated)
+        let selectedIDs = Set(wallpapers.lazy.map(\.id)).intersection(ids)
+        guard !selectedIDs.isEmpty else { return }
+        let worker = storeWorker
+        Task { [weak self] in
+            do {
+                let snapshot = try await worker.assign(itemsWithIDs: selectedIDs, to: groupID)
+                self?.applyMutationSnapshot(snapshot, enrichMetadata: false)
+            } catch {
+                self?.lastError = error.localizedDescription
             }
-            reload()
-        } catch {
-            lastError = error.localizedDescription
         }
     }
 
     func removeSelectedWallpapers() {
         let selectedItems = wallpapers.filter { selectedWallpaperIDs.contains($0.id) }
         guard !selectedItems.isEmpty else { return }
-        do {
-            let selectedIDs = Set(selectedItems.map(\.id))
-            wallpaperManager.removeWallpaperIDs(selectedIDs)
-            try store.remove(items: selectedItems)
-            selectedWallpaperIDs.subtract(selectedIDs)
-            if let selectedWallpaperID, selectedIDs.contains(selectedWallpaperID) {
-                self.selectedWallpaperID = nil
+        let selectedIDs = Set(selectedItems.map(\.id))
+        wallpaperManager.removeWallpaperIDs(selectedIDs)
+        let worker = storeWorker
+        Task { [weak self] in
+            do {
+                let snapshot = try await worker.remove(items: selectedItems)
+                guard let self else { return }
+                self.selectedWallpaperIDs.subtract(selectedIDs)
+                if let selectedWallpaperID, selectedIDs.contains(selectedWallpaperID) {
+                    self.selectedWallpaperID = nil
+                }
+                self.applyMutationSnapshot(snapshot, enrichMetadata: false)
+            } catch {
+                self?.lastError = error.localizedDescription
             }
-            reload()
-        } catch {
-            lastError = error.localizedDescription
         }
     }
 
@@ -543,34 +589,55 @@ final class LibraryViewModel: ObservableObject {
         beginImport(panel.urls)
     }
 
+    func cancelImport() {
+        isImporting = false
+        isImportInspectionInProgress = false
+        pendingImportURLs = []
+        pendingImportCandidates = []
+        pendingWebEntryCandidates = []
+    }
+
     func beginImport(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
         pendingImportURLs = urls
+        pendingImportCandidates = []
+        pendingWebEntryCandidates = []
+        isImportInspectionInProgress = true
         isImporting = true
+        let worker = storeWorker
+        Task { [weak self] in
+            let inspection = await worker.inspectImportURLs(urls)
+            guard let self, self.pendingImportURLs == urls else { return }
+            self.pendingImportCandidates = inspection.candidates
+            self.pendingWebEntryCandidates = inspection.webEntryCandidates
+            self.isImportInspectionInProgress = false
+        }
     }
 
     func importURLs(_ urls: [URL], entryURL: URL? = nil, storageMode: StorageMode? = nil) {
         let selectedStorageMode = storageMode ?? self.storageMode
-        var errors: [String] = []
-        var importedID: UUID?
-        var importedCount = 0
-        for url in urls {
+        let worker = storeWorker
+        Task { [weak self] in
             do {
-                let selectedEntry = entryURL ?? preferredEntryURL(for: url)
-                let item = try store.importItem(at: url, storageMode: selectedStorageMode, entryURL: selectedEntry)
-                importedID = item.id
-                importedCount += 1
+                let result = try await worker.importItems(at: urls, entryURL: entryURL, storageMode: selectedStorageMode)
+                guard let self else { return }
+                self.isImporting = false
+                self.isImportInspectionInProgress = false
+                self.pendingImportURLs = []
+                self.pendingImportCandidates = []
+                self.pendingWebEntryCandidates = []
+                self.applyMutationSnapshot(result.snapshot)
+                self.selectedWallpaperID = result.importedIDs.last
+                self.lastError = nil
+                if !result.importedIDs.isEmpty || !result.failures.isEmpty {
+                    self.importSummary = ImportSummary(importedCount: result.importedIDs.count, failures: result.failures)
+                }
             } catch {
-                errors.append("\(url.lastPathComponent)：\(error.localizedDescription)")
+                guard let self else { return }
+                self.isImporting = false
+                self.isImportInspectionInProgress = false
+                self.lastError = error.localizedDescription
             }
-        }
-        isImporting = false
-        pendingImportURLs = []
-        reload()
-        selectedWallpaperID = importedID
-        lastError = nil
-        if importedCount > 0 || !errors.isEmpty {
-            importSummary = ImportSummary(importedCount: importedCount, failures: errors)
         }
     }
 
@@ -615,10 +682,10 @@ final class LibraryViewModel: ObservableObject {
         libraryURL = normalizedURL
         shouldCreateMissingLibraryDirectory = false
         store = WallpaperStore(libraryURL: libraryURL)
+        storeWorker = WallpaperStoreWorker(libraryURL: libraryURL)
         UserDefaults.standard.set(libraryURL.path, forKey: SettingsKey.libraryPath)
         wallpaperManager.configure(store: store, policy: playbackPolicy)
-        reload()
-        wallpaperManager.restoreAssignments(to: displayService.displays, policy: playbackPolicy, items: wallpapers)
+        reload(afterLoad: restoreWallpaperAssignments)
     }
 
     private static func isTemporaryLibraryURL(_ url: URL) -> Bool {
@@ -658,10 +725,16 @@ final class LibraryViewModel: ObservableObject {
             if let index = wallpapers.firstIndex(where: { $0.id == item.id }) {
                 var updated = wallpapers[index]
                 updated.lastUsedAt = Date()
-                do {
-                    wallpapers[index] = try store.update(item: updated)
-                } catch {
-                    lastError = error.localizedDescription
+                wallpapers[index] = updated
+                let worker = storeWorker
+                Task { [weak self] in
+                    do {
+                        let persisted = try await worker.update(item: updated)
+                        guard let self, let currentIndex = self.wallpapers.firstIndex(where: { $0.id == persisted.id }) else { return }
+                        self.wallpapers[currentIndex] = persisted
+                    } catch {
+                        self?.lastError = error.localizedDescription
+                    }
                 }
             }
         } catch {
@@ -712,13 +785,16 @@ final class LibraryViewModel: ObservableObject {
     }
 
     func refreshAvailability(for item: WallpaperItem) {
-        do {
-            let refreshed = try store.refreshAvailability(for: item)
-            if let index = wallpapers.firstIndex(where: { $0.id == item.id }) {
-                wallpapers[index] = refreshed
+        let worker = storeWorker
+        Task { [weak self] in
+            do {
+                let refreshed = try await worker.refreshAvailability(for: item)
+                guard let self, let index = self.wallpapers.firstIndex(where: { $0.id == item.id }) else { return }
+                self.wallpapers[index] = refreshed
+                self.refreshVisibleWallpapersPreservingLoadedCount(self.visibleWallpapers.count)
+            } catch {
+                self?.lastError = error.localizedDescription
             }
-        } catch {
-            lastError = error.localizedDescription
         }
     }
 
@@ -730,11 +806,14 @@ final class LibraryViewModel: ObservableObject {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            _ = try store.relocate(item: item, to: url)
-            reload()
-        } catch {
-            lastError = error.localizedDescription
+        let worker = storeWorker
+        Task { [weak self] in
+            do {
+                let snapshot = try await worker.relocate(item: item, to: url)
+                self?.applyMutationSnapshot(snapshot)
+            } catch {
+                self?.lastError = error.localizedDescription
+            }
         }
     }
 
@@ -752,16 +831,21 @@ final class LibraryViewModel: ObservableObject {
     func removeWallpapers(ids: Set<UUID>) {
         let items = wallpapers.filter { ids.contains($0.id) }
         guard !items.isEmpty else { return }
-        do {
-            wallpaperManager.removeWallpaperIDs(ids)
-            try store.remove(items: items)
-            selectedWallpaperIDs.subtract(ids)
-            if let selectedWallpaperID, ids.contains(selectedWallpaperID) {
-                self.selectedWallpaperID = nil
+        let removedIDs = Set(items.map(\.id))
+        wallpaperManager.removeWallpaperIDs(removedIDs)
+        let worker = storeWorker
+        Task { [weak self] in
+            do {
+                let snapshot = try await worker.remove(items: items)
+                guard let self else { return }
+                self.selectedWallpaperIDs.subtract(removedIDs)
+                if let selectedWallpaperID, removedIDs.contains(selectedWallpaperID) {
+                    self.selectedWallpaperID = nil
+                }
+                self.applyMutationSnapshot(snapshot, enrichMetadata: false)
+            } catch {
+                self?.lastError = error.localizedDescription
             }
-            reload()
-        } catch {
-            lastError = error.localizedDescription
         }
     }
 
@@ -850,10 +934,15 @@ final class LibraryViewModel: ObservableObject {
         let items = wallpapers.filter { ids.contains($0.id) }
         guard !items.isEmpty else { return }
         let shouldFavorite = !items.allSatisfy(\.isFavorite)
-        do {
-            for item in items { try store.update(item: item, isFavorite: shouldFavorite) }
-            reload()
-        } catch { lastError = error.localizedDescription }
+        let worker = storeWorker
+        Task { [weak self] in
+            do {
+                let snapshot = try await worker.setFavorite(itemIDs: ids, isFavorite: shouldFavorite)
+                self?.applyMutationSnapshot(snapshot, enrichMetadata: false)
+            } catch {
+                self?.lastError = error.localizedDescription
+            }
+        }
     }
 
     func showToast(_ message: String, undo: (() -> Void)? = nil) {
@@ -879,18 +968,7 @@ final class LibraryViewModel: ObservableObject {
     }
 
     func toggleFavorite(_ item: WallpaperItem) {
-        do {
-            try store.update(item: item, isFavorite: !item.isFavorite)
-            reload()
-        } catch {
-            lastError = error.localizedDescription
-        }
-    }
-
-    private func preferredEntryURL(for url: URL) -> URL? {
-        guard WallpaperType.detect(from: url) == .web else { return nil }
-        let candidates = store.webEntryCandidates(at: url)
-        return candidates.first(where: { $0.lastPathComponent.lowercased() == "index.html" }) ?? candidates.first
+        toggleFavorites(for: [item.id])
     }
 
     private func applySettingsFromDefaults() {
@@ -1965,17 +2043,19 @@ private struct ImportSheet: View {
     @State private var selectedEntry: URL?
     @State private var selectedStorageMode: StorageMode = .managedCopy
 
-    private var candidates: [URL] {
-        guard let projectURL = webProject else { return [] }
-        return model.store.webEntryCandidates(at: projectURL)
-    }
+    private var candidates: [URL] { model.pendingWebEntryCandidates }
 
     private var webProject: URL? {
-        let webProjects = model.pendingImportURLs.filter {
-            WallpaperType.detect(from: $0) == .web && $0.hasDirectoryPath
+        let webProjects = model.pendingImportCandidates.compactMap { candidate -> URL? in
+            guard candidate.type == .web, candidate.url.hasDirectoryPath else { return nil }
+            return candidate.url
         }
         guard webProjects.count == 1 else { return nil }
         return webProjects.first
+    }
+
+    private func importType(for url: URL) -> WallpaperType? {
+        model.pendingImportCandidates.first(where: { $0.url == url })?.type
     }
 
     private var requiresEntrySelection: Bool {
@@ -1994,18 +2074,22 @@ private struct ImportSheet: View {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(model.pendingImportURLs, id: \.self) { url in
                         HStack(spacing: 8) {
-                            Image(systemName: icon(for: url))
+                            let type = importType(for: url)
+                            Image(systemName: icon(for: type))
                                 .foregroundStyle(.secondary)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(url.lastPathComponent)
                                     .font(.callout)
                                     .lineLimit(1)
-                                Text(typeDescription(for: url))
+                                Text(typeDescription(for: type))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
-                            if WallpaperType.detect(from: url) == nil {
+                            if model.isImportInspectionInProgress {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else if type == nil {
                                 Text("不支持")
                                     .font(.caption)
                                     .foregroundStyle(.red)
@@ -2051,8 +2135,7 @@ private struct ImportSheet: View {
             HStack {
                 Spacer()
                 Button("取消") {
-                    model.isImporting = false
-                    model.pendingImportURLs = []
+                    model.cancelImport()
                     dismiss()
                 }
                 Button("开始导入") {
@@ -2060,7 +2143,7 @@ private struct ImportSheet: View {
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.pendingImportURLs.isEmpty || (requiresEntrySelection && selectedEntry == nil))
+                .disabled(model.pendingImportURLs.isEmpty || model.isImportInspectionInProgress || (requiresEntrySelection && selectedEntry == nil))
             }
         }
         .padding(24)
@@ -2069,10 +2152,14 @@ private struct ImportSheet: View {
             selectedStorageMode = model.storageMode
             selectedEntry = candidates.first(where: { $0.lastPathComponent.lowercased() == "index.html" }) ?? candidates.first
         }
+        .onChange(of: candidates) { values in
+            guard selectedEntry == nil else { return }
+            selectedEntry = values.first(where: { $0.lastPathComponent.lowercased() == "index.html" }) ?? values.first
+        }
     }
 
-    private func icon(for url: URL) -> String {
-        switch WallpaperType.detect(from: url) {
+    private func icon(for type: WallpaperType?) -> String {
+        switch type {
         case .image: return "photo"
         case .video: return "film"
         case .web: return "safari"
@@ -2080,12 +2167,12 @@ private struct ImportSheet: View {
         }
     }
 
-    private func typeDescription(for url: URL) -> String {
-        switch WallpaperType.detect(from: url) {
+    private func typeDescription(for type: WallpaperType?) -> String {
+        switch type {
         case .image: return "图片壁纸"
         case .video: return "视频壁纸"
         case .web: return "本地网页壁纸"
-        case .none: return "文件类型不受支持"
+        case .none: return "正在扫描…"
         }
     }
 

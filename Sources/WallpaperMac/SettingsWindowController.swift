@@ -6,7 +6,7 @@ import WallpaperMacCore
 final class SettingsWindowController: NSWindowController {
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 580),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -42,6 +42,13 @@ private struct SettingsView: View {
     @AppStorage(SettingsKey.fitMode) private var fitMode = WallpaperFitMode.fill.rawValue
     @AppStorage(SettingsKey.launchAtLogin) private var launchAtLogin = false
     @State private var launchAtLoginError: String?
+
+    private var applicationVersionInfo: ApplicationVersionInfo {
+        ApplicationVersionInfo(
+            infoDictionary: Bundle.main.infoDictionary ?? [:],
+            fallbackVersion: "0.2.4"
+        )
+    }
 
     var body: some View {
         Form {
@@ -104,10 +111,27 @@ private struct SettingsView: View {
                         .foregroundStyle(.red)
                 }
             }
+            Section("关于 WallpaperMac") {
+                HStack(spacing: 12) {
+                    Image(nsImage: NSApplication.shared.applicationIconImage)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 40, height: 40)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("WallpaperMac")
+                            .font(.headline)
+                        Text(applicationVersionInfo.displayText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .padding(.vertical, 2)
+            }
         }
         .formStyle(.grouped)
         .padding(20)
-        .frame(minWidth: 600, minHeight: 480)
+        .frame(minWidth: 600, minHeight: 540)
         .onAppear {
             launchAtLogin = LoginItemService.isEnabled
         }

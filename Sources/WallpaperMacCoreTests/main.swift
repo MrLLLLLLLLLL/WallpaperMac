@@ -464,6 +464,23 @@ func testGroupsAndBulkRemovalPersist() throws {
     try expect(!FileManager.default.fileExists(atPath: second.sourceURL.path), "bulk removal should delete managed asset two")
 }
 
+func testBulkGroupAssignmentPersistsAllChangesWithOneStoreOperation() throws {
+    let fixture = try Fixture()
+    let sourceURLs = (1...3).map { fixture.root.appendingPathComponent("asset-\($0).png") }
+    for (index, sourceURL) in sourceURLs.enumerated() {
+        try Data("asset-\(index)".utf8).write(to: sourceURL)
+    }
+    let items = try sourceURLs.map { try fixture.store.importItem(at: $0, storageMode: .externalReference) }
+    let group = WallpaperGroup(name: "批量分组")
+
+    let updated = try fixture.store.assign(itemsWithIDs: Set(items.map(\.id)), to: group.id)
+
+    try expect(updated.count, equals: items.count, "bulk assignment should return every selected wallpaper")
+    try expect(Set(updated.compactMap(\.groupID)), equals: [group.id], "bulk assignment should update every selected wallpaper")
+    let persisted = try fixture.store.items().filter { Set(items.map(\.id)).contains($0.id) }
+    try expect(Set(persisted.compactMap(\.groupID)), equals: [group.id], "bulk assignment should persist all group changes")
+}
+
 func testDisplayQueueNormalizesAndPersists() throws {
     let fixture = try Fixture()
     let firstID = UUID()
@@ -518,6 +535,7 @@ let tests: [(String, () throws -> Void)] = [
     ("persists custom library configuration", testLibraryConfigurationRoundTripsCustomPath),
     ("does not invent missing library configuration", testMissingLibraryConfigurationDoesNotCreateEmptyLibrary),
     ("persists groups and bulk removal", testGroupsAndBulkRemovalPersist),
+    ("assigns groups in bulk", testBulkGroupAssignmentPersistsAllChangesWithOneStoreOperation),
     ("normalizes and persists display queue", testDisplayQueueNormalizesAndPersists),
     ("keeps display queues independent", testDisplayQueuesStayIndependent),
     ("evaluates playback suspension rules", testPlaybackPolicySuspensionRules),
@@ -528,7 +546,8 @@ let tests: [(String, () throws -> Void)] = [
     ("uses landscape 16:9 wallpaper preview layout", testWallpaperPreviewUsesLandscapeSixteenByNineLayout),
     ("uses shared pagination contract for groups", testWallpaperLibraryPaginationUsesSamePageContractForGroups),
     ("migrates legacy display queues", testStoreMigratesLegacyDisplayQueues),
-    ("round trips display queue state", testQueueStoreRoundTripsDisplayQueueState)
+    ("round trips display queue state", testQueueStoreRoundTripsDisplayQueueState),
+    ("formats application version information", testApplicationVersionInfoFormatting)
 ]
 
 var failures = 0
@@ -658,4 +677,28 @@ func testQueueStoreRoundTripsDisplayQueueState() throws {
     try expect(loadedBindings.first?.activeQueueID, equals: binding.activeQueueID, "display active queue should round trip")
     try expect(loadedBindings.first?.state(for: queue.id).currentIndex, equals: 2, "display queue index should round trip")
     try expect(loadedBindings.first?.state(for: queue.id).overrides.intervalSeconds, equals: Optional(8), "display override should round trip")
+}
+
+func testApplicationVersionInfoFormatting() throws {
+    let release = ApplicationVersionInfo(
+        infoDictionary: [
+            "CFBundleShortVersionString": "0.2.4",
+            "CFBundleVersion": "0.2.4"
+        ],
+        fallbackVersion: "0.2.4"
+    )
+    try expect(release.version, equals: "0.2.4", "bundle version should be preferred")
+    try expect(release.displayText, equals: "版本 0.2.4", "matching build number should not be repeated")
+
+    let numberedBuild = ApplicationVersionInfo(
+        infoDictionary: [
+            "CFBundleShortVersionString": "0.2.4",
+            "CFBundleVersion": "42"
+        ],
+        fallbackVersion: "0.2.4"
+    )
+    try expect(numberedBuild.displayText, equals: "版本 0.2.4（构建 42）", "distinct build number should be displayed")
+
+    let development = ApplicationVersionInfo(infoDictionary: [:], fallbackVersion: "0.2.4")
+    try expect(development.displayText, equals: "版本 0.2.4", "development builds should use the fallback version")
 }

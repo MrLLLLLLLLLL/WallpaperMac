@@ -353,6 +353,35 @@ public final class WallpaperStore {
         return try update(item: updated)
     }
 
+    /// Assigns several wallpapers to the same group while decoding and writing the
+    /// wallpaper metadata only once. This keeps bulk context-menu actions from
+    /// issuing a complete JSON read/write cycle for every selected item.
+    @discardableResult
+    public func assign(itemsWithIDs itemIDs: Set<UUID>, to groupID: UUID?) throws -> [WallpaperItem] {
+        guard !itemIDs.isEmpty else { return [] }
+
+        var currentItems = try items()
+        let matchedIDs = Set(currentItems.lazy.map(\.id)).intersection(itemIDs)
+        guard matchedIDs.count == itemIDs.count else {
+            throw WallpaperStoreError.itemNotFound(itemIDs.subtracting(matchedIDs).first ?? UUID())
+        }
+
+        var updatedItems: [WallpaperItem] = []
+        updatedItems.reserveCapacity(itemIDs.count)
+        var didChange = false
+        for index in currentItems.indices where itemIDs.contains(currentItems[index].id) {
+            if currentItems[index].groupID != groupID {
+                currentItems[index].groupID = groupID
+                didChange = true
+            }
+            updatedItems.append(currentItems[index])
+        }
+        if didChange {
+            try save(currentItems)
+        }
+        return updatedItems
+    }
+
     @discardableResult
     public func relocate(item: WallpaperItem, to replacementURL: URL) throws -> WallpaperItem {
         guard fileManager.fileExists(atPath: replacementURL.path) else {
@@ -475,13 +504,23 @@ public final class WallpaperStore {
 
     @discardableResult
     public func refreshAllAvailability() throws -> [WallpaperItem] {
-        let refreshed = try items().map { item in
+        let currentItems = try items()
+        var refreshed: [WallpaperItem] = []
+        refreshed.reserveCapacity(currentItems.count)
+        var didChange = false
+        for item in currentItems {
             var updated = item
             try refreshVideoPlaybackURL(for: &updated)
             updated.availability = availability(for: updated)
-            return updated
+            didChange = didChange || updated != item
+            refreshed.append(updated)
         }
-        try save(refreshed)
+        // Availability checks run during every library load. Avoiding an
+        // atomic JSON rewrite when nothing changed substantially reduces disk
+        // pressure for large libraries and external volumes.
+        if didChange {
+            try save(refreshed)
+        }
         return refreshed.sorted { $0.createdAt > $1.createdAt }
     }
 

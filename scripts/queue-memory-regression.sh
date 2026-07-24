@@ -180,12 +180,15 @@ if end - base > 16 * 1024 or peak - base > 32 * 1024:
     raise SystemExit(f'ERROR: RSS grew during queue playback: baseline={base}KB end={end}KB peak={peak}KB')
 
 values = [value for _, value in window_rows]
+# Wallpaper windows are created after the AppKit run loop starts. Do not treat
+# the first startup sample as a leaked or missing window; evaluate the stable
+# warm-up interval and the tail where queue transitions have occurred.
 warm_windows = [value for second, value in window_rows if 5 <= second <= 8]
 tail_windows = [value for second, value in window_rows if second >= 15]
 window_baseline = statistics.median(warm_windows)
 window_tail = statistics.median(tail_windows)
 window_tail_max = max(tail_windows)
-if min(values) < 1 or window_tail > window_baseline + 1 or window_tail_max > window_baseline + 2:
+if min(warm_windows) < 1 or window_tail > window_baseline + 1 or window_tail_max > window_baseline + 2:
     raise SystemExit(f'ERROR: wallpaper window count grew: baseline={window_baseline} tail={window_tail} max={window_tail_max} observed={values}')
 print(f'Queue transitions advanced; RSS baseline={int(base)}KB end={int(end)}KB peak={int(peak)}KB; wallpaperWindows baseline={int(window_baseline)} tail={int(window_tail)} max={window_tail_max}')
 PY
