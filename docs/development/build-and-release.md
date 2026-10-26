@@ -7,6 +7,7 @@
 - macOS 13 或更高版本
 - 与项目兼容的 Xcode / Command Line Tools 和 Swift 工具链
 - 用于 DMG 构建的系统工具：`hdiutil`、`codesign`、`plutil`、`zip`、`unzip`
+- 用于打包兼容视频转换器的 ffmpeg；默认读取 `/opt/homebrew/bin/ffmpeg`，也可设置 `WALLPAPERMAC_FFMPEG_SOURCE`
 
 先确认环境：
 
@@ -35,7 +36,7 @@ swift run WallpaperMacCoreTests
 open dist/WallpaperMac.app
 ```
 
-`package-release.sh` 会执行 Release 构建，重新创建 `dist/WallpaperMac.app`，写入 `Info.plist`、复制图标并进行 ad-hoc 签名。它不进行 Developer ID 签名或 Apple 公证。
+`package-release.sh` 会执行 Release 构建，重新创建 `dist/WallpaperMac.app`，写入 `Info.plist`、复制图标、内置 ffmpeg 及其动态库，并进行 ad-hoc 签名。它不进行 Developer ID 签名或 Apple 公证。
 
 ## 验证层级
 
@@ -60,6 +61,9 @@ CI 不替代真实桌面验证：显示器分配、`AVPlayer`、`WKWebView`、�
 
 # 专门验证图片、视频和网页播放器承载路径
 ./scripts/player-runtime-test.sh
+
+# 专门验证 AV1 转换、引用原文件不复制和兼容缓存
+./scripts/video-codec-runtime-test.sh
 
 # 专门验证队列重复切换期间播放器会被释放，内存不会单调上升
 ./scripts/queue-memory-regression.sh

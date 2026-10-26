@@ -40,13 +40,14 @@ private struct SettingsView: View {
     @AppStorage(SettingsKey.pauseOnBattery) private var pauseOnBattery = false
     @AppStorage(SettingsKey.pauseInFullScreen) private var pauseInFullScreen = false
     @AppStorage(SettingsKey.fitMode) private var fitMode = WallpaperFitMode.fill.rawValue
+    @AppStorage(SettingsKey.webWallpaperInteractionEnabled) private var webWallpaperInteractionEnabled = false
     @AppStorage(SettingsKey.launchAtLogin) private var launchAtLogin = false
     @State private var launchAtLoginError: String?
 
     private var applicationVersionInfo: ApplicationVersionInfo {
         ApplicationVersionInfo(
             infoDictionary: Bundle.main.infoDictionary ?? [:],
-            fallbackVersion: "0.2.4"
+            fallbackVersion: "0.2.5"
         )
     }
 
@@ -86,6 +87,12 @@ private struct SettingsView: View {
                     }
                 }
                 Text("填充屏幕会裁剪边缘；完整显示会保留原始比例。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section("交互") {
+                Toggle("壁纸点击效果", isOn: $webWallpaperInteractionEnabled)
+                Text("启用后，网页壁纸会移动到桌面图标层上方，以便直接点击网页；图片和视频壁纸仍保持点击穿透。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -142,6 +149,7 @@ private struct SettingsView: View {
         .onChange(of: pauseOnBattery) { _ in notifySettingsChanged() }
         .onChange(of: pauseInFullScreen) { _ in notifySettingsChanged() }
         .onChange(of: fitMode) { _ in notifySettingsChanged() }
+        .onChange(of: webWallpaperInteractionEnabled) { _ in notifySettingsChanged() }
         .onChange(of: launchAtLogin) { enabled in
             updateLaunchAtLogin(enabled)
         }
@@ -185,6 +193,7 @@ enum SettingsKey {
     static let pauseOnBattery = "WallpaperMac.pauseOnBattery"
     static let pauseInFullScreen = "WallpaperMac.pauseInFullScreen"
     static let fitMode = "WallpaperMac.fitMode"
+    static let webWallpaperInteractionEnabled = "WallpaperMac.webWallpaperInteractionEnabled"
     static let launchAtLogin = "WallpaperMac.launchAtLogin"
     static let onboardingCompleted = "WallpaperMac.onboardingCompleted"
 }

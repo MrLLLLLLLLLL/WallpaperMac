@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusBarController: StatusBarController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        WallpaperVideoCompatibilityService.removeLegacyPlaybackCache()
         statusBarController = StatusBarController(
             showMainWindow: { [weak self] in self?.showMainWindow() },
             showSettings: { [weak self] in self?.showSettingsWindow() },

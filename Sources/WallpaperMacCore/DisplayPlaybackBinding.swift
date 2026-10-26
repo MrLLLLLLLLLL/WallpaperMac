@@ -62,4 +62,17 @@ public struct DisplayPlaybackBinding: Identifiable, Codable, Equatable, Sendable
     public mutating func updateState(_ state: DisplayQueueState) {
         queueStates[state.queueID] = state
     }
+
+    /// Marks the active queue as requiring explicit reapplication after its
+    /// contents or playback rules change. The last index is retained so the
+    /// queue can resume from the same position when applied again.
+    @discardableResult
+    public mutating func invalidateActiveQueue(ifMatching queueID: UUID) -> Bool {
+        guard activeQueueID == queueID else { return false }
+        var state = state(for: queueID)
+        state.isEnabled = false
+        state.isPlaying = false
+        queueStates[queueID] = state
+        return true
+    }
 }

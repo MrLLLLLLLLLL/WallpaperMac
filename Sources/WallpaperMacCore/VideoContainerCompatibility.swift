@@ -9,17 +9,23 @@ import Foundation
 public enum VideoContainerCompatibility {
     private static let hev1 = Data("hev1".utf8)
     private static let hvc1 = Data("hvc1".utf8)
-    private static let scanChunkSize = 1024 * 1024
     private static let minimumSampleEntrySize: UInt64 = 86
 
-    /// Returns whether the file contains a plausible MP4 `hev1` sample entry.
+    private struct BoxDescriptor {
+        let offset: UInt64
+        let type: String
+        let payloadOffset: UInt64
+        let endOffset: UInt64
+    }
+
+    /// Returns whether the MP4 structure contains a real `hev1` sample entry.
+    /// Random `hev1` bytes in `mdat` media payloads are deliberately ignored.
     public static func needsHVC1Normalization(
         at url: URL,
         fileManager: FileManager = .default
     ) throws -> Bool {
         guard fileManager.isReadableFile(atPath: url.path) else { return false }
-        let positions = try hev1Positions(in: url, fileManager: fileManager)
-        return !positions.isEmpty
+        return try hev1Positions(in: url, fileManager: fileManager).isEmpty == false
     }
 
     /// Rewrites `hev1` sample-entry tags in place. Returns `true` when a tag
@@ -84,44 +90,103 @@ public enum VideoContainerCompatibility {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
         defer { try? handle.close() }
 
-        var positions: [UInt64] = []
-        var window = Data()
-        var windowStart: UInt64 = 0
-        while let chunk = try handle.read(upToCount: scanChunkSize), !chunk.isEmpty {
-            window.append(chunk)
-            let bytes = [UInt8](window)
-            var cursor = 0
-            while cursor + hev1.count <= bytes.count {
-                guard let match = bytes[cursor...].firstIndex(of: hev1[0]) else { break }
-                let start = Int(match)
-                guard start + hev1.count <= bytes.count else { break }
-                if Data(bytes[start..<(start + hev1.count)]) == hev1 {
-                    let absolutePosition = windowStart + UInt64(start)
-                    if start >= 4 {
-                        let sampleEntrySize = UInt64(bytes[start - 4]) << 24
-                            | UInt64(bytes[start - 3]) << 16
-                            | UInt64(bytes[start - 2]) << 8
-                            | UInt64(bytes[start - 1])
-                        if sampleEntrySize >= minimumSampleEntrySize,
-                           absolutePosition + sampleEntrySize <= fileSize {
-                            positions.append(absolutePosition)
-                        }
-                    }
-                    cursor = start + hev1.count
-                } else {
-                    cursor = start + 1
+        return try positions(
+            in: handle,
+            range: 0..<fileSize,
+            fileSize: fileSize,
+            searchingSampleEntriesOnly: false
+        )
+    }
+
+    /// Parses only MP4 box boundaries. The media payload in `mdat` is never
+    /// scanned, preventing byte sequences inside compressed video data from
+    /// being mistaken for sample-entry headers.
+    private static func positions(
+        in handle: FileHandle,
+        range: Range<UInt64>,
+        fileSize: UInt64,
+        searchingSampleEntriesOnly: Bool
+    ) throws -> [UInt64] {
+        var results: [UInt64] = []
+        var offset = range.lowerBound
+        while offset + 8 <= range.upperBound {
+            try handle.seek(toOffset: offset)
+            guard let header = try handle.read(upToCount: 8), header.count == 8 else { break }
+            let box = try descriptor(handle: handle, header: header, offset: offset, range: range, fileSize: fileSize)
+            guard let box else { break }
+
+            if box.type == "stsd" {
+                let sampleEntryStart = min(box.payloadOffset + 8, box.endOffset)
+                guard sampleEntryStart < box.endOffset else {
+                    offset = box.endOffset
+                    continue
                 }
+                let entries = try positions(
+                    in: handle,
+                    range: sampleEntryStart..<box.endOffset,
+                    fileSize: fileSize,
+                    searchingSampleEntriesOnly: true
+                )
+                results.append(contentsOf: entries)
+            } else if searchingSampleEntriesOnly {
+                if box.type == "hev1", box.endOffset - box.offset >= minimumSampleEntrySize {
+                    results.append(box.offset + 4)
+                }
+            } else if ["moov", "trak", "mdia", "minf", "stbl"].contains(box.type) {
+                let nested = try positions(
+                    in: handle,
+                    range: box.payloadOffset..<box.endOffset,
+                    fileSize: fileSize,
+                    searchingSampleEntriesOnly: false
+                )
+                results.append(contentsOf: nested)
             }
 
-            // Keep enough overlap for a four-byte size field and the tag.
-            let retainedBytes = 11
-            if window.count > retainedBytes {
-                let dropCount = window.count - retainedBytes
-                window.removeSubrange(0..<dropCount)
-                windowStart += UInt64(dropCount)
-            }
+            guard box.endOffset > offset else { break }
+            offset = box.endOffset
         }
-        return positions
+        return results
+    }
+
+    private static func descriptor(
+        handle: FileHandle,
+        header: Data,
+        offset: UInt64,
+        range: Range<UInt64>,
+        fileSize: UInt64
+    ) throws -> BoxDescriptor? {
+        let size32 = readUInt32(header, at: 0)
+        guard let type = String(data: header.subdata(in: 4..<8), encoding: .ascii) else {
+            return nil
+        }
+
+        var boxSize = UInt64(size32)
+        var headerSize: UInt64 = 8
+        if size32 == 1 {
+            try handle.seek(toOffset: offset + 8)
+            guard let extendedBytes = try handle.read(upToCount: 8), extendedBytes.count == 8 else {
+                return nil
+            }
+            boxSize = extendedBytes.reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+            headerSize = 16
+        }
+
+        guard boxSize >= headerSize else { return nil }
+        let endOffset = min(offset + boxSize, range.upperBound)
+        guard endOffset > offset, endOffset <= fileSize else { return nil }
+        return BoxDescriptor(
+            offset: offset,
+            type: type,
+            payloadOffset: offset + headerSize,
+            endOffset: endOffset
+        )
+    }
+
+    private static func readUInt32(_ data: Data, at index: Int) -> UInt32 {
+        UInt32(data[index]) << 24
+            | UInt32(data[index + 1]) << 16
+            | UInt32(data[index + 2]) << 8
+            | UInt32(data[index + 3])
     }
 
     private static func patch(
@@ -142,16 +207,11 @@ public enum VideoContainerCompatibility {
         with temporaryURL: URL,
         fileManager: FileManager
     ) throws {
-        if #available(macOS 10.6, *) {
-            _ = try fileManager.replaceItemAt(
-                originalURL,
-                withItemAt: temporaryURL,
-                backupItemName: nil,
-                options: .usingNewMetadataOnly
-            )
-        } else {
-            try fileManager.removeItem(at: originalURL)
-            try fileManager.moveItem(at: temporaryURL, to: originalURL)
-        }
+        _ = try fileManager.replaceItemAt(
+            originalURL,
+            withItemAt: temporaryURL,
+            backupItemName: nil,
+            options: .usingNewMetadataOnly
+        )
     }
 }

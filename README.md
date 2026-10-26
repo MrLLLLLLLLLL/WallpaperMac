@@ -4,7 +4,9 @@
 
 WallpaperMac 是一款使用 **SwiftUI + AppKit** 构建的原生 macOS 壁纸管理工具。它将本地图片、视频和本地 HTML 项目统一纳入壁纸库，支持多显示器独立分配、播放队列、分组、菜单栏控制和可迁移的壁纸库存储位置。
 
-当前版本：**0.2.4** · 目标平台：**macOS 13+** · 构建方式：**Swift Package Manager**
+当前版本：**0.2.5** · 目标平台：**macOS 13+** · 构建方式：**Swift Package Manager**
+
+App 内置兼容视频转换工具，用于播放 AV1 等 macOS AVFoundation 不直接支持的编码。
 
 > **项目说明：**这是一个以自用为目的的 vibecoding 项目，如果有什么问题欢迎提出。
 
@@ -102,11 +104,10 @@ display-assignments.json           # 显示器壁纸分配
 wallpaper-groups.json              # 分组
 display-queues.json                # 旧版本队列数据的迁移来源
 Assets/                            # “复制到应用库”的资源副本
-VideoProxies/                      # 外部 `hev1` HEVC 视频的兼容播放副本
 Thumbnails/                        # 生成的缩略图
 ```
 
-应用还会在 `~/Library/Application Support/WallpaperMac/Configuration/` 保存壁纸库位置配置。旧版索引缺少新增字段时会使用兼容默认值读取；不要手工编辑 JSON，除非你已备份壁纸库并清楚数据格式的影响。
+应用还会在 `~/Library/Application Support/WallpaperMac/Configuration/` 保存壁纸库位置配置。兼容视频不会生成完整播放副本，旧版本遗留的 `VideoProxies/` 会在加载壁纸库时自动删除。旧版索引缺少新增字段时会使用兼容默认值读取；不要手工编辑 JSON，除非你已备份壁纸库并清楚数据格式的影响。
 
 ### 两种导入策略
 
@@ -123,7 +124,7 @@ Thumbnails/                        # 生成的缩略图
 - 网页壁纸可以是单个 `.html` 文件，也可以是一个完整本地 HTML 项目目录；导入目录时选择入口文件，通常是 `index.html`。
 - 导入后在检查器查看预览和元数据，再将其应用到指定显示器。
 
-视频与网页默认静音，避免在桌面环境意外播放声音。对于少数使用 `hev1` sample entry 的 HEVC / H.265 MP4，WallpaperMac 会自动进行容器兼容处理：托管导入只修改应用库副本的标记而不重编码；外部引用不会改写原视频，而是在壁纸库 `VideoProxies/` 中生成仅供播放与封面提取使用的兼容副本。网页项目应使用离线相对路径，不依赖 CDN、远程脚本或在线图片。
+视频与网页默认静音，避免在桌面环境意外播放声音。设置中的“壁纸点击效果”启用后，网页壁纸会位于桌面图标层上方，便于直接点击网页交互。对于使用 `hev1` sample entry 的 HEVC / H.265 MP4，托管导入只修改应用库副本的容器标记而不重编码；引用原文件不会改写源视频，也不会在壁纸库中生成副本。AV1、VP9 等 macOS AVFoundation 不直接支持的编码会使用 App 内置 ffmpeg 解码，并把视频帧流式送入壁纸播放层，不生成完整播放副本。网页项目应使用离线相对路径，不依赖 CDN、远程脚本或在线图片。
 
 ### 管理资源
 

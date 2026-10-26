@@ -99,37 +99,137 @@ func testDetectsWallpaperTypes() throws {
     try expect(WallpaperType.detect(from: URL(fileURLWithPath: "/tmp/site/index.html")), equals: .web, "detects web")
 }
 
-func testVideoContainerCompatibilityNormalizesHev1Entries() throws {
+func mp4Box(_ type: String, payload: Data) -> Data {
+    precondition(type.utf8.count == 4)
+    var data = Data()
+    let size = UInt32(payload.count + 8)
+    data.append(contentsOf: withUnsafeBytes(of: size.bigEndian, Array.init))
+    data.append(Data(type.utf8))
+    data.append(payload)
+    return data
+}
+
+func makeVideoFixtureData(sampleEntryType: String, includeFalsePositiveInMediaData: Bool) -> Data {
+    let sampleEntryPayload = Data(repeating: 0, count: 96)
+    let sampleEntry = mp4Box(sampleEntryType, payload: sampleEntryPayload)
+    let stsdPayload = Data([0, 0, 0, 0, 0, 0, 0, 1]) + sampleEntry
+    let stsd = mp4Box("stsd", payload: stsdPayload)
+    let stbl = mp4Box("stbl", payload: stsd)
+    let minf = mp4Box("minf", payload: stbl)
+    let mdia = mp4Box("mdia", payload: minf)
+    let trak = mp4Box("trak", payload: mdia)
+    let moov = mp4Box("moov", payload: trak)
+    let ftyp = mp4Box("ftyp", payload: Data([0x69, 0x73, 0x6f, 0x6d, 0, 0, 0, 1, 0x69, 0x73, 0x6f, 0x6d]))
+    var mediaPayload = Data(repeating: 0x42, count: 128)
+    if includeFalsePositiveInMediaData {
+        mediaPayload.replaceSubrange(20..<24, with: Data([0, 0, 0, 100]))
+        mediaPayload.replaceSubrange(24..<28, with: Data("hev1".utf8))
+    }
+    let mdat = mp4Box("mdat", payload: mediaPayload)
+    return ftyp + moov + mdat
+}
+
+func testVideoPlaybackCompatibilityRequiresCacheForAV1() throws {
+    try expect(
+        VideoPlaybackCompatibility.requiresConversion(codec: "av01", isPlayable: false),
+        equals: true,
+        "AV1 videos must use a compatibility playback path when AVFoundation cannot play them"
+    )
+    try expect(
+        VideoPlaybackCompatibility.requiresConversion(codec: "av01", isPlayable: true),
+        equals: true,
+        "known AV1 videos should remain on the compatibility path even if a decoder reports playable"
+    )
+    try expect(
+        VideoPlaybackCompatibility.requiresConversion(codec: "avc1", isPlayable: true),
+        equals: false,
+        "native H.264 videos should continue to use the original file"
+    )
+    try expect(
+        VideoPlaybackCompatibility.requiresConversion(codec: nil, isPlayable: false),
+        equals: true,
+        "unknown codecs that are not playable should use the compatibility path"
+    )
+    try expect(
+        VideoPlaybackCompatibility.preferredForwardBufferSeconds > 0,
+        "native AVPlayer playback should use a bounded forward buffer"
+    )
+    try expect(
+        VideoPlaybackCompatibility.preferredForwardBufferSeconds <= 5,
+        "native AVPlayer playback should not preload large videos into an unbounded buffer"
+    )
+}
+
+func testVideoCompatibilityStreamPlanPipesDecodedFrames() throws {
+    let source = URL(fileURLWithPath: "/Volumes/Media/large-input.mp4")
+    let plan = VideoCompatibilityStreamPlan(sourceURL: source)
+    try expect(plan.width, equals: 1920, "streaming playback should cap decoded frame width")
+    try expect(plan.height, equals: 1080, "streaming playback should cap decoded frame height")
+    try expect(plan.arguments.contains(source.path), "streaming command should read the original source")
+    try expect(plan.arguments.contains("pipe:1"), "streaming command should emit frames to stdout")
+    try expect(plan.arguments.contains("nv12"), "streaming command should use an efficient video frame pixel format")
+    try expect(plan.arguments.contains("-f"), "streaming command should explicitly select raw frame output")
+}
+
+
+func testVideoContainerCompatibilityNormalizesRealHev1Entries() throws {
     let fixture = try Fixture()
     let source = fixture.root.appendingPathComponent("sample.mp4")
-    var bytes = Data(repeating: 0, count: 256)
-    let sampleEntryOffset = 80
-    bytes.replaceSubrange((sampleEntryOffset - 4)..<sampleEntryOffset, with: Data([0, 0, 0, 100]))
-    bytes.replaceSubrange(sampleEntryOffset..<(sampleEntryOffset + 4), with: Data("hev1".utf8))
-    try bytes.write(to: source)
+    try makeVideoFixtureData(sampleEntryType: "hev1", includeFalsePositiveInMediaData: true).write(to: source)
 
     let managed = try fixture.store.importItem(at: source, storageMode: .managedCopy)
     let managedData = try Data(contentsOf: managed.sourceURL)
     try expect(managedData.range(of: Data("hvc1".utf8)) != nil, "managed HEVC copy should use hvc1 sample entry")
-    try expect(managedData.range(of: Data("hev1".utf8)) == nil, "managed HEVC copy should not retain hev1 sample entry")
+    try expect(try VideoContainerCompatibility.needsHVC1Normalization(at: managed.sourceURL), equals: false, "managed HEVC copy should not retain a real hev1 sample entry")
     try expect(managed.playbackURL, equals: nil, "managed copy should normalize in place without a proxy")
+}
 
-    let externalSource = fixture.root.appendingPathComponent("external.mp4")
-    try bytes.write(to: externalSource)
-    let external = try fixture.store.importItem(at: externalSource, storageMode: .externalReference)
-    guard let playbackURL = external.playbackURL else {
-        throw TestFailure(message: "external HEVC reference should receive a compatible playback proxy")
-    }
-    try expect(playbackURL != externalSource, "external HEVC reference should keep its original source")
-    try expect(FileManager.default.fileExists(atPath: playbackURL.path), "external HEVC playback proxy should exist")
-    let originalData = try Data(contentsOf: externalSource)
-    let proxyData = try Data(contentsOf: playbackURL)
-    try expect(originalData.range(of: Data("hev1".utf8)) != nil, "external source must remain unchanged")
-    try expect(proxyData.range(of: Data("hvc1".utf8)) != nil, "external proxy should use hvc1 sample entry")
+func testVideoContainerCompatibilityIgnoresMediaPayloadLookalikes() throws {
+    let fixture = try Fixture()
+    let source = fixture.root.appendingPathComponent("lookalike.mp4")
+    try makeVideoFixtureData(sampleEntryType: "avc1", includeFalsePositiveInMediaData: true).write(to: source)
+    try expect(
+        VideoContainerCompatibility.needsHVC1Normalization(at: source),
+        equals: false,
+        "media payload bytes must not be mistaken for an MP4 sample entry"
+    )
+}
 
-    _ = try fixture.store.remove(item: external)
-    try expect(!FileManager.default.fileExists(atPath: playbackURL.path), "removing an external reference should remove its owned playback proxy")
-    try expect(FileManager.default.fileExists(atPath: externalSource.path), "removing an external reference must not remove the source video")
+func testExternalReferenceDoesNotPersistVideoProxy() throws {
+    let fixture = try Fixture()
+    let source = fixture.root.appendingPathComponent("external.mp4")
+    try makeVideoFixtureData(sampleEntryType: "hev1", includeFalsePositiveInMediaData: true).write(to: source)
+
+    let external = try fixture.store.importItem(at: source, storageMode: .externalReference)
+
+    try expect(external.playbackURL, equals: nil, "external references must not persist a playback proxy")
+    try expect(FileManager.default.fileExists(atPath: source.path), "external source must remain unchanged")
+    let proxyDirectory = fixture.library.appendingPathComponent("VideoProxies")
+    let proxyFiles = (try? FileManager.default.contentsOfDirectory(atPath: proxyDirectory.path)) ?? []
+    try expect(proxyFiles, equals: [], "external references must not add files to VideoProxies")
+}
+
+func testStoreRemovesLegacyExternalPlaybackProxy() throws {
+    let fixture = try Fixture()
+    let source = fixture.root.appendingPathComponent("legacy.mp4")
+    try makeVideoFixtureData(sampleEntryType: "avc1", includeFalsePositiveInMediaData: true).write(to: source)
+    let proxyDirectory = fixture.library.appendingPathComponent("VideoProxies", isDirectory: true)
+    try FileManager.default.createDirectory(at: proxyDirectory, withIntermediateDirectories: true)
+    let proxyURL = proxyDirectory.appendingPathComponent("\(UUID().uuidString).mp4")
+    try Data("legacy-proxy".utf8).write(to: proxyURL)
+    let item = WallpaperItem(
+        name: "legacy",
+        type: .video,
+        sourceURL: source,
+        playbackURL: proxyURL,
+        storageMode: .externalReference
+    )
+    try fixture.store.save(items: [item])
+
+    let refreshed = try fixture.store.refreshAllAvailability().first
+
+    try expect(refreshed?.playbackURL, equals: nil, "loading the library should clear legacy external playback URLs")
+    try expect(FileManager.default.fileExists(atPath: proxyURL.path), equals: false, "loading the library should delete the legacy VideoProxies copy")
 }
 
 func testManagedImportCopiesFile() throws {
@@ -392,6 +492,52 @@ func testPlaybackPolicySuspensionRules() throws {
     try expect(!disabled.shouldPauseDynamicWallpaper(isOnBattery: true, isFullScreenAppActive: true), "disabled policies should not pause")
 }
 
+func testWebMouseEventScriptActivatesClickOnce() throws {
+    let mouseUp = WebMouseEventScript.source(x: 120, y: 80, phase: .mouseUp)
+    try expect(
+        mouseUp.components(separatedBy: "element.click()").count - 1,
+        equals: 1,
+        "mouseup should use exactly one native element click activation"
+    )
+    try expect(
+        mouseUp.contains("if (typeof element.click === 'function')"),
+        "HTML elements should use their native click activation"
+    )
+    try expect(
+        mouseUp.components(separatedBy: "new MouseEvent('click'").count - 1,
+        equals: 1,
+        "non-HTML elements should have one mutually exclusive fallback click activation"
+    )
+    let mouseDown = WebMouseEventScript.source(x: 120, y: 80, phase: .mouseDown)
+    try expect(
+        mouseDown.contains("element.click()"),
+        equals: false,
+        "mousedown must not activate click behavior"
+    )
+}
+
+func testPlaybackPolicySupportsWebWallpaperClickEffect() throws {
+    let enabledJSON = """
+    {"isPlaying":true,"isMuted":true,"loops":true,"pauseOnBattery":false,
+     "pauseInFullScreenApps":false,"reloadWebContentOnResume":false,
+     "fitMode":"fill","webWallpaperInteractionEnabled":true}
+    """
+    let enabled = try JSONDecoder().decode(PlaybackPolicy.self, from: Data(enabledJSON.utf8))
+    try expect(enabled.webWallpaperInteractionEnabled, "enabled wallpaper click effect should round-trip")
+
+    let legacyJSON = """
+    {"isPlaying":true,"isMuted":true,"loops":true,"pauseOnBattery":false,
+     "pauseInFullScreenApps":false,"reloadWebContentOnResume":false,
+     "fitMode":"fill"}
+    """
+    let legacy = try JSONDecoder().decode(PlaybackPolicy.self, from: Data(legacyJSON.utf8))
+    try expect(
+        legacy.webWallpaperInteractionEnabled,
+        equals: false,
+        "legacy playback policy should keep wallpaper click effect disabled"
+    )
+}
+
 func testPlaybackDefaultsAndDisplayAssignmentCoding() throws {
     let policy = PlaybackPolicy()
     try expect(policy.isPlaying, "playback should default to playing")
@@ -516,7 +662,7 @@ let tests: [(String, () throws -> Void)] = [
     ("bulk metadata save preserves wallpaper state", testBulkMetadataSavePreservesWallpaperState),
     ("detects wallpaper types", testDetectsWallpaperTypes),
     ("managed import copies file", testManagedImportCopiesFile),
-    ("normalizes HEVC sample entries for playback", testVideoContainerCompatibilityNormalizesHev1Entries),
+    ("normalizes HEVC sample entries for playback", testVideoContainerCompatibilityNormalizesRealHev1Entries),
     ("external import keeps reference", testExternalImportKeepsReference),
     ("reports missing external file", testReportsMissingExternalFile),
     ("detects nested HTML project", testNestedHTMLProjectIsDetected),
@@ -531,6 +677,8 @@ let tests: [(String, () throws -> Void)] = [
     ("relocates HTML project and preserves entry", testRelocatesHTMLProjectAndPreservesEntry),
     ("cleans invalid managed HTML imports", testInvalidHTMLImportCleansManagedAsset),
     ("rejects mismatched managed relocation", testRelocateManagedWallpaperCleansCopyOnFailure),
+    ("activates web click once", testWebMouseEventScriptActivatesClickOnce),
+    ("supports wallpaper click effect", testPlaybackPolicySupportsWebWallpaperClickEffect),
     ("encodes playback and display defaults", testPlaybackDefaultsAndDisplayAssignmentCoding),
     ("persists custom library configuration", testLibraryConfigurationRoundTripsCustomPath),
     ("does not invent missing library configuration", testMissingLibraryConfigurationDoesNotCreateEmptyLibrary),
@@ -543,8 +691,15 @@ let tests: [(String, () throws -> Void)] = [
     ("enforces playback queue defaults and overrides", testPlaybackQueueHasDefaultConstraintsAndPerItemOverrides),
     ("persists video completion queue setting", testPlaybackQueueVideoCompletionSettingRoundTrips),
     ("decodes legacy queue without video completion setting", testLegacyPlaybackQueueWithoutVideoCompletionSettingDecodes),
+    ("requires compatibility playback for AV1", testVideoPlaybackCompatibilityRequiresCacheForAV1),
+    ("plans streaming compatibility playback", testVideoCompatibilityStreamPlanPipesDecodedFrames),
+    ("normalizes real HEVC sample entries", testVideoContainerCompatibilityNormalizesRealHev1Entries),
+    ("ignores media payload lookalikes", testVideoContainerCompatibilityIgnoresMediaPayloadLookalikes),
+    ("keeps external references without video proxies", testExternalReferenceDoesNotPersistVideoProxy),
+    ("removes legacy external playback proxies", testStoreRemovesLegacyExternalPlaybackProxy),
     ("uses landscape 16:9 wallpaper preview layout", testWallpaperPreviewUsesLandscapeSixteenByNineLayout),
-    ("uses shared pagination contract for groups", testWallpaperLibraryPaginationUsesSamePageContractForGroups),
+    ("uses real 20-item pagination for library and groups", testWallpaperLibraryPaginationUsesSamePageContractForGroups),
+    ("invalidates edited active queue bindings", testDisplayBindingInvalidatesEditedQueue),
     ("migrates legacy display queues", testStoreMigratesLegacyDisplayQueues),
     ("round trips display queue state", testQueueStoreRoundTripsDisplayQueueState),
     ("formats application version information", testApplicationVersionInfoFormatting)
@@ -609,24 +764,35 @@ func testLegacyPlaybackQueueWithoutVideoCompletionSettingDecodes() throws {
 }
 
 func testWallpaperLibraryPaginationUsesSamePageContractForGroups() throws {
-    let items = Array(1...100)
+    let items = Array(1...101)
     try expect(WallpaperLibraryPagination.defaultPageSize, equals: 20, "library and group pages should share a 20-item default page size")
-    let firstPage = WallpaperLibraryPagination.page(from: items, loadedCount: 0)
-    try expect(firstPage.count, equals: 20, "library pages should load 20 items initially")
-    let secondCount = WallpaperLibraryPagination.nextLoadedCount(currentCount: firstPage.count, totalCount: items.count)
-    let secondPage = WallpaperLibraryPagination.page(from: items, loadedCount: secondCount)
-    try expect(secondPage.count, equals: 40, "group pages should load the same next page size as the library")
-    let thirdCount = WallpaperLibraryPagination.nextLoadedCount(currentCount: secondPage.count, totalCount: items.count)
-    try expect(thirdCount, equals: 60, "pagination should advance by 20 items per page")
-    let finalCount = (0..<2).reduce(thirdCount) { count, _ in
-        WallpaperLibraryPagination.nextLoadedCount(currentCount: count, totalCount: items.count)
-    }
-    try expect(finalCount, equals: 100, "pagination should clamp the final page")
+    try expect(WallpaperLibraryPagination.pageCount(totalCount: items.count), equals: 6, "101 items should create six real pages")
+    try expect(WallpaperLibraryPagination.page(from: items, pageNumber: 1), equals: Array(1...20), "first page should contain only its first 20 items")
+    try expect(WallpaperLibraryPagination.page(from: items, pageNumber: 2), equals: Array(21...40), "second page should not retain first-page items")
+    try expect(WallpaperLibraryPagination.page(from: items, pageNumber: 6), equals: [101], "last page should contain only the remaining items")
+    try expect(WallpaperLibraryPagination.normalizedPage(7, totalCount: items.count), equals: 6, "page selection should clamp to the final page")
+    try expect(WallpaperLibraryPagination.normalizedPage(4, totalCount: 20), equals: 1, "deleting items should clamp the current page")
+}
+
+func testDisplayBindingInvalidatesEditedQueue() throws {
+    let queue = PlaybackQueue(name: "夜间")
+    let state = DisplayQueueState(queueID: queue.id, currentIndex: 3, isPlaying: true, isEnabled: true)
+    var binding = DisplayPlaybackBinding(
+        displayID: "display-1",
+        displayName: "内置显示器",
+        activeQueueID: queue.id,
+        queueStates: [queue.id: state]
+    )
+    try expect(binding.invalidateActiveQueue(ifMatching: queue.id), "editing the active queue should invalidate the display binding")
+    try expect(!binding.state(for: queue.id).isEnabled, "invalidated queue should require the user to apply it again")
+    try expect(!binding.state(for: queue.id).isPlaying, "invalidated queue should stop automatic switching")
+    try expect(binding.state(for: queue.id).currentIndex, equals: 3, "queue edit should preserve the last index for reapplication")
+    try expect(!binding.invalidateActiveQueue(ifMatching: UUID()), "editing another queue should not affect this display")
 }
 
 func testWallpaperPreviewUsesLandscapeSixteenByNineLayout() throws {
     try expect(WallpaperPreviewLayout.aspectRatio, equals: 16.0 / 9.0, "resource previews should use a 16:9 frame")
-    try expect(WallpaperPreviewLayout.contentMode, equals: .fill, "resource previews should fill and crop non-16:9 assets")
+    try expect(WallpaperPreviewLayout.contentMode, equals: .fit, "portrait resources should be fully visible inside the landscape frame")
     try expect(WallpaperPreviewLayout.height(forWidth: 320), equals: 180, "preview frame height should be derived from its width")
     try expect(WallpaperPreviewLayout.height(forWidth: 0), equals: 0, "preview frame should not produce a negative height")
 }
@@ -682,23 +848,23 @@ func testQueueStoreRoundTripsDisplayQueueState() throws {
 func testApplicationVersionInfoFormatting() throws {
     let release = ApplicationVersionInfo(
         infoDictionary: [
-            "CFBundleShortVersionString": "0.2.4",
-            "CFBundleVersion": "0.2.4"
+            "CFBundleShortVersionString": "0.2.5",
+            "CFBundleVersion": "0.2.5"
         ],
-        fallbackVersion: "0.2.4"
+        fallbackVersion: "0.2.5"
     )
-    try expect(release.version, equals: "0.2.4", "bundle version should be preferred")
-    try expect(release.displayText, equals: "版本 0.2.4", "matching build number should not be repeated")
+    try expect(release.version, equals: "0.2.5", "bundle version should be preferred")
+    try expect(release.displayText, equals: "版本 0.2.5", "matching build number should not be repeated")
 
     let numberedBuild = ApplicationVersionInfo(
         infoDictionary: [
-            "CFBundleShortVersionString": "0.2.4",
+            "CFBundleShortVersionString": "0.2.5",
             "CFBundleVersion": "42"
         ],
-        fallbackVersion: "0.2.4"
+        fallbackVersion: "0.2.5"
     )
-    try expect(numberedBuild.displayText, equals: "版本 0.2.4（构建 42）", "distinct build number should be displayed")
+    try expect(numberedBuild.displayText, equals: "版本 0.2.5（构建 42）", "distinct build number should be displayed")
 
-    let development = ApplicationVersionInfo(infoDictionary: [:], fallbackVersion: "0.2.4")
-    try expect(development.displayText, equals: "版本 0.2.4", "development builds should use the fallback version")
+    let development = ApplicationVersionInfo(infoDictionary: [:], fallbackVersion: "0.2.5")
+    try expect(development.displayText, equals: "版本 0.2.5", "development builds should use the fallback version")
 }

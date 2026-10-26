@@ -35,12 +35,28 @@ printf '%s\n' '== App and ZIP packaging =='
 printf '%s\n' '== Player runtime matrix =='
 ./scripts/player-runtime-test.sh
 
+printf '%s\n' '== Video codec compatibility =='
+./scripts/video-codec-runtime-test.sh
+
+printf '%s\n' '== Streaming memory regression =='
+./scripts/video-stream-memory-regression.sh
+
+printf '%s\n' '== Web wallpaper interaction =='
+./scripts/web-wallpaper-interaction-test.sh
+
 printf '%s\n' '== App smoke test =='
 ./scripts/smoke-app.sh
 
 printf '%s\n' '== Bundle checks =='
 test -x "$APP/Contents/MacOS/WallpaperMac"
 test -f "$APP/Contents/Resources/AppIcon.icns"
+test -x "$APP/Contents/Resources/ffmpeg"
+test -d "$APP/Contents/Resources/ffmpeg-libs"
+"$APP/Contents/Resources/ffmpeg" -version | head -1
+if /usr/bin/otool -L "$APP/Contents/Resources/ffmpeg" | /usr/bin/grep -E '/opt/homebrew|/usr/local'; then
+    print -u2 "Bundled ffmpeg still references Homebrew paths"
+    exit 1
+fi
 /usr/bin/plutil -lint "$APP/Contents/Info.plist"
 SHORT_VERSION="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist")"
 BUNDLE_VERSION="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$APP/Contents/Info.plist")"

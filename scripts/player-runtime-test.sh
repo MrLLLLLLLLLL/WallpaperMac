@@ -187,10 +187,39 @@ let windows = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[St
 for item in windows {
     guard let owner = item[kCGWindowOwnerName as String] as? String, owner == "WallpaperMac" else { continue }
     let layer = item[kCGWindowLayer as String] as? Int ?? -1
-    print("layer=\(layer)")
+    let windowID = item[kCGWindowNumber as String] as? Int ?? -1
+    print("windowID=\(windowID) layer=\(layer)")
 }
 SWIFT
 swiftc "$TEST_ROOT/list-wallpaper-windows.swift" -o "$TEST_ROOT/list-wallpaper-windows" -framework CoreGraphics >/dev/null
+
+cat > "$TEST_ROOT/check-nonblack.swift" <<'SWIFT'
+import AppKit
+guard CommandLine.arguments.count == 2,
+      let image = NSImage(contentsOfFile: CommandLine.arguments[1]),
+      let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+    fputs("unable to load wallpaper capture\n", stderr)
+    exit(1)
+}
+let bitmap = NSBitmapImageRep(cgImage: cgImage)
+var sampled = 0
+var nonBlack = 0
+for y in stride(from: 0, to: bitmap.pixelsHigh, by: max(1, bitmap.pixelsHigh / 80)) {
+    for x in stride(from: 0, to: bitmap.pixelsWide, by: max(1, bitmap.pixelsWide / 80)) {
+        guard let color = bitmap.colorAt(x: x, y: y) else { continue }
+        sampled += 1
+        if color.redComponent + color.greenComponent + color.blueComponent > 0.08 {
+            nonBlack += 1
+        }
+    }
+}
+guard sampled > 0, Double(nonBlack) / Double(sampled) > 0.05 else {
+    fputs("wallpaper capture is effectively black: \(nonBlack)/\(sampled)\n", stderr)
+    exit(1)
+}
+print("nonBlack=\(nonBlack)/\(sampled)")
+SWIFT
+swiftc "$TEST_ROOT/check-nonblack.swift" -o "$TEST_ROOT/check-nonblack" -framework AppKit >/dev/null
 
 find "$DIAGNOSTIC_DIR" -maxdepth 1 -name 'WallpaperMac-*.ips' -print 2>/dev/null | sort > "$TEST_ROOT/diagnostics-before.txt"
 
@@ -254,10 +283,19 @@ PY
         echo "ERROR: process exited while testing $TYPE wallpaper." >&2
         exit 1
     fi
-    WINDOW_COUNT="$("$TEST_ROOT/list-wallpaper-windows" | awk '/layer=-2147483623/ { count += 1 } END { print count + 0 }')"
+    WINDOW_COUNT="$("$TEST_ROOT/list-wallpaper-windows" | awk '/windowID=/ { count += 1 } END { print count + 0 }')"
     if (( WINDOW_COUNT < 1 )); then
         echo "ERROR: no wallpaper window was created for $TYPE wallpaper." >&2
         exit 1
+    fi
+    if [[ "$TYPE" == video ]]; then
+        WINDOW_ID="$("$TEST_ROOT/list-wallpaper-windows" | awk '/layer=-2147483623/ { sub("windowID=", "", $1); print $1; exit }')"
+        CAPTURE="$TEST_ROOT/video-wallpaper.png"
+        /usr/sbin/screencapture -x -o -l "$WINDOW_ID" "$CAPTURE"
+        if ! "$TEST_ROOT/check-nonblack" "$CAPTURE"; then
+            echo "ERROR: video wallpaper window captured without visible video pixels." >&2
+            exit 1
+        fi
     fi
     STATE="$(python3 - "$LIBRARY/display-assignments.json" <<'PY'
 import json, sys

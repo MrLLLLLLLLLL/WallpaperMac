@@ -1,5 +1,6 @@
 import AVFoundation
 import AppKit
+import CoreMedia
 import WebKit
 import WallpaperMacCore
 
@@ -89,6 +90,7 @@ final class WallpaperManager: ObservableObject {
         for (displayID, controller) in controllers {
             controller.setMuted(policy.isMuted)
             controller.setFitMode(policy.fitMode)
+            controller.setWebInteractionEnabled(policy.webWallpaperInteractionEnabled)
             controller.setSystemSuspended(isSystemSuspended, reloadWebContentOnResume: false)
             playbackStates[displayID] = controller.playbackState
         }
@@ -278,6 +280,12 @@ final class WallpaperManager: ObservableObject {
     }
 
     func activeQueue(for displayID: String) -> PlaybackQueue? {
+        guard let binding = bindings[displayID],
+              binding.state(for: binding.activeQueueID).isEnabled else { return nil }
+        return queueLibrary[binding.activeQueueID]
+    }
+
+    func boundQueue(for displayID: String) -> PlaybackQueue? {
         guard let binding = bindings[displayID] else { return nil }
         return queueLibrary[binding.activeQueueID]
     }
@@ -335,9 +343,9 @@ final class WallpaperManager: ObservableObject {
             )
         }
         queueLibrary[normalized.id] = normalized
+        invalidateBoundDisplays(for: normalized.id)
         publishQueueLibrary()
         persistQueues()
-        rescheduleBoundDisplays(for: normalized.id)
         return true
     }
 
@@ -387,6 +395,7 @@ final class WallpaperManager: ObservableObject {
         }
         queue.addWallpaperIDs(orderedIDs)
         queueLibrary[queueID] = queue
+        invalidateBoundDisplays(for: queueID)
         publishQueueLibrary()
         persistQueues()
     }
@@ -401,6 +410,7 @@ final class WallpaperManager: ObservableObject {
             binding.queueStates[queueID] = state
             bindings[displayID] = binding
         }
+        invalidateBoundDisplays(for: queueID)
         publishQueueLibrary()
         persistQueues()
     }
@@ -761,15 +771,18 @@ final class WallpaperManager: ObservableObject {
         state.overrides.transition ?? queue.transition
     }
 
-    private func rescheduleBoundDisplays(for queueID: UUID) {
-        for displayID in bindings.keys {
-            guard let binding = bindings[displayID], binding.activeQueueID == queueID,
-                  let display = connectedDisplays[displayID],
-                  let items = queueItems.values.isEmpty ? nil : Array(queueItems.values) else { continue }
-            let state = binding.state(for: queueID)
-            guard state.isEnabled else { continue }
-            startQueue(queueID: queueID, on: display, policy: playbackPolicy, items: items, resetIndex: false)
+    private func invalidateBoundDisplays(for queueID: UUID) {
+        var changed = false
+        for displayID in Array(bindings.keys) {
+            guard var binding = bindings[displayID],
+                  binding.invalidateActiveQueue(ifMatching: queueID) else { continue }
+            queueTimers.removeValue(forKey: displayID)?.invalidate()
+            bindings[displayID] = binding
+            changed = true
         }
+        guard changed else { return }
+        publishBindings()
+        publishLegacyQueues()
     }
 
     private func shouldAdvanceAfterVideoCompletion(queue: PlaybackQueue, item: WallpaperItem) -> Bool {
@@ -886,11 +899,15 @@ final class WallpaperManager: ObservableObject {
             previous?.teardownAndClose()
             window?.alphaValue = 1
             replacement.showWindow(nil)
+            window?.makeKeyAndOrderFront(nil)
             window?.orderFrontRegardless()
+            NSApp.activate(ignoringOtherApps: true)
         case .crossfade:
             window?.alphaValue = 0
             replacement.showWindow(nil)
+            window?.makeKeyAndOrderFront(nil)
             window?.orderFrontRegardless()
+            NSApp.activate(ignoringOtherApps: true)
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.45
                 context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -904,7 +921,9 @@ final class WallpaperManager: ObservableObject {
             window?.setFrame(targetFrame.offsetBy(dx: direction * targetFrame.width, dy: 0), display: false)
             window?.alphaValue = 1
             replacement.showWindow(nil)
+            window?.makeKeyAndOrderFront(nil)
             window?.orderFrontRegardless()
+            NSApp.activate(ignoringOtherApps: true)
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.5
                 context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -918,7 +937,9 @@ final class WallpaperManager: ObservableObject {
             window?.setFrame(targetFrame.insetBy(dx: inset, dy: inset), display: false)
             window?.alphaValue = 0
             replacement.showWindow(nil)
+            window?.makeKeyAndOrderFront(nil)
             window?.orderFrontRegardless()
+            NSApp.activate(ignoringOtherApps: true)
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.5
                 context.timingFunction = CAMediaTimingFunction(name: .easeOut)
@@ -958,6 +979,7 @@ private extension Array {
 
 private final class WallpaperWindowController: NSWindowController {
     private let wallpaperContentView: WallpaperContentView
+    private let isWebWallpaper: Bool
 
     var playbackState: WallpaperManager.PlaybackState {
         wallpaperContentView.playbackState
@@ -970,7 +992,11 @@ private final class WallpaperWindowController: NSWindowController {
         advanceAfterVideoCompletion: Bool = false,
         onVideoPlaybackCompleted: (() -> Void)? = nil
     ) throws {
-        let window = WallpaperWindow(screen: screen)
+        isWebWallpaper = item.type == .web
+        let window = WallpaperWindow(
+            screen: screen,
+            allowsMouseEvents: item.type == .web && policy.webWallpaperInteractionEnabled
+        )
         let contentView = try WallpaperContentView(
             item: item,
             policy: policy,
@@ -999,6 +1025,10 @@ private final class WallpaperWindowController: NSWindowController {
         wallpaperContentView.setFitMode(fitMode)
     }
 
+    func setWebInteractionEnabled(_ enabled: Bool) {
+        (window as? WallpaperWindow)?.setAllowsMouseEvents(isWebWallpaper && enabled)
+    }
+
     func setSystemSuspended(_ suspended: Bool, reloadWebContentOnResume: Bool) {
         wallpaperContentView.setSystemSuspended(
             suspended,
@@ -1024,7 +1054,10 @@ private final class WallpaperWindowController: NSWindowController {
 }
 
 private final class WallpaperWindow: NSWindow {
-    init(screen: NSScreen) {
+    private var allowsMouseEvents: Bool
+
+    init(screen: NSScreen, allowsMouseEvents: Bool = false) {
+        self.allowsMouseEvents = allowsMouseEvents
         super.init(
             contentRect: screen.frame,
             styleMask: [.borderless],
@@ -1036,12 +1069,34 @@ private final class WallpaperWindow: NSWindow {
         isOpaque = true
         backgroundColor = .black
         hasShadow = false
-        ignoresMouseEvents = true
-        level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)))
+        ignoresMouseEvents = !allowsMouseEvents
+        acceptsMouseMovedEvents = allowsMouseEvents
+        level = Self.wallpaperLevel(interactive: allowsMouseEvents)
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         // These windows are recreated for every queue transition. Allow AppKit
         // to release the native window once the controller has torn it down.
         isReleasedWhenClosed = true
+    }
+
+    func setAllowsMouseEvents(_ enabled: Bool) {
+        allowsMouseEvents = enabled
+        ignoresMouseEvents = !enabled
+        acceptsMouseMovedEvents = enabled
+        level = Self.wallpaperLevel(interactive: enabled)
+    }
+
+    private static func wallpaperLevel(interactive: Bool) -> NSWindow.Level {
+        let key: CGWindowLevelKey = interactive ? .desktopIconWindow : .desktopWindow
+        let offset = interactive ? 1 : 0
+        return NSWindow.Level(rawValue: Int(CGWindowLevelForKey(key)) + offset)
+    }
+
+    override var canBecomeKey: Bool {
+        allowsMouseEvents
+    }
+
+    override var canBecomeMain: Bool {
+        allowsMouseEvents
     }
 }
 
@@ -1057,8 +1112,10 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
     private var imageLayer: CALayer?
     private var player: AVPlayer?
     private var playerLayer: AVPlayerLayer?
+    private var streamingController: WallpaperVideoStreamController?
     private var webView: WKWebView?
     private var loopObserver: NSObjectProtocol?
+    private var compatibilityTask: Task<Void, Never>?
     private var isTornDown = false
 
     var playbackState: WallpaperManager.PlaybackState {
@@ -1105,6 +1162,10 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
             NotificationCenter.default.removeObserver(loopObserver)
             self.loopObserver = nil
         }
+        compatibilityTask?.cancel()
+        compatibilityTask = nil
+        streamingController?.teardown()
+        streamingController = nil
 
         player?.pause()
         playerLayer?.player = nil
@@ -1128,10 +1189,52 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
         teardown()
     }
 
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard item.type == .web else { return super.hitTest(point) }
+        return self
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        item.type == .web
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard item.type == .web else {
+            super.mouseDown(with: event)
+            return
+        }
+        dispatchWebMouseEvent(event, phase: .mouseDown)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard item.type == .web else {
+            super.mouseUp(with: event)
+            return
+        }
+        dispatchWebMouseEvent(event, phase: .mouseUp)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if item.type == .web, let webView {
+            window?.makeFirstResponder(webView)
+        }
+    }
+
+    private func dispatchWebMouseEvent(_ event: NSEvent, phase: WebMouseEventPhase) {
+        guard let webView else { return }
+        let localPoint = convert(event.locationInWindow, from: nil)
+        let x = max(0, min(bounds.width, localPoint.x))
+        let y = max(0, min(bounds.height, bounds.height - localPoint.y))
+        let script = WebMouseEventScript.source(x: x, y: y, phase: phase)
+        webView.evaluateJavaScript(script, completionHandler: nil)
+    }
+
     override func layout() {
         super.layout()
         imageLayer?.frame = bounds
         playerLayer?.frame = bounds
+        streamingController?.setFrame(bounds)
         webView?.frame = bounds
     }
 
@@ -1152,6 +1255,7 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
         self.fitMode = fitMode
         imageLayer?.contentsGravity = imageContentsGravity
         playerLayer?.videoGravity = videoGravity
+        streamingController?.setVideoGravity(videoGravity)
     }
 
     func setSystemSuspended(_ suspended: Bool, reloadWebContentOnResume: Bool) {
@@ -1166,11 +1270,29 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
     }
 
     private var imageContentsGravity: CALayerContentsGravity {
-        fitMode == .fill ? .resizeAspectFill : .resizeAspect
+        isPortraitAsset || fitMode == .fit ? .resizeAspect : .resizeAspectFill
     }
 
     private var videoGravity: AVLayerVideoGravity {
-        fitMode == .fill ? .resizeAspectFill : .resizeAspect
+        isPortraitAsset || fitMode == .fit ? .resizeAspect : .resizeAspectFill
+    }
+
+    private var isPortraitAsset: Bool {
+        if let width = item.metadata?.pixelWidth,
+           let height = item.metadata?.pixelHeight,
+           width > 0,
+           height > 0 {
+            return height > width
+        }
+        if let thumbnailURL = item.thumbnailURL,
+           let image = NSImage(contentsOf: thumbnailURL) {
+            return image.size.height > image.size.width
+        }
+        if item.type == .image,
+           let image = NSImage(contentsOf: item.sourceURL) {
+            return image.size.height > image.size.width
+        }
+        return false
     }
 
     private func applyPlaybackState() {
@@ -1179,7 +1301,13 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
         case .image:
             break
         case .video:
-            if shouldPlay { player?.play() } else { player?.pause() }
+            if let streamingController {
+                streamingController.setPlaying(shouldPlay)
+            } else if shouldPlay {
+                player?.play()
+            } else {
+                player?.pause()
+            }
         case .web:
             evaluateMediaScript(shouldPlay ? "play" : "pause")
         }
@@ -1211,28 +1339,7 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
             layer?.addSublayer(imageLayer)
             self.imageLayer = imageLayer
         case .video:
-            let playbackURL = item.playbackURL ?? item.sourceURL
-            let player = AVPlayer(url: playbackURL)
-            let playerLayer = AVPlayerLayer(player: player)
-            playerLayer.videoGravity = videoGravity
-            layer?.addSublayer(playerLayer)
-            self.player = player
-            self.playerLayer = playerLayer
-            loopObserver = NotificationCenter.default.addObserver(
-                forName: .AVPlayerItemDidPlayToEndTime,
-                object: player.currentItem,
-                queue: .main
-            ) { [weak self, weak player] _ in
-                guard let self, !self.isTornDown else { return }
-                if self.loops {
-                    player?.seek(to: .zero)
-                    if self.isPlaying && !self.isSystemSuspended { player?.play() }
-                } else {
-                    self.onVideoPlaybackCompleted?()
-                }
-            }
-            player.isMuted = isMuted
-            if isPlaying { player.play() }
+            configureVideoPlayback(at: item.playbackURL ?? item.sourceURL)
         case .web:
             let configuration = WKWebViewConfiguration()
             configuration.mediaTypesRequiringUserActionForPlayback = []
@@ -1249,6 +1356,95 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
         }
     }
 
+    private func configureVideoPlayback(at sourceURL: URL) {
+        compatibilityTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let asset = AVURLAsset(url: sourceURL)
+                let isPlayable = try await asset.load(.isPlayable)
+                let codec = try await videoCodec(for: asset)
+                guard !Task.isCancelled else { return }
+                guard VideoPlaybackCompatibility.requiresConversion(
+                    codec: codec,
+                    isPlayable: isPlayable
+                ) else {
+                    await MainActor.run { [weak self] in
+                        self?.installVideoPlayer(at: sourceURL)
+                    }
+                    return
+                }
+
+                await MainActor.run { [weak self] in
+                    self?.installStreamingVideoPlayer(at: sourceURL)
+                }
+            } catch {
+                NSLog("WallpaperMac compatibility playback failed for \(sourceURL.path): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func installStreamingVideoPlayer(at sourceURL: URL) {
+        guard !isTornDown, streamingController == nil else { return }
+        let controller = WallpaperVideoStreamController(
+            sourceURL: sourceURL,
+            isPlaying: isPlaying && !isSystemSuspended,
+            videoGravity: videoGravity,
+            loops: loops,
+            frame: bounds,
+            onVideoPlaybackCompleted: onVideoPlaybackCompleted
+        )
+        streamingController = controller
+        layer?.addSublayer(controller.displayLayer)
+        controller.start()
+    }
+
+    private func installVideoPlayer(at playbackURL: URL) {
+        guard !isTornDown, player == nil else { return }
+        let player = AVPlayer(url: playbackURL)
+        player.automaticallyWaitsToMinimizeStalling = true
+        player.currentItem?.preferredForwardBufferDuration = VideoPlaybackCompatibility.preferredForwardBufferSeconds
+        let playerLayer = AVPlayerLayer(player: player)
+        playerLayer.videoGravity = videoGravity
+        // The player is installed after asynchronous codec inspection, so the
+        // view may already have completed its initial layout pass.
+        playerLayer.frame = bounds
+        layer?.addSublayer(playerLayer)
+        needsLayout = true
+        self.player = player
+        self.playerLayer = playerLayer
+        loopObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: player.currentItem,
+            queue: .main
+        ) { [weak self, weak player] _ in
+            guard let self, !self.isTornDown else { return }
+            if self.loops {
+                player?.seek(to: .zero)
+                if self.isPlaying && !self.isSystemSuspended { player?.play() }
+            } else {
+                self.onVideoPlaybackCompleted?()
+            }
+        }
+        player.isMuted = isMuted
+        if isPlaying { player.play() }
+    }
+
+    private func videoCodec(for asset: AVURLAsset) async throws -> String? {
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        guard let track = tracks.first,
+              let description = try await track.load(.formatDescriptions).first else {
+            return nil
+        }
+        let codec = CMFormatDescriptionGetMediaSubType(description)
+        return String(
+            format: "%c%c%c%c",
+            (codec >> 24) & 0xff,
+            (codec >> 16) & 0xff,
+            (codec >> 8) & 0xff,
+            codec & 0xff
+        ).lowercased()
+    }
+
     private func evaluateMediaScript(_ action: String) {
         let script = "document.querySelectorAll('video,audio').forEach(function(media){ var result = media.\(action)(); if (result && result.catch) { result.catch(function() {}); } });"
         webView?.evaluateJavaScript(script, completionHandler: nil)
@@ -1260,6 +1456,8 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
             evaluateMediaScript("play")
         }
     }
+
+
 }
 
 private enum WallpaperContentError: Error, LocalizedError {

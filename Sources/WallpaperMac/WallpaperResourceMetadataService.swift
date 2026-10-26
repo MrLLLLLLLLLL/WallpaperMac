@@ -106,6 +106,17 @@ struct WallpaperResourceMetadataService {
                 )
             }
         }
+        if image == nil, let fallbackData = try? await WallpaperVideoCompatibilityService.thumbnailData(
+            for: assetURL,
+            itemID: itemID
+        ) {
+            do {
+                try fallbackData.write(to: destination, options: .atomic)
+                return destination
+            } catch {
+                return nil
+            }
+        }
         guard let image else { return nil }
         let rep = NSBitmapImageRep(cgImage: image)
         guard let data = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.82]) else { return nil }

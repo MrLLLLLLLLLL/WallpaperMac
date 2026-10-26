@@ -121,8 +121,11 @@ import CoreGraphics
 let windows = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
 let count = windows.reduce(into: 0) { count, item in
     let owner = item[kCGWindowOwnerName as String] as? String
-    let layer = item[kCGWindowLayer as String] as? Int
-    if owner == "WallpaperMac" && layer == -2147483623 { count += 1 }
+    let layer = item[kCGWindowLayer as String] as? Int ?? 0
+    let bounds = item[kCGWindowBounds as String] as? [String: Any] ?? [:]
+    let width = bounds["Width"] as? CGFloat ?? 0
+    let height = bounds["Height"] as? CGFloat ?? 0
+    if owner == "WallpaperMac" && layer < 0 && width > 100 && height > 100 { count += 1 }
 }
 print(count)
 SWIFT

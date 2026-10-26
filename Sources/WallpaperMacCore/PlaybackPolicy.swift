@@ -20,6 +20,7 @@ public struct PlaybackPolicy: Codable, Equatable, Sendable {
     public var pauseInFullScreenApps: Bool
     public var reloadWebContentOnResume: Bool
     public var fitMode: WallpaperFitMode
+    public var webWallpaperInteractionEnabled: Bool
 
     public init(
         isPlaying: Bool = true,
@@ -28,7 +29,8 @@ public struct PlaybackPolicy: Codable, Equatable, Sendable {
         pauseOnBattery: Bool = false,
         pauseInFullScreenApps: Bool = false,
         reloadWebContentOnResume: Bool = false,
-        fitMode: WallpaperFitMode = .fill
+        fitMode: WallpaperFitMode = .fill,
+        webWallpaperInteractionEnabled: Bool = false
     ) {
         self.isPlaying = isPlaying
         self.isMuted = isMuted
@@ -37,6 +39,27 @@ public struct PlaybackPolicy: Codable, Equatable, Sendable {
         self.pauseInFullScreenApps = pauseInFullScreenApps
         self.reloadWebContentOnResume = reloadWebContentOnResume
         self.fitMode = fitMode
+        self.webWallpaperInteractionEnabled = webWallpaperInteractionEnabled
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case isPlaying, isMuted, loops, pauseOnBattery, pauseInFullScreenApps
+        case reloadWebContentOnResume, fitMode, webWallpaperInteractionEnabled
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        isPlaying = try container.decode(Bool.self, forKey: .isPlaying)
+        isMuted = try container.decode(Bool.self, forKey: .isMuted)
+        loops = try container.decode(Bool.self, forKey: .loops)
+        pauseOnBattery = try container.decode(Bool.self, forKey: .pauseOnBattery)
+        pauseInFullScreenApps = try container.decode(Bool.self, forKey: .pauseInFullScreenApps)
+        reloadWebContentOnResume = try container.decode(Bool.self, forKey: .reloadWebContentOnResume)
+        fitMode = try container.decode(WallpaperFitMode.self, forKey: .fitMode)
+        webWallpaperInteractionEnabled = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .webWallpaperInteractionEnabled
+        ) ?? false
     }
 
     public func shouldPauseDynamicWallpaper(isOnBattery: Bool, isFullScreenAppActive: Bool) -> Bool {

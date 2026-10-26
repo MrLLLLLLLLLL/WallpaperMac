@@ -90,6 +90,7 @@ struct ImportSummary: Identifiable {
 final class LibraryViewModel: ObservableObject {
     @Published private(set) var wallpapers: [WallpaperItem] = []
     @Published private(set) var visibleWallpapers: [WallpaperItem] = []
+    @Published private(set) var currentPage = 1
     @Published private(set) var groups: [WallpaperGroup] = []
     @Published var selectedWallpaperID: UUID?
     @Published var selectedWallpaperIDs: Set<UUID> = []
@@ -159,7 +160,8 @@ final class LibraryViewModel: ObservableObject {
             loops: defaults.object(forKey: SettingsKey.loops) as? Bool ?? true,
             pauseOnBattery: defaults.object(forKey: SettingsKey.pauseOnBattery) as? Bool ?? false,
             pauseInFullScreenApps: defaults.object(forKey: SettingsKey.pauseInFullScreen) as? Bool ?? false,
-            fitMode: WallpaperFitMode(rawValue: defaults.string(forKey: SettingsKey.fitMode) ?? "") ?? .fill
+            fitMode: WallpaperFitMode(rawValue: defaults.string(forKey: SettingsKey.fitMode) ?? "") ?? .fill,
+            webWallpaperInteractionEnabled: defaults.object(forKey: SettingsKey.webWallpaperInteractionEnabled) as? Bool ?? false
         )
         wallpaperManager.configure(store: store, policy: playbackPolicy)
         settingsObserver = NotificationCenter.default.addObserver(
@@ -375,33 +377,48 @@ final class LibraryViewModel: ObservableObject {
         startMetadataEnrichment(for: snapshot.items, generation: generation)
     }
 
-    func loadNextPageIfNeeded(currentItem item: WallpaperItem) {
-        guard let lastVisibleID = visibleWallpapers.last?.id, lastVisibleID == item.id else { return }
-        let nextCount = WallpaperLibraryPagination.nextLoadedCount(
-            currentCount: visibleWallpapers.count,
+    var totalPageCount: Int {
+        WallpaperLibraryPagination.pageCount(
             totalCount: filteredWallpapers.count,
             pageSize: Self.pageSize
         )
-        guard nextCount > visibleWallpapers.count else { return }
-        visibleWallpapers = WallpaperLibraryPagination.page(
-            from: filteredWallpapers,
-            loadedCount: nextCount,
+    }
+
+    var pageNumbers: [Int] {
+        let total = totalPageCount
+        guard total > 0 else { return [] }
+        let windowSize = min(5, total)
+        let halfWindow = windowSize / 2
+        var start = max(1, currentPage - halfWindow)
+        let end = min(total, start + windowSize - 1)
+        start = max(1, end - windowSize + 1)
+        return Array(start...end)
+    }
+
+    func goToPage(_ pageNumber: Int) {
+        currentPage = WallpaperLibraryPagination.normalizedPage(
+            pageNumber,
+            totalCount: filteredWallpapers.count,
             pageSize: Self.pageSize
         )
+        refreshVisibleWallpapers()
+        selectedWallpaperID = nil
     }
 
     private func resetPagination() {
-        visibleWallpapers = WallpaperLibraryPagination.page(
-            from: filteredWallpapers,
-            loadedCount: Self.pageSize,
-            pageSize: Self.pageSize
-        )
+        currentPage = 1
+        refreshVisibleWallpapers()
     }
 
-    private func refreshVisibleWallpapersPreservingLoadedCount(_ loadedCount: Int) {
+    private func refreshVisibleWallpapers() {
+        currentPage = WallpaperLibraryPagination.normalizedPage(
+            currentPage,
+            totalCount: filteredWallpapers.count,
+            pageSize: Self.pageSize
+        )
         visibleWallpapers = WallpaperLibraryPagination.page(
             from: filteredWallpapers,
-            loadedCount: loadedCount,
+            pageNumber: currentPage,
             pageSize: Self.pageSize
         )
     }
@@ -443,7 +460,6 @@ final class LibraryViewModel: ObservableObject {
             guard !Task.isCancelled, let self, self.metadataEnrichmentGeneration == generation else { return }
             guard !enriched.isEmpty else { return }
 
-            let loadedCount = self.visibleWallpapers.count
             var mergedItems = self.wallpapers
             var changed = false
             for enrichedItem in enriched {
@@ -463,7 +479,7 @@ final class LibraryViewModel: ObservableObject {
                 try await self.storeWorker.save(items: mergedItems)
                 guard !Task.isCancelled, self.metadataEnrichmentGeneration == generation else { return }
                 self.wallpapers = mergedItems
-                self.refreshVisibleWallpapersPreservingLoadedCount(loadedCount)
+                self.refreshVisibleWallpapers()
             } catch {
                 self.lastError = "保存资源信息失败：\(error.localizedDescription)"
             }
@@ -564,7 +580,7 @@ final class LibraryViewModel: ObservableObject {
         transition: WallpaperTransitionEffect,
         isEnabled: Bool
     ) {
-        let queueID = wallpaperManager.activeQueue(for: display.id)?.id ?? PlaybackQueue.defaultQueue.id
+        let queueID = wallpaperManager.boundQueue(for: display.id)?.id ?? PlaybackQueue.defaultQueue.id
         var queue = wallpaperManager.queue(with: queueID) ?? .defaultQueue
         queue.addWallpaperIDs(wallpaperIDs)
         queue.defaultIntervalSeconds = intervalSeconds
@@ -791,7 +807,7 @@ final class LibraryViewModel: ObservableObject {
                 let refreshed = try await worker.refreshAvailability(for: item)
                 guard let self, let index = self.wallpapers.firstIndex(where: { $0.id == item.id }) else { return }
                 self.wallpapers[index] = refreshed
-                self.refreshVisibleWallpapersPreservingLoadedCount(self.visibleWallpapers.count)
+                self.refreshVisibleWallpapers()
             } catch {
                 self?.lastError = error.localizedDescription
             }
@@ -979,7 +995,8 @@ final class LibraryViewModel: ObservableObject {
             loops: defaults.object(forKey: SettingsKey.loops) as? Bool ?? true,
             pauseOnBattery: defaults.object(forKey: SettingsKey.pauseOnBattery) as? Bool ?? false,
             pauseInFullScreenApps: defaults.object(forKey: SettingsKey.pauseInFullScreen) as? Bool ?? false,
-            fitMode: WallpaperFitMode(rawValue: defaults.string(forKey: SettingsKey.fitMode) ?? "") ?? .fill
+            fitMode: WallpaperFitMode(rawValue: defaults.string(forKey: SettingsKey.fitMode) ?? "") ?? .fill,
+            webWallpaperInteractionEnabled: defaults.object(forKey: SettingsKey.webWallpaperInteractionEnabled) as? Bool ?? false
         )
         wallpaperManager.update(policy: playbackPolicy)
         if let path = defaults.string(forKey: SettingsKey.libraryPath) {
@@ -1635,7 +1652,7 @@ private struct LibraryContentView: View {
                         .font(.title2.weight(.semibold))
                     Text(model.isSelectionMode
                          ? "已选 \(model.selectedWallpaperIDs.count) / \(model.filteredWallpapers.count) 项"
-                         : "\(model.filteredWallpapers.count) 个资源 · 已加载 \(model.visibleWallpapers.count)")
+                         : "\(model.filteredWallpapers.count) 个资源 · 第 \(model.currentPage) / \(max(model.totalPageCount, 1)) 页")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1753,7 +1770,6 @@ private struct LibraryContentView: View {
                             } favoriteAction: {
                                 model.toggleFavorite(item)
                             }
-                            .onAppear { model.loadNextPageIfNeeded(currentItem: item) }
                             .contextMenu {
                                 WallpaperContextMenu(model: model, item: item)
                             }
@@ -1779,12 +1795,16 @@ private struct LibraryContentView: View {
                     } favoriteAction: {
                         model.toggleFavorite(item)
                     }
-                    .onAppear { model.loadNextPageIfNeeded(currentItem: item) }
                     .contextMenu {
                         WallpaperContextMenu(model: model, item: item)
                     }
                 }
                 .listStyle(.inset)
+            }
+
+            if !model.filteredWallpapers.isEmpty {
+                Divider()
+                paginationBar
             }
         }
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isDropTargeted) { providers in
@@ -1812,6 +1832,71 @@ private struct LibraryContentView: View {
         }
     }
 
+    private var paginationBar: some View {
+        HStack(spacing: 10) {
+            Text("本页 \(model.visibleWallpapers.count) 项")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 72, alignment: .leading)
+
+            Spacer()
+
+            Button {
+                model.goToPage(1)
+            } label: {
+                Image(systemName: "backward.end.fill")
+            }
+            .buttonStyle(.borderless)
+            .disabled(model.currentPage <= 1)
+            .help("第一页")
+
+            Button {
+                model.goToPage(model.currentPage - 1)
+            } label: {
+                Image(systemName: "chevron.left")
+            }
+            .buttonStyle(.borderless)
+            .disabled(model.currentPage <= 1)
+            .help("上一页")
+
+            ForEach(model.pageNumbers, id: \.self) { page in
+                PageNumberButton(
+                    page: page,
+                    isCurrent: page == model.currentPage,
+                    action: { model.goToPage(page) }
+                )
+            }
+
+            Button {
+                model.goToPage(model.currentPage + 1)
+            } label: {
+                Image(systemName: "chevron.right")
+            }
+            .buttonStyle(.borderless)
+            .disabled(model.currentPage >= model.totalPageCount)
+            .help("下一页")
+
+            Button {
+                model.goToPage(model.totalPageCount)
+            } label: {
+                Image(systemName: "forward.end.fill")
+            }
+            .buttonStyle(.borderless)
+            .disabled(model.currentPage >= model.totalPageCount)
+            .help("最后一页")
+
+            Spacer()
+
+            Text("第 \(model.currentPage) / \(model.totalPageCount) 页")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 72, alignment: .trailing)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 10)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.24))
+    }
+
     private var title: String {
         switch model.destination {
         case .all: return "全部壁纸"
@@ -1824,6 +1909,30 @@ private struct LibraryContentView: View {
         case .group(let id): return model.groups.first(where: { $0.id == id })?.name ?? "分组"
         case .display(let id): return model.displayRows.first(where: { $0.id == id })?.name ?? "显示器"
         }
+    }
+}
+
+private struct PageNumberButton: View {
+    let page: Int
+    let isCurrent: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text("\(page)")
+                .font(.caption.monospacedDigit().weight(isCurrent ? .semibold : .regular))
+                .frame(minWidth: 26, minHeight: 24)
+                .foregroundStyle(isCurrent ? Color.white : Color.primary)
+                .background(
+                    isCurrent
+                        ? Color.accentColor
+                        : Color(nsColor: .controlBackgroundColor),
+                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("第 \(page) 页")
+        .accessibilityAddTraits(isCurrent ? .isSelected : [])
     }
 }
 
@@ -1981,7 +2090,7 @@ private struct WallpaperPreviewFrame<Content: View>: View {
         // Use a geometry-bearing color as the sizing source. Applying
         // aspectRatio directly to ThumbnailView lets a portrait thumbnail
         // contribute its intrinsic height and can make the preview vertical.
-        Color.clear
+        Color.black
             .frame(maxWidth: .infinity)
             .aspectRatio(CGFloat(WallpaperPreviewLayout.aspectRatio), contentMode: .fit)
             .overlay {
@@ -1998,9 +2107,15 @@ private struct ThumbnailView: View {
     var body: some View {
         ZStack {
             if let image = previewImage {
-                Image(nsImage: image)
-                    .resizable()
-                    .scaledToFill()
+                if isPortrait(image) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFit()
+                } else {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFill()
+                }
             } else {
                 LinearGradient(
                     colors: [Color(nsColor: .controlBackgroundColor), Color(nsColor: .underPageBackgroundColor)],
@@ -2019,8 +2134,12 @@ private struct ThumbnailView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .background(Color.black)
         .clipped()
+    }
+
+    private func isPortrait(_ image: NSImage) -> Bool {
+        image.size.height > image.size.width
     }
 
     private var previewImage: NSImage? {

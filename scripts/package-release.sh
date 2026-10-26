@@ -27,6 +27,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/Assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 cp "$BUILD" "$APP/Contents/MacOS/WallpaperMac"
 chmod +x "$APP/Contents/MacOS/WallpaperMac"
+"$ROOT/scripts/bundle-ffmpeg.sh"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

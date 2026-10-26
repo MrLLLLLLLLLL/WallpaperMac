@@ -308,7 +308,6 @@ public final class WallpaperStore {
             if type == .video {
                 playbackURL = try prepareVideoPlaybackURL(
                     sourceURL: storedURL,
-                    itemID: id,
                     storageMode: storageMode
                 )
             }
@@ -417,7 +416,6 @@ public final class WallpaperStore {
             if item.type == .video {
                 let preparedPlaybackURL = try prepareVideoPlaybackURL(
                     sourceURL: updated.sourceURL,
-                    itemID: item.id,
                     storageMode: item.storageMode
                 )
                 updated.playbackURL = preparedPlaybackURL
@@ -504,6 +502,7 @@ public final class WallpaperStore {
 
     @discardableResult
     public func refreshAllAvailability() throws -> [WallpaperItem] {
+        removeLegacyVideoProxies()
         let currentItems = try items()
         var refreshed: [WallpaperItem] = []
         refreshed.reserveCapacity(currentItems.count)
@@ -582,17 +581,15 @@ public final class WallpaperStore {
 
     private func ensureLibraryDirectories() throws {
         let assetsURL = libraryURL.appendingPathComponent("Assets", isDirectory: true)
-        let proxiesURL = libraryURL.appendingPathComponent("VideoProxies", isDirectory: true)
         try fileManager.createDirectory(at: assetsURL, withIntermediateDirectories: true)
-        try fileManager.createDirectory(at: proxiesURL, withIntermediateDirectories: true)
     }
 
     /// Prepares the URL AVFoundation should open for a video wallpaper.
-    /// Managed imports can be safely normalized in their library copy; external
-    /// references retain the original file and receive a small app-owned proxy.
+    /// Managed imports can be normalized in their library copy. External
+    /// references always open the original file and never create persistent
+    /// playback copies inside the wallpaper library.
     private func prepareVideoPlaybackURL(
         sourceURL: URL,
-        itemID: UUID,
         storageMode: StorageMode
     ) throws -> URL? {
         switch storageMode {
@@ -600,35 +597,32 @@ public final class WallpaperStore {
             _ = try VideoContainerCompatibility.normalizeHVC1InPlace(at: sourceURL, fileManager: fileManager)
             return nil
         case .externalReference:
-            guard try VideoContainerCompatibility.needsHVC1Normalization(at: sourceURL, fileManager: fileManager) else {
-                return nil
-            }
-            let proxiesURL = libraryURL.appendingPathComponent("VideoProxies", isDirectory: true)
-            let fileExtension = sourceURL.pathExtension.isEmpty ? "mp4" : sourceURL.pathExtension
-            let proxyURL = proxiesURL.appendingPathComponent("\(itemID.uuidString).\(fileExtension)")
-            removePlaybackProxyIfOwned(at: proxyURL)
-            _ = try VideoContainerCompatibility.copyNormalizedVideo(
-                from: sourceURL,
-                to: proxyURL,
-                fileManager: fileManager
-            )
-            return proxyURL
+            return nil
         }
     }
 
     private func refreshVideoPlaybackURL(for item: inout WallpaperItem) throws {
-        guard item.type == .video,
-              fileManager.fileExists(atPath: item.sourceURL.path),
-              fileManager.isReadableFile(atPath: item.sourceURL.path) else { return }
-        if let playbackURL = item.playbackURL,
-           fileManager.isReadableFile(atPath: playbackURL.path) {
+        guard item.type == .video else { return }
+        if item.storageMode == .externalReference {
+            removePlaybackProxyIfOwned(at: item.playbackURL)
+            item.playbackURL = nil
             return
         }
+
+        removePlaybackProxyIfOwned(at: item.playbackURL)
+        item.playbackURL = nil
+        guard fileManager.fileExists(atPath: item.sourceURL.path),
+              fileManager.isReadableFile(atPath: item.sourceURL.path) else { return }
         item.playbackURL = try prepareVideoPlaybackURL(
             sourceURL: item.sourceURL,
-            itemID: item.id,
             storageMode: item.storageMode
         )
+    }
+
+    private func removeLegacyVideoProxies() {
+        let proxiesURL = libraryURL.appendingPathComponent("VideoProxies", isDirectory: true)
+        guard fileManager.fileExists(atPath: proxiesURL.path) else { return }
+        try? fileManager.removeItem(at: proxiesURL)
     }
 
     private func removePlaybackProxyIfOwned(at url: URL?) {
