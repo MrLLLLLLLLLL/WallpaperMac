@@ -620,7 +620,6 @@ final class WallpaperManager: ObservableObject {
             controllers[displayID]?.teardownAndClose()
             controllers[displayID] = replacement
             playbackStates[displayID] = replacement.playbackState
-            replacement.showWindow(nil)
             replacement.window?.orderFrontRegardless()
         } catch {
             return
@@ -894,20 +893,19 @@ final class WallpaperManager: ObservableObject {
     ) {
         let targetFrame = screen.frame
         let window = replacement.window
+        // Wallpaper windows are desktop-level surfaces: order them above the
+        // desktop without becoming key or activating the app, so automatic
+        // queue transitions never steal focus from the user's frontmost app.
+        // Interactive web wallpapers still receive clicks because their windows
+        // accept first mouse and do not ignore mouse events.
         switch effect {
         case .cut:
             previous?.teardownAndClose()
             window?.alphaValue = 1
-            replacement.showWindow(nil)
-            window?.makeKeyAndOrderFront(nil)
             window?.orderFrontRegardless()
-            NSApp.activate(ignoringOtherApps: true)
         case .crossfade:
             window?.alphaValue = 0
-            replacement.showWindow(nil)
-            window?.makeKeyAndOrderFront(nil)
             window?.orderFrontRegardless()
-            NSApp.activate(ignoringOtherApps: true)
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.45
                 context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -920,10 +918,7 @@ final class WallpaperManager: ObservableObject {
             let direction: CGFloat = effect == .slideLeft ? 1 : -1
             window?.setFrame(targetFrame.offsetBy(dx: direction * targetFrame.width, dy: 0), display: false)
             window?.alphaValue = 1
-            replacement.showWindow(nil)
-            window?.makeKeyAndOrderFront(nil)
             window?.orderFrontRegardless()
-            NSApp.activate(ignoringOtherApps: true)
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.5
                 context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -936,10 +931,7 @@ final class WallpaperManager: ObservableObject {
             let inset = min(targetFrame.width, targetFrame.height) * 0.08
             window?.setFrame(targetFrame.insetBy(dx: inset, dy: inset), display: false)
             window?.alphaValue = 0
-            replacement.showWindow(nil)
-            window?.makeKeyAndOrderFront(nil)
             window?.orderFrontRegardless()
-            NSApp.activate(ignoringOtherApps: true)
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.5
                 context.timingFunction = CAMediaTimingFunction(name: .easeOut)
