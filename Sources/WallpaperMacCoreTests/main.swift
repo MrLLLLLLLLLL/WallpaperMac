@@ -702,7 +702,8 @@ let tests: [(String, () throws -> Void)] = [
     ("invalidates edited active queue bindings", testDisplayBindingInvalidatesEditedQueue),
     ("migrates legacy display queues", testStoreMigratesLegacyDisplayQueues),
     ("round trips display queue state", testQueueStoreRoundTripsDisplayQueueState),
-    ("formats application version information", testApplicationVersionInfoFormatting)
+    ("formats application version information", testApplicationVersionInfoFormatting),
+    ("bounds video-completion stall watchdog", testPlaybackQueueStallWatchdogInterval)
 ]
 
 var failures = 0
@@ -867,4 +868,29 @@ func testApplicationVersionInfoFormatting() throws {
 
     let development = ApplicationVersionInfo(infoDictionary: [:], fallbackVersion: "0.2.5")
     try expect(development.displayText, equals: "版本 0.2.5", "development builds should use the fallback version")
+}
+
+func testPlaybackQueueStallWatchdogInterval() throws {
+    let queue = PlaybackQueue(name: "夜间", defaultIntervalSeconds: 30)
+
+    try expect(
+        queue.stallWatchdogInterval(forVideoWithDurationSeconds: 10),
+        equals: 30,
+        "short videos should keep a minimum watchdog so a hang still recovers quickly"
+    )
+    try expect(
+        queue.stallWatchdogInterval(forVideoWithDurationSeconds: 120),
+        equals: 144,
+        "long videos should use duration plus a 20% grace window"
+    )
+    try expect(
+        queue.stallWatchdogInterval(forVideoWithDurationSeconds: nil),
+        equals: 300,
+        "unknown duration should use a long timeout that does not cut healthy long videos"
+    )
+    try expect(
+        queue.stallWatchdogInterval(forVideoWithDurationSeconds: .nan),
+        equals: 300,
+        "invalid duration should fall back to the safe default"
+    )
 }

@@ -522,6 +522,9 @@ final class WallpaperManager: ObservableObject {
                 advanceAfterVideoCompletion: shouldAdvanceAfterVideoCompletion(queue: queue, item: item)
             )
         } catch {
+            // Do not leave the display without a timer: a failed apply would
+            // otherwise stall the queue permanently (no tick, no completion).
+            scheduleQueueTimer(for: display.id, interval: 5)
             return
         }
         scheduleQueueTimerIfNeeded(for: display.id, queue: queue, state: state, item: item)
@@ -795,7 +798,11 @@ final class WallpaperManager: ObservableObject {
         item: WallpaperItem
     ) {
         if shouldAdvanceAfterVideoCompletion(queue: queue, item: item) {
-            queueTimers.removeValue(forKey: displayID)?.invalidate()
+            // Still arm a watchdog: video-completion queues rely solely on the
+            // player callback, so a failed start or hung decode would stall
+            // the queue forever with no timer to recover.
+            let watchdog = queue.stallWatchdogInterval(forVideoWithDurationSeconds: item.metadata?.durationSeconds)
+            scheduleQueueTimer(for: displayID, interval: watchdog)
         } else {
             scheduleQueueTimer(for: displayID, interval: effectiveInterval(queue: queue, state: state, itemID: item.id))
         }
@@ -858,7 +865,11 @@ final class WallpaperManager: ObservableObject {
             )
             scheduleQueueTimerIfNeeded(for: displayID, queue: queue, state: nextState, item: item)
         } catch {
-            // The next timer tick will try the next available item.
+            // Keep the queue moving even when the next item fails to apply.
+            // Video-completion mode has no periodic tick unless we arm one.
+            if queueTimers[displayID] == nil {
+                scheduleQueueTimer(for: displayID, interval: 5)
+            }
         }
     }
 
@@ -1371,6 +1382,13 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
                 }
             } catch {
                 NSLog("WallpaperMac compatibility playback failed for \(sourceURL.path): \(error.localizedDescription)")
+                // Surface the failure as playback completion so video-completion
+                // queues can advance instead of waiting forever for an item that
+                // never installed a player.
+                guard !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    self?.onVideoPlaybackCompleted?()
+                }
             }
         }
     }
@@ -1411,14 +1429,18 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
         ) { [weak self, weak player] _ in
             guard let self, !self.isTornDown else { return }
             if self.loops {
-                player?.seek(to: .zero)
-                if self.isPlaying && !self.isSystemSuspended { player?.play() }
+                // Resume only after the seek lands; play() during an in-flight
+                // seek can leave the player waiting forever on some files.
+                player?.seek(to: .zero) { finished in
+                    guard finished, let player else { return }
+                    if self.isPlaying && !self.isSystemSuspended { player.play() }
+                }
             } else {
                 self.onVideoPlaybackCompleted?()
             }
         }
         player.isMuted = isMuted
-        if isPlaying { player.play() }
+        if isPlaying && !isSystemSuspended { player.play() }
     }
 
     private func videoCodec(for asset: AVURLAsset) async throws -> String? {

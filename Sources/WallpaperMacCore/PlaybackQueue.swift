@@ -167,6 +167,22 @@ public struct PlaybackQueue: Identifiable, Codable, Equatable, Sendable {
         itemIntervalOverrides[itemID] ?? defaultIntervalSeconds
     }
 
+    /// Fallback timeout when a queue advances after video completion.
+    ///
+    /// Video-completion queues have no periodic tick, so a stall (failed
+    /// decoder start, hung ffmpeg, probe error) would freeze the queue
+    /// forever. The watchdog fires slightly after the video should have
+    /// ended and lets the queue move on.
+    public func stallWatchdogInterval(forVideoWithDurationSeconds durationSeconds: Double?) -> Double {
+        if let durationSeconds, durationSeconds.isFinite, durationSeconds > 0 {
+            let grace = max(15, durationSeconds * 0.2)
+            return min(max(durationSeconds + grace, 30), 86_400)
+        }
+        // Unknown duration: prefer a long timeout so healthy long videos are
+        // not cut short, while a hung playback still recovers.
+        return min(max(defaultIntervalSeconds, 300), 86_400)
+    }
+
     private static func deduplicated(_ ids: [UUID]) -> [UUID] {
         var seen = Set<UUID>()
         return ids.filter { seen.insert($0).inserted }

@@ -106,6 +106,7 @@ final class WallpaperVideoStreamController {
     private func startProcess() {
         guard let executableURL = WallpaperVideoCompatibilityService.executableURL() else {
             NSLog("WallpaperMac streaming playback failed: ffmpeg unavailable for \(sourceURL.path)")
+            notifyPlaybackCompleted()
             return
         }
 
@@ -123,12 +124,15 @@ final class WallpaperVideoStreamController {
         stateLock.lock()
         guard !isTornDown else {
             stateLock.unlock()
+            notifyPlaybackCompleted()
             return
         }
         self.process = process
         self.outputHandle = pipe.fileHandleForReading
         bufferedData.removeAll(keepingCapacity: true)
-        frameIndex = 0
+        // Keep `frameIndex` monotonic across loop restarts. AVSampleBufferDisplayLayer
+        // drops sample buffers whose PTS falls behind its timebase, so resetting to 0
+        // on every loop froze the video after the first playthrough.
         stateLock.unlock()
 
         do {
@@ -139,6 +143,7 @@ final class WallpaperVideoStreamController {
             self.process = nil
             self.outputHandle = nil
             stateLock.unlock()
+            notifyPlaybackCompleted()
             return
         }
         frameQueue.async { [weak self] in
@@ -207,9 +212,13 @@ final class WallpaperVideoStreamController {
         if loops {
             startProcess()
         } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.onVideoPlaybackCompleted?()
-            }
+            notifyPlaybackCompleted()
+        }
+    }
+
+    private func notifyPlaybackCompleted() {
+        DispatchQueue.main.async { [weak self] in
+            self?.onVideoPlaybackCompleted?()
         }
     }
 
