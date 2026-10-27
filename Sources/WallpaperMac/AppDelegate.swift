@@ -15,6 +15,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             quitApplication: { NSApp.terminate(nil) }
         )
         showMainWindow()
+
+        // Daily update check runs at launch, independent of the settings UI.
+        if UserDefaults.standard.object(forKey: SettingsKey.autoCheckUpdates) as? Bool ?? true {
+            UpdateService.shared.runDailyCheckIfNeeded()
+        }
     }
 
     func showMainWindow() {

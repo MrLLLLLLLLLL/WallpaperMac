@@ -13,6 +13,7 @@ final class WallpaperVideoStreamController {
     private let sourceURL: URL
     private let loops: Bool
     private let onVideoPlaybackCompleted: (() -> Void)?
+    private let onFrameProgress: (() -> Void)?
     private let frameRate: Int
     private let width: Int
     private let height: Int
@@ -37,13 +38,15 @@ final class WallpaperVideoStreamController {
         videoGravity: AVLayerVideoGravity,
         loops: Bool,
         frame: CGRect,
-        onVideoPlaybackCompleted: (() -> Void)?
+        onVideoPlaybackCompleted: (() -> Void)?,
+        onFrameProgress: (() -> Void)? = nil
     ) {
         let plan = VideoCompatibilityStreamPlan(sourceURL: sourceURL)
         self.sourceURL = sourceURL
         self.isPlaying = isPlaying
         self.loops = loops
         self.onVideoPlaybackCompleted = onVideoPlaybackCompleted
+        self.onFrameProgress = onFrameProgress
         self.frameRate = plan.frameRate
         self.width = plan.width
         self.height = plan.height
@@ -93,10 +96,17 @@ final class WallpaperVideoStreamController {
         bufferedData.removeAll(keepingCapacity: true)
         stateLock.unlock()
 
-        handle?.readabilityHandler = nil
-        try? handle?.close()
+        // Order matters: terminate first so the pipe hits EOF and any blocked
+        // read() on frameQueue returns. Closing the handle while read is still
+        // blocked races FileHandle's own lock and can crash.
         if let process, process.isRunning {
             process.terminate()
+        }
+        handle?.readabilityHandler = nil
+        if let handle {
+            frameQueue.async {
+                try? handle.close()
+            }
         }
         displayLayer.stopRequestingMediaData()
         displayLayer.flushAndRemoveImage()
@@ -146,6 +156,22 @@ final class WallpaperVideoStreamController {
             notifyPlaybackCompleted()
             return
         }
+
+        // Approach B: run() outside the lock, then re-validate ownership. A
+        // teardown between unlock and run would otherwise leave an orphan
+        // ffmpeg whose termination handler no longer belongs to us.
+        stateLock.lock()
+        let orphaned = self.process !== process || isTornDown
+        if orphaned {
+            self.process = nil
+            self.outputHandle = nil
+        }
+        stateLock.unlock()
+        if orphaned {
+            process.terminate()
+            return
+        }
+
         frameQueue.async { [weak self] in
             self?.startRequestingFrames()
         }
@@ -181,6 +207,10 @@ final class WallpaperVideoStreamController {
                 stopRequestingFrames()
                 return
             }
+            // Heartbeat: a frame arrived, so the pipeline is alive. Hop to the
+            // main actor like notifyPlaybackCompleted — produceFrames runs on
+            // frameQueue and must not touch WallpaperManager state directly.
+            notifyFrameProgress()
             let presentationIndex = frameIndex
             frameIndex += 1
             enqueue(frame, presentationIndex: presentationIndex)
@@ -201,12 +231,19 @@ final class WallpaperVideoStreamController {
             return
         }
         self.process = nil
+        let handle = self.outputHandle
         self.outputHandle = nil
         bufferedData.removeAll(keepingCapacity: true)
         isRequestingFrames = false
         let cancelled = isTornDown
         stateLock.unlock()
 
+        if let handle {
+            handle.readabilityHandler = nil
+            frameQueue.async {
+                try? handle.close()
+            }
+        }
         displayLayer.stopRequestingMediaData()
         guard !cancelled else { return }
         if loops {
@@ -219,6 +256,12 @@ final class WallpaperVideoStreamController {
     private func notifyPlaybackCompleted() {
         DispatchQueue.main.async { [weak self] in
             self?.onVideoPlaybackCompleted?()
+        }
+    }
+
+    private func notifyFrameProgress() {
+        DispatchQueue.main.async { [weak self] in
+            self?.onFrameProgress?()
         }
     }
 
@@ -246,9 +289,13 @@ final class WallpaperVideoStreamController {
         }
 
         stateLock.lock()
+        defer { stateLock.unlock() }
+        // The buffer can be cleared by teardown()/processDidTerminate() between
+        // the loop exit above and this lock. Re-check before slicing so a
+        // partial buffer never reaches removeSubrange (which would trap).
+        guard bufferedData.count >= frameSize else { return nil }
         let frame = Data(bufferedData.prefix(frameSize))
         bufferedData.removeSubrange(0..<frameSize)
-        stateLock.unlock()
         return frame
     }
 

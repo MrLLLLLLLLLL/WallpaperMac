@@ -53,3 +53,7 @@ plan.md
 .env
 .env.*
 !.env.example
+
+# Update signing private keys (never commit)
+secrets/
+*.update.key

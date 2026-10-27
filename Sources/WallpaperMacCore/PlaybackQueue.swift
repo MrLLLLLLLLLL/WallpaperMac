@@ -130,6 +130,22 @@ public struct PlaybackQueue: Identifiable, Codable, Equatable, Sendable {
         updatedAt = Date()
     }
 
+    /// Replaces membership wholesale while keeping the given order.
+    ///
+    /// Used by the queue editor: deletions and manual reordering must stick,
+    /// which an additive merge cannot express. Callers that hand-edited the
+    /// order pass `markingSortMode: .custom` so later automatic sorting does
+    /// not silently reshuffle the list.
+    public mutating func replaceWallpaperIDs(_ ids: [UUID], markingSortMode mode: QueueSortMode? = nil) {
+        wallpaperIDs = Self.deduplicated(ids)
+        if let mode {
+            sortMode = mode
+        }
+        let valid = Set(wallpaperIDs)
+        itemIntervalOverrides = itemIntervalOverrides.filter { valid.contains($0.key) }
+        updatedAt = Date()
+    }
+
     public mutating func removeWallpaperIDs(_ ids: Set<UUID>) {
         wallpaperIDs.removeAll { ids.contains($0) }
         itemIntervalOverrides = itemIntervalOverrides.filter { !ids.contains($0.key) }
@@ -171,17 +187,31 @@ public struct PlaybackQueue: Identifiable, Codable, Equatable, Sendable {
     ///
     /// Video-completion queues have no periodic tick, so a stall (failed
     /// decoder start, hung ffmpeg, probe error) would freeze the queue
-    /// forever. The watchdog fires slightly after the video should have
-    /// ended and lets the queue move on.
+    /// forever. The watchdog is a *stall* detector, not a playback limiter:
+    ///
+    /// - Known duration: fires slightly after the video should have ended.
+    /// - Unknown duration: a short stall window. The player feeds a frame
+    ///   heartbeat that keeps re-arming it, so healthy long videos are never
+    ///   cut while a truly hung pipeline still recovers.
+    ///
+    /// `hardDeadlineInterval` is the absolute ceiling that a heartbeat cannot
+    /// extend, applied separately per display.
     public func stallWatchdogInterval(forVideoWithDurationSeconds durationSeconds: Double?) -> Double {
         if let durationSeconds, durationSeconds.isFinite, durationSeconds > 0 {
             let grace = max(15, durationSeconds * 0.2)
             return min(max(durationSeconds + grace, 30), 86_400)
         }
-        // Unknown duration: prefer a long timeout so healthy long videos are
-        // not cut short, while a hung playback still recovers.
-        return min(max(defaultIntervalSeconds, 300), 86_400)
+        // Unknown duration: stall window only. Absence of frames for this long
+        // means the pipeline is dead; the heartbeat covers healthy playback.
+        return Self.unknownDurationStallWindowSeconds
     }
+
+    /// Absolute playback ceiling for video-completion queues, independent of
+    /// the stall heartbeat. Prevents an infinite, always-progressing stream
+    /// from occupying a display forever.
+    public var hardDeadlineInterval: Double { 4 * 60 * 60 }
+
+    public static let unknownDurationStallWindowSeconds: Double = 60
 
     private static func deduplicated(_ ids: [UUID]) -> [UUID] {
         var seen = Set<UUID>()

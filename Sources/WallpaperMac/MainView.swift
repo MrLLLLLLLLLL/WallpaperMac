@@ -133,6 +133,7 @@ final class LibraryViewModel: ObservableObject {
     private var pendingGroupAssignmentIDs: Set<UUID> = []
     private var pendingQueueAssignmentIDs: Set<UUID> = []
     private var undoOperation: (() -> Void)?
+    private var activeToastID: UUID?
     private var metadataEnrichmentTask: Task<Void, Never>?
     private var metadataEnrichmentGeneration = 0
     private var libraryLoadTask: Task<Void, Never>?
@@ -248,7 +249,7 @@ final class LibraryViewModel: ObservableObject {
     }
 
     var displayRows: [DisplayRow] {
-        let assignments = Dictionary(uniqueKeysWithValues: wallpaperManager.displayAssignments.map { ($0.id, $0) })
+        let assignments = UniquedDictionary.build(wallpaperManager.displayAssignments.map { ($0.id, $0) }, label: "display assignments")
         let connectedRows = displayService.displays.map { display in
             DisplayRow(
                 id: display.id,
@@ -460,25 +461,30 @@ final class LibraryViewModel: ObservableObject {
             guard !Task.isCancelled, let self, self.metadataEnrichmentGeneration == generation else { return }
             guard !enriched.isEmpty else { return }
 
-            var mergedItems = self.wallpapers
-            var changed = false
+            // Field-level patches only: a full merged array would overwrite
+            // renames/favorites that landed while enrichment was running.
+            var patches: [UUID: WallpaperStore.MetadataPatch] = [:]
             for enrichedItem in enriched {
-                guard let index = mergedItems.firstIndex(where: { current in
-                    current.id == enrichedItem.id && current.sourceURL == enrichedItem.sourceURL && current.entryURL == enrichedItem.entryURL
+                guard let current = self.wallpapers.first(where: { candidate in
+                    candidate.id == enrichedItem.id && candidate.sourceURL == enrichedItem.sourceURL && candidate.entryURL == enrichedItem.entryURL
                 }) else { continue }
-                var current = mergedItems[index]
                 if current.metadata != enrichedItem.metadata || current.thumbnailURL != enrichedItem.thumbnailURL {
-                    current.metadata = enrichedItem.metadata
-                    current.thumbnailURL = enrichedItem.thumbnailURL
-                    mergedItems[index] = current
-                    changed = true
+                    patches[enrichedItem.id] = WallpaperStore.MetadataPatch(
+                        metadata: enrichedItem.metadata,
+                        thumbnailURL: enrichedItem.thumbnailURL
+                    )
                 }
             }
-            guard changed else { return }
+            guard !patches.isEmpty else { return }
             do {
-                try await self.storeWorker.save(items: mergedItems)
+                let updated = try await self.storeWorker.updateMetadata(patches)
                 guard !Task.isCancelled, self.metadataEnrichmentGeneration == generation else { return }
-                self.wallpapers = mergedItems
+                var merged = self.wallpapers
+                for item in updated {
+                    guard let index = merged.firstIndex(where: { $0.id == item.id }) else { continue }
+                    merged[index] = item
+                }
+                self.wallpapers = merged
                 self.refreshVisibleWallpapers()
             } catch {
                 self.lastError = "保存资源信息失败：\(error.localizedDescription)"
@@ -582,7 +588,9 @@ final class LibraryViewModel: ObservableObject {
     ) {
         let queueID = wallpaperManager.boundQueue(for: display.id)?.id ?? PlaybackQueue.defaultQueue.id
         var queue = wallpaperManager.queue(with: queueID) ?? .defaultQueue
-        queue.addWallpaperIDs(wallpaperIDs)
+        // Editor saves are a full replace: the list on screen is the source of
+        // truth for both membership and order.
+        queue.replaceWallpaperIDs(wallpaperIDs, markingSortMode: .custom)
         queue.defaultIntervalSeconds = intervalSeconds
         queue.transition = transition
         _ = wallpaperManager.updateQueue(queue)
@@ -658,10 +666,16 @@ final class LibraryViewModel: ObservableObject {
     }
 
     func importDroppedFiles(from providers: [NSItemProvider]) {
-        for provider in providers {
+        let collector = DropURLCollector(providerCount: providers.count)
+        for (index, provider) in providers.enumerated() {
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { [weak self] data, error in
                 guard error == nil else {
-                    Task { @MainActor [weak self] in self?.lastError = error?.localizedDescription }
+                    collector.submit(nil, at: index)
+                    Task { @MainActor [weak self] in
+                        if let urls = collector.drain() {
+                            self?.beginImport(urls)
+                        }
+                    }
                     return
                 }
                 let url: URL?
@@ -674,9 +688,11 @@ final class LibraryViewModel: ObservableObject {
                 } else {
                     url = nil
                 }
-                guard let url else { return }
+                collector.submit(url, at: index)
                 Task { @MainActor [weak self] in
-                    self?.beginImport([url])
+                    if let urls = collector.drain() {
+                        self?.beginImport(urls)
+                    }
                 }
             }
         }
@@ -787,7 +803,13 @@ final class LibraryViewModel: ObservableObject {
     }
 
     func toggleAllPlayback() {
-        wallpaperManager.setPlaybackEnabledForAll(!wallpaperManager.isAnyDynamicWallpaperPlaying)
+        let shouldPlay = !wallpaperManager.isAnyDynamicWallpaperPlaying
+        wallpaperManager.setPlaybackEnabledForAll(shouldPlay)
+        NotificationCenter.default.post(
+            name: .wallpaperMacPlaybackStateChanged,
+            object: nil,
+            userInfo: ["isPlaying": shouldPlay]
+        )
     }
 
     func toggleAllMute() {
@@ -962,12 +984,17 @@ final class LibraryViewModel: ObservableObject {
     }
 
     func showToast(_ message: String, undo: (() -> Void)? = nil) {
+        // Tag each toast so a stale timer cannot clear a newer one that reused
+        // the same message text (including undo prompts).
+        let toastID = UUID()
+        activeToastID = toastID
         toastMessage = message
         undoOperation = undo
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self, self.toastMessage == message else { return }
+            guard let self, self.activeToastID == toastID else { return }
             self.toastMessage = nil
             self.undoOperation = nil
+            self.activeToastID = nil
         }
     }
 
@@ -1470,17 +1497,33 @@ private struct QueueEditorView: View {
     }
 
     private func moveQueueItems(from offsets: IndexSet, to destination: Int) {
-        var ids = queueItems.map(\.id)
-        ids.move(fromOffsets: offsets, toOffset: destination)
+        // The list shows only resolved items; wallpaperIDs may still contain
+        // placeholders for deleted wallpapers. Translate visible offsets onto
+        // wallpaperIDs so a reorder cannot silently drop those rows.
+        let visibleIDs = queueItems.map(\.id)
+        let wallpaperIndices = visibleIDs.compactMap { id in wallpaperIDs.firstIndex(of: id) }
+        guard wallpaperIndices.count == visibleIDs.count else { return }
+        let source = IndexSet(offsets.compactMap { offset -> Int? in
+            guard wallpaperIndices.indices.contains(offset) else { return nil }
+            return wallpaperIndices[offset]
+        })
+        let dest: Int = {
+            if wallpaperIndices.indices.contains(destination) {
+                return wallpaperIndices[destination]
+            }
+            return wallpaperIDs.count
+        }()
+        var ids = wallpaperIDs
+        ids.move(fromOffsets: source, toOffset: dest)
         wallpaperIDs = ids
     }
 
     private func swapQueueItems(at index: Int, with otherIndex: Int) {
-        guard index >= 0, index < queueItems.count,
-              otherIndex >= 0, otherIndex < queueItems.count else { return }
-        var ids = queueItems.map(\.id)
-        ids.swapAt(index, otherIndex)
-        wallpaperIDs = ids
+        let visibleIDs = queueItems.map(\.id)
+        guard visibleIDs.indices.contains(index), visibleIDs.indices.contains(otherIndex) else { return }
+        guard let first = wallpaperIDs.firstIndex(of: visibleIDs[index]),
+              let second = wallpaperIDs.firstIndex(of: visibleIDs[otherIndex]) else { return }
+        wallpaperIDs.swapAt(first, second)
     }
 
     private func save() {
@@ -2144,11 +2187,11 @@ private struct ThumbnailView: View {
 
     private var previewImage: NSImage? {
         guard item.availability == .available else { return nil }
-        if let thumbnailURL = item.thumbnailURL, let image = NSImage(contentsOf: thumbnailURL) {
-            return image
+        if let thumbnailURL = item.thumbnailURL {
+            return ThumbnailCache.shared.image(at: thumbnailURL)
         }
         guard item.type == .image else { return nil }
-        return NSImage(contentsOf: item.sourceURL)
+        return ThumbnailCache.shared.image(at: item.sourceURL)
     }
 
     private var iconName: String {
@@ -2166,7 +2209,7 @@ private struct ImportSheet: View {
 
     private var webProject: URL? {
         let webProjects = model.pendingImportCandidates.compactMap { candidate -> URL? in
-            guard candidate.type == .web, candidate.url.hasDirectoryPath else { return nil }
+            guard candidate.type == .web, candidate.url.isExistingDirectory else { return nil }
             return candidate.url
         }
         guard webProjects.count == 1 else { return nil }

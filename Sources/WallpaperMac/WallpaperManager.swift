@@ -13,6 +13,26 @@ final class WallpaperManager: ObservableObject {
     @Published private(set) var playbackQueues: [PlaybackQueue] = []
     @Published private(set) var displayQueueBindings: [String: DisplayPlaybackBinding] = [:]
 
+    /// Identity of one presentation of one wallpaper on one display.
+    ///
+    /// Completion callbacks from a previous controller (teardown, loop restart,
+    /// rapid queue cycling) carry the session they were started with. Only the
+    /// session currently installed for that display may advance the queue, so a
+    /// late callback cannot skip the wallpaper the user is now looking at.
+    struct PlaybackSession: Equatable, Sendable {
+        let token: UUID
+        let itemID: UUID
+        let displayID: String
+
+        init(itemID: UUID, displayID: String, token: UUID = UUID()) {
+            self.token = token
+            self.itemID = itemID
+            self.displayID = displayID
+        }
+    }
+
+    private var currentSessions: [String: PlaybackSession] = [:]
+
     enum PlaybackState: Equatable {
         case staticImage
         case playing(isMuted: Bool)
@@ -34,6 +54,7 @@ final class WallpaperManager: ObservableObject {
     private var controllers: [String: WallpaperWindowController] = [:]
     private var assignments: [String: DisplayAssignment] = [:]
     private var queueTimers: [String: Timer] = [:]
+    private var hardDeadlineTimers: [String: Timer] = [:]
     private var connectedDisplays: [String: DisplayService.Display] = [:]
     private var queueItems: [UUID: WallpaperItem] = [:]
     private var queueLibrary: [UUID: PlaybackQueue] = [:]
@@ -66,6 +87,7 @@ final class WallpaperManager: ObservableObject {
             NotificationCenter.default.removeObserver(screenChangeObserver)
         }
         queueTimers.values.forEach { $0.invalidate() }
+        hardDeadlineTimers.values.forEach { $0.invalidate() }
         // WallpaperManager is main-actor isolated, but Swift does not allow
         // calling the main-actor controller teardown from deinit. All runtime
         // shutdown paths explicitly tear down controllers before removing
@@ -121,13 +143,18 @@ final class WallpaperManager: ObservableObject {
         if !preserveQueue {
             stopQueue(displayID: display.id, persist: true)
         }
+        let session = PlaybackSession(itemID: item.id, displayID: display.id)
+        currentSessions[display.id] = session
         let replacement = try WallpaperWindowController(
             item: item,
             screen: display.screen,
             policy: policy,
             advanceAfterVideoCompletion: advanceAfterVideoCompletion,
             onVideoPlaybackCompleted: { [weak self] in
-                self?.videoPlaybackDidFinish(for: display.id)
+                self?.videoPlaybackDidFinish(for: display.id, session: session)
+            },
+            onFrameProgress: { [weak self] in
+                self?.noteVideoFrameProgress(for: display.id, session: session)
             }
         )
         replacement.setSystemSuspended(isSystemSuspended, reloadWebContentOnResume: false)
@@ -215,8 +242,8 @@ final class WallpaperManager: ObservableObject {
 
     func reapply(to displays: [DisplayService.Display], policy: PlaybackPolicy, items: [WallpaperItem]) {
         playbackPolicy = policy
-        connectedDisplays = Dictionary(uniqueKeysWithValues: displays.map { ($0.id, $0) })
-        queueItems = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+        connectedDisplays = UniquedDictionary.build(displays.map { ($0.id, $0) }, label: "connected displays")
+        queueItems = UniquedDictionary.build(items.map { ($0.id, $0) }, label: "queue items")
         let connectedIDs = Set(displays.map(\.id))
         for key in assignments.keys where !connectedIDs.contains(key) {
             queueTimers[key]?.invalidate()
@@ -483,7 +510,7 @@ final class WallpaperManager: ObservableObject {
     ) {
         guard let queue = queueLibrary[queueID] else { return }
         connectedDisplays[display.id] = display
-        queueItems = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+        queueItems = UniquedDictionary.build(items.map { ($0.id, $0) }, label: "queue items")
         var binding = bindings[display.id] ?? DisplayPlaybackBinding(displayID: display.id, displayName: display.name)
         binding.displayName = display.name
         binding.activeQueueID = queueID
@@ -531,6 +558,7 @@ final class WallpaperManager: ObservableObject {
     }
 
     func stopQueue(displayID: String, persist: Bool = true) {
+        hardDeadlineTimers.removeValue(forKey: displayID)?.invalidate()
         queueTimers.removeValue(forKey: displayID)?.invalidate()
         guard var binding = bindings[displayID] else { return }
         let queueID = binding.activeQueueID
@@ -610,13 +638,20 @@ final class WallpaperManager: ObservableObject {
         let activeQueue = bindings[displayID].flatMap { queueLibrary[$0.activeQueueID] }
         let advanceAfterVideoCompletion = activeQueue?.advanceAfterVideoCompletion == true && wallpaper.type == .video
         do {
+            // New session invalidates completion callbacks from the replaced
+            // controller; timers are rescheduled for the new playback below.
+            let session = PlaybackSession(itemID: wallpaper.id, displayID: displayID)
+            currentSessions[displayID] = session
             let replacement = try WallpaperWindowController(
                 item: wallpaper,
                 screen: display,
                 policy: policy,
                 advanceAfterVideoCompletion: advanceAfterVideoCompletion,
                 onVideoPlaybackCompleted: { [weak self] in
-                    self?.videoPlaybackDidFinish(for: displayID)
+                    self?.videoPlaybackDidFinish(for: displayID, session: session)
+                },
+                onFrameProgress: { [weak self] in
+                    self?.noteVideoFrameProgress(for: displayID, session: session)
                 }
             )
             replacement.setSystemSuspended(isSystemSuspended, reloadWebContentOnResume: false)
@@ -624,6 +659,26 @@ final class WallpaperManager: ObservableObject {
             controllers[displayID] = replacement
             playbackStates[displayID] = replacement.playbackState
             replacement.window?.orderFrontRegardless()
+            // Reload replaces the player entirely: drop the old timer and
+            // re-arm it for the queue/state/item combination that is live now.
+            queueTimers[displayID]?.invalidate()
+            queueTimers.removeValue(forKey: displayID)
+            if let binding = bindings[displayID],
+               let queue = queueLibrary[binding.activeQueueID],
+               let state = binding.queueStates[queue.id],
+               state.isEnabled {
+                if advanceAfterVideoCompletion {
+                    let watchdog = queue.stallWatchdogInterval(
+                        forVideoWithDurationSeconds: wallpaper.metadata?.durationSeconds
+                    )
+                    scheduleQueueTimer(for: displayID, interval: watchdog)
+                } else {
+                    scheduleQueueTimer(
+                        for: displayID,
+                        interval: effectiveInterval(queue: queue, state: state, itemID: wallpaper.id)
+                    )
+                }
+            }
         } catch {
             return
         }
@@ -637,7 +692,7 @@ final class WallpaperManager: ObservableObject {
             playbackStates.removeAll()
             return
         }
-        assignments = Dictionary(uniqueKeysWithValues: saved.map { ($0.id, $0) })
+        assignments = UniquedDictionary.build(saved.map { ($0.id, $0) }, label: "display assignments")
         publishDisplayAssignments()
         appliedWallpaperIDs.removeAll()
         playbackStates.removeAll()
@@ -658,9 +713,9 @@ final class WallpaperManager: ObservableObject {
         }
         let loadedQueues = (try? store.playbackQueues()) ?? [.defaultQueue]
         playbackQueues = loadedQueues
-        queueLibrary = Dictionary(uniqueKeysWithValues: loadedQueues.map { ($0.id, $0) })
+        queueLibrary = UniquedDictionary.build(loadedQueues.map { ($0.id, $0) }, label: "playback queues")
         let loadedBindings = (try? store.displayPlaybackBindings()) ?? []
-        bindings = Dictionary(uniqueKeysWithValues: loadedBindings.map { ($0.displayID, $0) })
+        bindings = UniquedDictionary.build(loadedBindings.map { ($0.displayID, $0) }, label: "display bindings")
         for displayID in bindings.keys {
             guard var binding = bindings[displayID], queueLibrary[binding.activeQueueID] == nil else { continue }
             binding.activeQueueID = defaultQueueID
@@ -733,7 +788,7 @@ final class WallpaperManager: ObservableObject {
     }
 
     private func publishLegacyQueues() {
-        displayQueues = Dictionary(uniqueKeysWithValues: bindings.values.compactMap { binding in
+        displayQueues = UniquedDictionary.build(bindings.values.compactMap { binding -> (String, DisplayPlaybackQueue)? in
             guard let queue = queueLibrary[binding.activeQueueID] else { return nil }
             let state = binding.state(for: queue.id)
             return (
@@ -800,21 +855,59 @@ final class WallpaperManager: ObservableObject {
         if shouldAdvanceAfterVideoCompletion(queue: queue, item: item) {
             // Still arm a watchdog: video-completion queues rely solely on the
             // player callback, so a failed start or hung decode would stall
-            // the queue forever with no timer to recover.
+            // the queue forever with no timer to recover. The frame heartbeat
+            // re-arms this while the pipeline is alive.
             let watchdog = queue.stallWatchdogInterval(forVideoWithDurationSeconds: item.metadata?.durationSeconds)
             scheduleQueueTimer(for: displayID, interval: watchdog)
+            // Absolute ceiling the heartbeat cannot extend.
+            hardDeadlineTimers[displayID]?.invalidate()
+            let deadline = queue.hardDeadlineInterval
+            hardDeadlineTimers[displayID] = Timer.scheduledTimer(withTimeInterval: deadline, repeats: false) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.advanceQueue(for: displayID)
+                }
+            }
         } else {
+            hardDeadlineTimers.removeValue(forKey: displayID)?.invalidate()
             scheduleQueueTimer(for: displayID, interval: effectiveInterval(queue: queue, state: state, itemID: item.id))
         }
     }
 
-    private func videoPlaybackDidFinish(for displayID: String) {
+    /// Frame heartbeat from the streaming player: the pipeline is alive, so a
+    /// video-completion queue's stall watchdog is re-armed without advancing.
+    ///
+    /// Called on the main actor. Extends the existing timer's `fireDate`
+    /// instead of rebuilding a Timer per frame (30–60 rebuilds/sec/display
+    /// would churn the run loop and invalidate/replace handles needlessly).
+    private func noteVideoFrameProgress(for displayID: String, session: PlaybackSession) {
+        guard currentSessions[displayID] == session else { return }
+        guard let binding = bindings[displayID],
+              let queue = queueLibrary[binding.activeQueueID],
+              let state = binding.queueStates[queue.id],
+              state.isEnabled,
+              queue.advanceAfterVideoCompletion else { return }
+        let itemID = queue.wallpaperIDs[safe: state.currentIndex]
+        let duration = itemID.flatMap { queueItems[$0]?.metadata?.durationSeconds }
+        let stallWindow = queue.stallWatchdogInterval(forVideoWithDurationSeconds: duration)
+        if let timer = queueTimers[displayID], timer.isValid {
+            timer.fireDate = Date().addingTimeInterval(stallWindow)
+        } else {
+            scheduleQueueTimer(for: displayID, interval: stallWindow)
+        }
+    }
+
+    private func videoPlaybackDidFinish(for displayID: String, session: PlaybackSession) {
+        guard currentSessions[displayID] == session else {
+            // Stale callback from a replaced or torn-down controller.
+            return
+        }
         guard let binding = bindings[displayID],
               let queue = queueLibrary[binding.activeQueueID],
               let state = binding.queueStates[queue.id],
               state.isEnabled,
               queue.advanceAfterVideoCompletion,
               let itemID = queue.wallpaperIDs[safe: state.currentIndex],
+              itemID == session.itemID,
               queueItems[itemID]?.type == .video else { return }
         queueTimers.removeValue(forKey: displayID)?.invalidate()
         advanceQueue(for: displayID)
@@ -993,7 +1086,8 @@ private final class WallpaperWindowController: NSWindowController {
         screen: NSScreen,
         policy: PlaybackPolicy,
         advanceAfterVideoCompletion: Bool = false,
-        onVideoPlaybackCompleted: (() -> Void)? = nil
+        onVideoPlaybackCompleted: (() -> Void)? = nil,
+        onFrameProgress: (() -> Void)? = nil
     ) throws {
         isWebWallpaper = item.type == .web
         let window = WallpaperWindow(
@@ -1005,6 +1099,7 @@ private final class WallpaperWindowController: NSWindowController {
             policy: policy,
             loops: policy.loops && !advanceAfterVideoCompletion,
             onVideoPlaybackCompleted: onVideoPlaybackCompleted,
+            onFrameProgress: onFrameProgress,
             frame: NSRect(origin: .zero, size: screen.frame.size)
         )
         wallpaperContentView = contentView
@@ -1112,6 +1207,7 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
     private var fitMode: WallpaperFitMode
     private let loops: Bool
     private let onVideoPlaybackCompleted: (() -> Void)?
+    private let onFrameProgress: (() -> Void)?
     private var imageLayer: CALayer?
     private var player: AVPlayer?
     private var playerLayer: AVPlayerLayer?
@@ -1137,6 +1233,7 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
         policy: PlaybackPolicy,
         loops: Bool,
         onVideoPlaybackCompleted: (() -> Void)?,
+        onFrameProgress: (() -> Void)? = nil,
         frame: NSRect
     ) throws {
         self.item = item
@@ -1145,6 +1242,7 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
         self.fitMode = policy.fitMode
         self.loops = loops
         self.onVideoPlaybackCompleted = onVideoPlaybackCompleted
+        self.onFrameProgress = onFrameProgress
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
@@ -1159,6 +1257,13 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
     func teardown() {
         guard !isTornDown else { return }
         isTornDown = true
+        releasePlaybackResources()
+        removeInterfaceViews()
+    }
+
+    /// Thread-safe teardown of the playback pipeline (observers, tasks,
+    /// ffmpeg, AVPlayer). Does not touch AppKit layer/view hierarchy.
+    private func releasePlaybackResources() {
         isPlaying = false
 
         if let loopObserver {
@@ -1173,13 +1278,17 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
         player?.pause()
         playerLayer?.player = nil
         player?.replaceCurrentItem(with: nil)
+        player = nil
+    }
+
+    /// AppKit hierarchy removal — main thread only.
+    private func removeInterfaceViews() {
         playerLayer?.removeFromSuperlayer()
         imageLayer?.removeFromSuperlayer()
         layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
         layer?.contents = nil
         playerLayer = nil
         imageLayer = nil
-        player = nil
 
         webView?.stopLoading()
         webView?.navigationDelegate = nil
@@ -1189,7 +1298,12 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
     }
 
     deinit {
-        teardown()
+        // deinit can run on any queue. Only the non-AppKit cleanup is safe
+        // here; explicit runtime shutdown paths call teardown() on the main
+        // thread to remove layer/view subviews before the view is destroyed.
+        guard !isTornDown else { return }
+        isTornDown = true
+        releasePlaybackResources()
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -1280,20 +1394,25 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
         isPortraitAsset || fitMode == .fit ? .resizeAspect : .resizeAspectFill
     }
 
+    /// Memoized per content view: gravity recomputes on every layout pass.
+    private lazy var cachedIsPortraitAsset: Bool = resolveIsPortraitAsset()
+
     private var isPortraitAsset: Bool {
+        cachedIsPortraitAsset
+    }
+
+    private func resolveIsPortraitAsset() -> Bool {
         if let width = item.metadata?.pixelWidth,
            let height = item.metadata?.pixelHeight,
            width > 0,
            height > 0 {
             return height > width
         }
-        if let thumbnailURL = item.thumbnailURL,
-           let image = NSImage(contentsOf: thumbnailURL) {
-            return image.size.height > image.size.width
+        if let thumbnailURL = item.thumbnailURL, thumbnailURL.isFileURL {
+            return ThumbnailCache.shared.isPortrait(at: thumbnailURL)
         }
-        if item.type == .image,
-           let image = NSImage(contentsOf: item.sourceURL) {
-            return image.size.height > image.size.width
+        if item.type == .image, item.sourceURL.isFileURL {
+            return ThumbnailCache.shared.isPortrait(at: item.sourceURL)
         }
         return false
     }
@@ -1352,7 +1471,7 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
             webView.navigationDelegate = self
             webView.setValue(false, forKey: "drawsBackground")
             let entryURL = item.entryURL ?? item.sourceURL
-            let readRoot = item.sourceURL.hasDirectoryPath ? item.sourceURL : item.sourceURL.deletingLastPathComponent()
+            let readRoot = item.sourceURL.isExistingDirectory ? item.sourceURL : item.sourceURL.deletingLastPathComponent()
             webView.loadFileURL(entryURL, allowingReadAccessTo: readRoot)
             addSubview(webView)
             self.webView = webView
@@ -1401,7 +1520,8 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
             videoGravity: videoGravity,
             loops: loops,
             frame: bounds,
-            onVideoPlaybackCompleted: onVideoPlaybackCompleted
+            onVideoPlaybackCompleted: onVideoPlaybackCompleted,
+            onFrameProgress: onFrameProgress
         )
         streamingController = controller
         layer?.addSublayer(controller.displayLayer)

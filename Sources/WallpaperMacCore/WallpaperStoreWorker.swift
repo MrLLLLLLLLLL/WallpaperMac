@@ -79,7 +79,7 @@ public actor WallpaperStoreWorker {
             WallpaperImportCandidate(url: url, type: WallpaperType.detect(from: url))
         }
         let webDirectories = candidates.compactMap { candidate -> URL? in
-            guard candidate.type == .web, candidate.url.hasDirectoryPath else { return nil }
+            guard candidate.type == .web, candidate.url.isExistingDirectory else { return nil }
             return candidate.url
         }
         let entries = webDirectories.count == 1
@@ -145,6 +145,13 @@ public actor WallpaperStoreWorker {
 
     public func update(item: WallpaperItem) throws -> WallpaperItem {
         try store.update(item: item)
+    }
+
+    /// Field-level enrichment update: never accepts a full item array.
+    public func updateMetadata(
+        _ patches: [UUID: WallpaperStore.MetadataPatch]
+    ) throws -> [WallpaperItem] {
+        try store.updateMetadata(patches)
     }
 
     public func setFavorite(itemIDs: Set<UUID>, isFavorite: Bool) throws -> WallpaperLibrarySnapshot {

@@ -42,12 +42,15 @@ private struct SettingsView: View {
     @AppStorage(SettingsKey.fitMode) private var fitMode = WallpaperFitMode.fill.rawValue
     @AppStorage(SettingsKey.webWallpaperInteractionEnabled) private var webWallpaperInteractionEnabled = false
     @AppStorage(SettingsKey.launchAtLogin) private var launchAtLogin = false
+    @AppStorage(SettingsKey.autoCheckUpdates) private var autoCheckUpdates = true
     @State private var launchAtLoginError: String?
+    @State private var isSyncingLoginToggle = false
+    @ObservedObject private var updateService = UpdateService.shared
 
     private var applicationVersionInfo: ApplicationVersionInfo {
         ApplicationVersionInfo(
             infoDictionary: Bundle.main.infoDictionary ?? [:],
-            fallbackVersion: "0.2.5"
+            fallbackVersion: "0.2.6"
         )
     }
 
@@ -118,6 +121,9 @@ private struct SettingsView: View {
                         .foregroundStyle(.red)
                 }
             }
+            Section("软件更新") {
+                updateSectionContent
+            }
             Section("关于 WallpaperMac") {
                 HStack(spacing: 12) {
                     Image(nsImage: NSApplication.shared.applicationIconImage)
@@ -140,7 +146,14 @@ private struct SettingsView: View {
         .padding(20)
         .frame(minWidth: 600, minHeight: 540)
         .onAppear {
+            // Reflect external login-item changes without re-applying them.
+            isSyncingLoginToggle = true
             launchAtLogin = LoginItemService.isEnabled
+            isSyncingLoginToggle = false
+            // First open of settings may still trigger a missed daily check.
+            if autoCheckUpdates {
+                updateService.runDailyCheckIfNeeded()
+            }
         }
         .onChange(of: libraryPath) { _ in notifySettingsChanged() }
         .onChange(of: storageMode) { _ in notifySettingsChanged() }
@@ -151,7 +164,106 @@ private struct SettingsView: View {
         .onChange(of: fitMode) { _ in notifySettingsChanged() }
         .onChange(of: webWallpaperInteractionEnabled) { _ in notifySettingsChanged() }
         .onChange(of: launchAtLogin) { enabled in
+            guard !isSyncingLoginToggle else { return }
             updateLaunchAtLogin(enabled)
+        }
+    }
+
+    @ViewBuilder
+    private var updateSectionContent: some View {
+        HStack {
+            Text("当前版本 \(applicationVersionInfo.version)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            if updateService.phase == .checking {
+                ProgressView()
+                    .controlSize(.small)
+                Text("正在检查…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Button("检查更新") { updateService.checkForUpdates(userInitiated: true) }
+                    .disabled(updateService.isBusy)
+            }
+        }
+        Toggle("启动时每日检查一次", isOn: $autoCheckUpdates)
+
+        switch updateService.phase {
+        case .idle, .checking:
+            EmptyView()
+        case .upToDate(let version):
+            Text("当前已是最新版本（\(version)）")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .available(let update):
+            VStack(alignment: .leading, spacing: 8) {
+                Text("发现新版本 \(update.version)")
+                    .font(.headline)
+                if let publishedAt = update.publishedAt {
+                    Text(publishedAt.formatted(date: .abbreviated, time: .omitted))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if !update.releaseNotes.isEmpty {
+                    ScrollView {
+                        Text(update.releaseNotes)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .frame(maxHeight: 120)
+                }
+                HStack {
+                    Button("立即更新") { updateService.installUpdate(update) }
+                        .keyboardShortcut(.defaultAction)
+                    Button("稍后再说") {
+                        updateService.dismissPrompt()
+                    }
+                }
+            }
+            .padding(8)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.accentColor.opacity(0.08))
+            )
+        case .downloading(let update, let progress):
+            VStack(alignment: .leading, spacing: 6) {
+                Text("正在下载 \(update.version)")
+                    .font(.headline)
+                if let progress, let fraction = progress.fractionCompleted {
+                    ProgressView(value: fraction)
+                    Text("\(ByteCountFormatter.string(fromByteCount: progress.bytesReceived, countStyle: .file))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在下载…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text("下载完成后会自动校验并安装，应用将重启。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        case .installing(let update):
+            HStack {
+                ProgressView()
+                    .controlSize(.small)
+                Text("正在安装 \(update.version)，应用即将退出…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        case .failed(let message):
+            HStack {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                Spacer()
+                Button("重试") { updateService.checkForUpdates(userInitiated: true) }
+            }
         }
     }
 
@@ -196,6 +308,8 @@ enum SettingsKey {
     static let webWallpaperInteractionEnabled = "WallpaperMac.webWallpaperInteractionEnabled"
     static let launchAtLogin = "WallpaperMac.launchAtLogin"
     static let onboardingCompleted = "WallpaperMac.onboardingCompleted"
+    static let autoCheckUpdates = "WallpaperMac.autoCheckUpdates"
+    static let lastUpdateCheckDate = "WallpaperMac.lastUpdateCheckDate"
 }
 
 extension Notification.Name {

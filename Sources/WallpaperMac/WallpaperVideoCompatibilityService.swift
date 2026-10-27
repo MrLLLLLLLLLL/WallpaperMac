@@ -95,14 +95,23 @@ struct WallpaperVideoCompatibilityService {
         arguments: [String]
     ) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
+            // stderr goes to a temp file, not a pipe: ffmpeg can write more
+            // than the 64 KB pipe buffer, which would deadlock the child and
+            // prevent terminationHandler from ever firing.
+            let logURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("wallpapermac-ffmpeg-\(UUID().uuidString).log")
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
+            let logHandle = try? FileHandle(forWritingTo: logURL)
+
             let process = Process()
-            let errorPipe = Pipe()
             process.executableURL = executableURL
             process.arguments = arguments
             process.standardOutput = FileHandle.nullDevice
-            process.standardError = errorPipe
+            process.standardError = logHandle ?? FileHandle.nullDevice
             process.terminationHandler = { _ in
-                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                try? logHandle?.close()
+                let errorData = (try? Data(contentsOf: logURL)) ?? Data()
+                try? FileManager.default.removeItem(at: logURL)
                 let message = String(data: errorData, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 if process.terminationStatus == 0 {
@@ -115,6 +124,8 @@ struct WallpaperVideoCompatibilityService {
             do {
                 try process.run()
             } catch {
+                try? logHandle?.close()
+                try? FileManager.default.removeItem(at: logURL)
                 continuation.resume(throwing: error)
             }
         }

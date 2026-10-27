@@ -53,6 +53,14 @@ public final class WallpaperStore {
         libraryURL.appendingPathComponent("display-playback-bindings.json")
     }
 
+    private var migrationPlanURL: URL {
+        libraryURL.appendingPathComponent("display-queue-migration-plan.json")
+    }
+
+    private var migrationMarkerURL: URL {
+        libraryURL.appendingPathComponent("display-queues.migrated")
+    }
+
     public init(libraryURL: URL, fileManager: FileManager = .default) {
         self.libraryURL = libraryURL
         self.fileManager = fileManager
@@ -91,6 +99,7 @@ public final class WallpaperStore {
     }
 
     public func playbackQueues() throws -> [PlaybackQueue] {
+        try migrateLegacyDisplayQueuesIfNeeded()
         if fileManager.fileExists(atPath: playbackQueuesURL.path) {
             let data = try Data(contentsOf: playbackQueuesURL)
             var queues = try decoder.decode([PlaybackQueue].self, from: data)
@@ -99,16 +108,6 @@ public final class WallpaperStore {
                 if lhs.isDefault != rhs.isDefault { return lhs.isDefault }
                 return lhs.createdAt < rhs.createdAt
             }
-        }
-
-        try migrateLegacyDisplayQueuesIfNeeded()
-        if fileManager.fileExists(atPath: playbackQueuesURL.path) {
-            let data = try Data(contentsOf: playbackQueuesURL)
-            return normalizedQueues(try decoder.decode([PlaybackQueue].self, from: data))
-                .sorted { lhs, rhs in
-                    if lhs.isDefault != rhs.isDefault { return lhs.isDefault }
-                    return lhs.createdAt < rhs.createdAt
-                }
         }
         return [PlaybackQueue.defaultQueue]
     }
@@ -121,12 +120,6 @@ public final class WallpaperStore {
     }
 
     public func displayPlaybackBindings() throws -> [DisplayPlaybackBinding] {
-        if fileManager.fileExists(atPath: displayPlaybackBindingsURL.path) {
-            let data = try Data(contentsOf: displayPlaybackBindingsURL)
-            return try decoder.decode([DisplayPlaybackBinding].self, from: data)
-                .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
-        }
-
         try migrateLegacyDisplayQueuesIfNeeded()
         guard fileManager.fileExists(atPath: displayPlaybackBindingsURL.path) else { return [] }
         let data = try Data(contentsOf: displayPlaybackBindingsURL)
@@ -160,13 +153,57 @@ public final class WallpaperStore {
         return result
     }
 
+    /// Legacy `display-queues.json` migration with crash-safe commit protocol.
+    ///
+    /// Layout:
+    /// - `display-queue-migration-plan.json` — full generated queues/bindings
+    ///   (the mapping from legacy display IDs to queue UUIDs lives here).
+    /// - `display-playback-bindings.json` then `playback-queues.json` — the
+    ///   modern pair. Either may be missing after a crash; the plan restores it.
+    /// - `display-queues.migrated` — commit marker. Modern files without a
+    ///   marker are treated as an untrusted partial migration and can be
+    ///   regenerated from the still-present legacy file.
     private func migrateLegacyDisplayQueuesIfNeeded() throws {
-        guard !fileManager.fileExists(atPath: playbackQueuesURL.path),
-              !fileManager.fileExists(atPath: displayPlaybackBindingsURL.path),
-              fileManager.fileExists(atPath: displayQueuesURL.path) else { return }
+        if fileManager.fileExists(atPath: migrationMarkerURL.path) {
+            return
+        }
 
-        let data = try Data(contentsOf: displayQueuesURL)
-        let legacyQueues = try decoder.decode([DisplayPlaybackQueue].self, from: data)
+        // Resume an interrupted migration first: the plan already holds the
+        // canonical queue UUIDs, so regenerating cannot orphan bindings.
+        if fileManager.fileExists(atPath: migrationPlanURL.path) {
+            try resumeMigrationFromPlan()
+            return
+        }
+
+        guard fileManager.fileExists(atPath: displayQueuesURL.path) else {
+            // No legacy source. If a complete modern pair already decodes,
+            // record the marker so future loads skip this path.
+            if validatesModernQueueFiles() {
+                try commitMigration(removingLegacy: false)
+            }
+            return
+        }
+
+        // Users who migrated with an older build kept display-queues.json and
+        // never wrote a marker — and may have edited queues/bindings since.
+        // The validated modern pair is authoritative; only regenerate when it
+        // is missing or fails cross-checks (an interrupted newer migration).
+        if validatesModernQueueFiles() {
+            try commitMigration(removingLegacy: true)
+            return
+        }
+
+        let legacyQueues: [DisplayPlaybackQueue]
+        do {
+            let data = try Data(contentsOf: displayQueuesURL)
+            legacyQueues = try decoder.decode([DisplayPlaybackQueue].self, from: data)
+        } catch {
+            // Corrupt or unreadable legacy must not fail queue loading. Skip
+            // migration and leave whatever modern files exist in place.
+            NSLog("WallpaperMac: skipping legacy queue migration: \(error.localizedDescription)")
+            return
+        }
+
         var queues: [PlaybackQueue] = [.defaultQueue]
         var bindings: [DisplayPlaybackBinding] = []
         var usedNames = Set<String>()
@@ -203,8 +240,67 @@ public final class WallpaperStore {
         }
 
         try ensureLibraryDirectories()
-        try encoder.encode(queues).write(to: playbackQueuesURL, options: .atomic)
+        let plan = MigrationPlan(queues: queues, bindings: bindings)
+        try encoder.encode(plan).write(to: migrationPlanURL, options: .atomic)
+        try writeMigrationOutputs(queues: queues, bindings: bindings)
+        try commitMigration(removingLegacy: true)
+    }
+
+    private struct MigrationPlan: Codable {
+        let queues: [PlaybackQueue]
+        let bindings: [DisplayPlaybackBinding]
+    }
+
+    private func resumeMigrationFromPlan() throws {
+        let data = try Data(contentsOf: migrationPlanURL)
+        let plan = try decoder.decode(MigrationPlan.self, from: data)
+        try writeMigrationOutputs(queues: plan.queues, bindings: plan.bindings)
+        try commitMigration(removingLegacy: true)
+    }
+
+    private func writeMigrationOutputs(queues: [PlaybackQueue], bindings: [DisplayPlaybackBinding]) throws {
+        try ensureLibraryDirectories()
+        // Bindings first: a crash here leaves only the plan + legacy (or plan
+        // alone), never a queues file that cannot be reconciled without it.
         try encoder.encode(bindings).write(to: displayPlaybackBindingsURL, options: .atomic)
+        try encoder.encode(queues).write(to: playbackQueuesURL, options: .atomic)
+    }
+
+    private func commitMigration(removingLegacy: Bool) throws {
+        try ensureLibraryDirectories()
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        try Data("migrated \(stamp)\n".utf8).write(to: migrationMarkerURL, options: .atomic)
+        try? fileManager.removeItem(at: migrationPlanURL)
+        if removingLegacy {
+            let retired = libraryURL.appendingPathComponent("display-queues.json.migrated")
+            if fileManager.fileExists(atPath: displayQueuesURL.path) {
+                try? fileManager.removeItem(at: retired)
+                try? fileManager.moveItem(at: displayQueuesURL, to: retired)
+            }
+        }
+    }
+
+    /// True when both modern files decode and cross-reference cleanly.
+    private func validatesModernQueueFiles() -> Bool {
+        guard fileManager.fileExists(atPath: playbackQueuesURL.path),
+              fileManager.fileExists(atPath: displayPlaybackBindingsURL.path) else {
+            return false
+        }
+        guard let queueData = try? Data(contentsOf: playbackQueuesURL),
+              let queues = try? decoder.decode([PlaybackQueue].self, from: queueData),
+              let bindingData = try? Data(contentsOf: displayPlaybackBindingsURL),
+              let bindings = try? decoder.decode([DisplayPlaybackBinding].self, from: bindingData) else {
+            return false
+        }
+        let queueIDs = Set(queues.map(\.id))
+        guard queues.contains(where: \.isDefault) else { return false }
+        for binding in bindings {
+            guard queueIDs.contains(binding.activeQueueID) else { return false }
+            for state in binding.queueStates.values where !queueIDs.contains(state.queueID) {
+                return false
+            }
+        }
+        return true
     }
 
     public func displayQueues() throws -> [DisplayPlaybackQueue] {
@@ -276,7 +372,7 @@ public final class WallpaperStore {
         case .managedCopy:
             let assetsURL = libraryURL.appendingPathComponent("Assets", isDirectory: true)
             let destinationName = "\(id.uuidString)-\(managedCopySourceURL.lastPathComponent)"
-            storedURL = assetsURL.appendingPathComponent(destinationName, isDirectory: managedCopySourceURL.hasDirectoryPath)
+            storedURL = assetsURL.appendingPathComponent(destinationName, isDirectory: managedCopySourceURL.isExistingDirectory)
             try fileManager.copyItem(at: managedCopySourceURL, to: storedURL)
         case .externalReference:
             storedURL = sourceURL
@@ -343,6 +439,43 @@ public final class WallpaperStore {
         currentItems[index] = item
         try save(currentItems)
         return item
+    }
+
+    /// Patches only enrichment fields for several items in one read-modify-write.
+    ///
+    /// Callers must not hand over a full item array: the array is often a stale
+    /// UI snapshot that would clobber renames, favorites and imports written
+    /// after it was taken.
+    @discardableResult
+    public func updateMetadata(
+        _ patches: [UUID: MetadataPatch]
+    ) throws -> [WallpaperItem] {
+        guard !patches.isEmpty else { return [] }
+        var currentItems = try items()
+        var updated: [WallpaperItem] = []
+        for index in currentItems.indices {
+            guard let patch = patches[currentItems[index].id] else { continue }
+            if let metadata = patch.metadata {
+                currentItems[index].metadata = metadata
+            }
+            if let thumbnailURL = patch.thumbnailURL {
+                currentItems[index].thumbnailURL = thumbnailURL
+            }
+            updated.append(currentItems[index])
+        }
+        guard !updated.isEmpty else { return [] }
+        try save(currentItems)
+        return updated
+    }
+
+    public struct MetadataPatch: Equatable, Sendable {
+        public var metadata: WallpaperMetadata?
+        public var thumbnailURL: URL?
+
+        public init(metadata: WallpaperMetadata? = nil, thumbnailURL: URL? = nil) {
+            self.metadata = metadata
+            self.thumbnailURL = thumbnailURL
+        }
     }
 
     @discardableResult
@@ -434,7 +567,7 @@ public final class WallpaperStore {
                 let baseURL = item.storageMode == .managedCopy ? item.sourceURL : replacementURL
                 if let relativeEntryPath, !relativeEntryPath.isEmpty {
                     updated.entryURL = baseURL.appendingPathComponent(relativeEntryPath)
-                } else if baseURL.hasDirectoryPath {
+                } else if baseURL.isExistingDirectory {
                     updated.entryURL = webEntryURL(for: baseURL)
                 } else {
                     updated.entryURL = baseURL
@@ -472,15 +605,13 @@ public final class WallpaperStore {
             let missingID = selectedIDs.subtracting(removedItems.map(\.id)).first ?? UUID()
             throw WallpaperStoreError.itemNotFound(missingID)
         }
-        for item in removedItems {
-            if item.storageMode == .managedCopy, fileManager.fileExists(atPath: item.sourceURL.path) {
-                try fileManager.removeItem(at: item.sourceURL)
-            }
-            removeThumbnailIfOwned(by: item)
-            removePlaybackProxyIfOwned(at: item.playbackURL)
-        }
+        // Index first: if a later file delete fails the entry is still gone,
+        // leaving only reclaimable orphan files rather than phantom rows.
         currentItems.removeAll { selectedIDs.contains($0.id) }
         try save(currentItems)
+        for item in removedItems {
+            removeManagedResources(for: item)
+        }
         return removedItems
     }
 
@@ -491,18 +622,29 @@ public final class WallpaperStore {
             throw WallpaperStoreError.itemNotFound(item.id)
         }
         currentItems.remove(at: index)
+        try save(currentItems)
+        removeManagedResources(for: item)
+        return item
+    }
+
+    /// Best-effort resource cleanup after the index no longer references the item.
+    /// Failures are logged as orphans; they must not roll back the index write.
+    private func removeManagedResources(for item: WallpaperItem) {
         if item.storageMode == .managedCopy, fileManager.fileExists(atPath: item.sourceURL.path) {
-            try fileManager.removeItem(at: item.sourceURL)
+            do {
+                try fileManager.removeItem(at: item.sourceURL)
+            } catch {
+                NSLog("WallpaperMac: orphaned managed asset \(item.sourceURL.path): \(error.localizedDescription)")
+            }
         }
         removeThumbnailIfOwned(by: item)
         removePlaybackProxyIfOwned(at: item.playbackURL)
-        try save(currentItems)
-        return item
     }
 
     @discardableResult
     public func refreshAllAvailability() throws -> [WallpaperItem] {
         removeLegacyVideoProxies()
+        cleanupOrphanedManagedAssets()
         let currentItems = try items()
         var refreshed: [WallpaperItem] = []
         refreshed.reserveCapacity(currentItems.count)
@@ -625,6 +767,42 @@ public final class WallpaperStore {
         try? fileManager.removeItem(at: proxiesURL)
     }
 
+    /// Removes managed assets under `Assets/` whose `{UUID}-` prefix matches no
+    /// indexed item. Scope is strictly that ownership namespace — user files
+    /// and external references are never touched.
+    private func cleanupOrphanedManagedAssets() {
+        let assetsURL = libraryURL.appendingPathComponent("Assets", isDirectory: true)
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: assetsURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        let knownIDs: Set<String>
+        do {
+            knownIDs = Set(try items().map { $0.id.uuidString })
+        } catch {
+            return
+        }
+
+        for entry in entries {
+            let name = entry.lastPathComponent
+            // Ownership marker: `{UUID}-originalName` (see import destinationName).
+            // UUID strings contain hyphens themselves (8-4-4-4-12 = 36 chars),
+            // so the prefix is the first 36 characters, not up to the first '-'.
+            guard name.count > 36 else { continue }
+            let uuidPrefix = String(name.prefix(36))
+            guard name.hasPrefix(uuidPrefix), name.dropFirst(36).hasPrefix("-") else { continue }
+            guard UUID(uuidString: uuidPrefix) != nil, !knownIDs.contains(uuidPrefix) else { continue }
+            do {
+                try fileManager.removeItem(at: entry)
+                NSLog("WallpaperMac: removed orphaned managed asset \(name)")
+            } catch {
+                NSLog("WallpaperMac: failed to remove orphaned asset \(name): \(error.localizedDescription)")
+            }
+        }
+    }
+
     private func removePlaybackProxyIfOwned(at url: URL?) {
         guard let url else { return }
         let proxiesURL = libraryURL.appendingPathComponent("VideoProxies", isDirectory: true).standardizedFileURL
@@ -641,7 +819,7 @@ public final class WallpaperStore {
     }
 
     private func displayName(for url: URL) -> String {
-        if url.hasDirectoryPath {
+        if url.isExistingDirectory {
             return url.lastPathComponent
         }
         return url.deletingPathExtension().lastPathComponent
@@ -658,7 +836,7 @@ public final class WallpaperStore {
               (try? entryURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) != true else {
             return false
         }
-        guard sourceURL.hasDirectoryPath else {
+        guard sourceURL.isExistingDirectory else {
             return entryURL.standardizedFileURL == sourceURL.standardizedFileURL
         }
         let basePath = sourceURL.standardizedFileURL.path

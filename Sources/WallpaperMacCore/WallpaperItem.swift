@@ -114,8 +114,11 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
         storageMode = try container.decode(StorageMode.self, forKey: .storageMode)
         thumbnailURL = try container.decodeIfPresent(URL.self, forKey: .thumbnailURL)
         metadata = try container.decodeIfPresent(WallpaperMetadata.self, forKey: .metadata)
-        availability = try container.decode(WallpaperAvailability.self, forKey: .availability)
-        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        // Legacy archives omitted several fields. Fall back conservatively:
+        // missing availability must not look healthy, and missing createdAt
+        // must not sort the item as brand new.
+        availability = try container.decodeIfPresent(WallpaperAvailability.self, forKey: .availability) ?? .missing
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .distantPast
         lastUsedAt = try container.decodeIfPresent(Date.self, forKey: .lastUsedAt)
         isFavorite = try container.decodeIfPresent(Bool.self, forKey: .isFavorite) ?? false
         groupID = try container.decodeIfPresent(UUID.self, forKey: .groupID)

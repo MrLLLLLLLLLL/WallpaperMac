@@ -1,9 +1,10 @@
 import AppKit
 
 @MainActor
-final class StatusBarController: NSObject {
+final class StatusBarController: NSObject, NSMenuDelegate {
     private let statusItem: NSStatusItem
     private let menu = NSMenu()
+    private var isPlaybackPaused = false
     private let togglePlaybackItem = NSMenuItem()
     private let toggleMuteItem = NSMenuItem()
     private let showMainWindow: () -> Void
@@ -83,7 +84,27 @@ final class StatusBarController: NSObject {
         let quitItem = NSMenuItem(title: "退出 WallpaperMac", action: #selector(quitApplicationAction), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
+        menu.delegate = self
         statusItem.menu = menu
+
+        NotificationCenter.default.addObserver(
+            forName: .wallpaperMacPlaybackStateChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            let playing = (note.userInfo?["isPlaying"] as? Bool) ?? true
+            self.isPlaybackPaused = !playing
+            self.refreshPlaybackMenuTitle()
+        }
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        refreshPlaybackMenuTitle()
+    }
+
+    private func refreshPlaybackMenuTitle() {
+        togglePlaybackItem.title = isPlaybackPaused ? "恢复动态壁纸" : "暂停动态壁纸"
     }
 
     @objc private func showMainWindowAction() {
@@ -114,4 +135,5 @@ final class StatusBarController: NSObject {
 extension Notification.Name {
     static let wallpaperMacStatusTogglePlayback = Notification.Name("WallpaperMacStatusTogglePlayback")
     static let wallpaperMacStatusToggleMute = Notification.Name("WallpaperMacStatusToggleMute")
+    static let wallpaperMacPlaybackStateChanged = Notification.Name("WallpaperMacPlaybackStateChanged")
 }
