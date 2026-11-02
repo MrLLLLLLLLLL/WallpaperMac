@@ -50,7 +50,7 @@ private struct SettingsView: View {
     private var applicationVersionInfo: ApplicationVersionInfo {
         ApplicationVersionInfo(
             infoDictionary: Bundle.main.infoDictionary ?? [:],
-            fallbackVersion: "0.2.6"
+            fallbackVersion: "0.2.7"
         )
     }
 
