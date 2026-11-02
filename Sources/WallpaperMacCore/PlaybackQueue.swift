@@ -40,6 +40,33 @@ public enum QueueCompletionBehavior: String, Codable, CaseIterable, Equatable, S
     }
 }
 
+/// What moves a queue from the current wallpaper to the next one.
+///
+/// The two choices are exclusive: a video-completion queue never advances a
+/// video on the timer, and a fixed-interval queue never waits for playback to
+/// end. Images and web wallpapers have no completion event, so a
+/// video-completion queue falls back to the fixed interval for them.
+public enum QueueAdvanceMode: String, Codable, CaseIterable, Equatable, Sendable {
+    case videoCompletion
+    case fixedInterval
+
+    public var title: String {
+        switch self {
+        case .videoCompletion: return "视频播完后切换"
+        case .fixedInterval: return "固定时长切换"
+        }
+    }
+
+    public var detail: String {
+        switch self {
+        case .videoCompletion:
+            return "视频按实际播放结束切换；图片和网页壁纸没有结束事件，自动按固定时长切换。"
+        case .fixedInterval:
+            return "所有壁纸（包括视频）都按设定时长切换。"
+        }
+    }
+}
+
 public struct PlaybackQueue: Identifiable, Codable, Equatable, Sendable {
     public static let defaultName = "默认队列"
     public static let defaultQueue = PlaybackQueue(name: defaultName, isDefault: true)
@@ -51,9 +78,9 @@ public struct PlaybackQueue: Identifiable, Codable, Equatable, Sendable {
     public var sortMode: QueueSortMode
     public var playbackMode: QueuePlaybackMode
     public var completionBehavior: QueueCompletionBehavior
-    /// When enabled, a video advances this queue when its media item reaches the end.
-    /// The default keeps the pre-0.2.2 timer behavior for existing queues.
-    public var advanceAfterVideoCompletion: Bool
+    /// Whether the queue advances on video completion or on a fixed interval.
+    /// The default keeps the timer behavior for existing queues.
+    public var advanceMode: QueueAdvanceMode
     public var defaultIntervalSeconds: Double
     public var transition: WallpaperTransitionEffect
     public var itemIntervalOverrides: [UUID: Double]
@@ -62,7 +89,7 @@ public struct PlaybackQueue: Identifiable, Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, name, isDefault, wallpaperIDs, sortMode, playbackMode
-        case completionBehavior, advanceAfterVideoCompletion, defaultIntervalSeconds
+        case completionBehavior, advanceMode, advanceAfterVideoCompletion, defaultIntervalSeconds
         case transition, itemIntervalOverrides, createdAt, updatedAt
     }
 
@@ -75,12 +102,38 @@ public struct PlaybackQueue: Identifiable, Codable, Equatable, Sendable {
         self.sortMode = try container.decode(QueueSortMode.self, forKey: .sortMode)
         self.playbackMode = try container.decode(QueuePlaybackMode.self, forKey: .playbackMode)
         self.completionBehavior = try container.decode(QueueCompletionBehavior.self, forKey: .completionBehavior)
-        self.advanceAfterVideoCompletion = try container.decodeIfPresent(Bool.self, forKey: .advanceAfterVideoCompletion) ?? false
+        if let mode = try container.decodeIfPresent(QueueAdvanceMode.self, forKey: .advanceMode) {
+            self.advanceMode = mode
+        } else {
+            // Pre-0.2.7 queues only stored the boolean.
+            let legacy = try container.decodeIfPresent(Bool.self, forKey: .advanceAfterVideoCompletion) ?? false
+            self.advanceMode = legacy ? .videoCompletion : .fixedInterval
+        }
         self.defaultIntervalSeconds = Self.clampedInterval(try container.decode(Double.self, forKey: .defaultIntervalSeconds))
         self.transition = try container.decode(WallpaperTransitionEffect.self, forKey: .transition)
         self.itemIntervalOverrides = Self.normalizedOverrides(try container.decode([UUID: Double].self, forKey: .itemIntervalOverrides))
         self.createdAt = try container.decode(Date.self, forKey: .createdAt)
         self.updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(isDefault, forKey: .isDefault)
+        try container.encode(wallpaperIDs, forKey: .wallpaperIDs)
+        try container.encode(sortMode, forKey: .sortMode)
+        try container.encode(playbackMode, forKey: .playbackMode)
+        try container.encode(completionBehavior, forKey: .completionBehavior)
+        try container.encode(advanceMode, forKey: .advanceMode)
+        // Older builds only understand the boolean. Keep it in sync so
+        // downgrading does not silently reset the queue to timer mode.
+        try container.encode(advanceMode == .videoCompletion, forKey: .advanceAfterVideoCompletion)
+        try container.encode(defaultIntervalSeconds, forKey: .defaultIntervalSeconds)
+        try container.encode(transition, forKey: .transition)
+        try container.encode(itemIntervalOverrides, forKey: .itemIntervalOverrides)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(updatedAt, forKey: .updatedAt)
     }
 
     public init(
@@ -91,7 +144,7 @@ public struct PlaybackQueue: Identifiable, Codable, Equatable, Sendable {
         sortMode: QueueSortMode = .custom,
         playbackMode: QueuePlaybackMode = .sequential,
         completionBehavior: QueueCompletionBehavior = .loop,
-        advanceAfterVideoCompletion: Bool = false,
+        advanceMode: QueueAdvanceMode = .fixedInterval,
         defaultIntervalSeconds: Double = 30,
         transition: WallpaperTransitionEffect = .crossfade,
         itemIntervalOverrides: [UUID: Double] = [:],
@@ -105,12 +158,27 @@ public struct PlaybackQueue: Identifiable, Codable, Equatable, Sendable {
         self.sortMode = sortMode
         self.playbackMode = playbackMode
         self.completionBehavior = completionBehavior
-        self.advanceAfterVideoCompletion = advanceAfterVideoCompletion
+        self.advanceMode = advanceMode
         self.defaultIntervalSeconds = Self.clampedInterval(defaultIntervalSeconds)
         self.transition = transition
         self.itemIntervalOverrides = Self.normalizedOverrides(itemIntervalOverrides)
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+    }
+
+    /// Legacy spelling of `advanceMode`, kept for older call sites.
+    public var advanceAfterVideoCompletion: Bool {
+        get { advanceMode == .videoCompletion }
+        set { advanceMode = newValue ? .videoCompletion : .fixedInterval }
+    }
+
+    /// Whether this item ends by itself and drives the next switch.
+    ///
+    /// Only videos have a completion event. In a video-completion queue an
+    /// image or web wallpaper falls back to the fixed interval instead of
+    /// stalling the queue forever.
+    public func usesCompletionAdvance(for type: WallpaperType) -> Bool {
+        advanceMode == .videoCompletion && type == .video
     }
 
     public mutating func normalize() {

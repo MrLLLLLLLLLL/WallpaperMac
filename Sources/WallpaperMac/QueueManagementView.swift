@@ -189,14 +189,26 @@ struct QueueManagementView: View {
                     Text("淡入淡出").tag(WallpaperTransitionEffect.crossfade)
                 }
             }
-            Toggle("视频播放完成后切换下一个壁纸", isOn: Binding(
-                get: { queue.advanceAfterVideoCompletion },
-                set: { value in update(queue) { $0.advanceAfterVideoCompletion = value } }
-            ))
-            .toggleStyle(.checkbox)
-            .help("启用后，队列中的视频会在实际播放结束时切换；图片和网页仍按队列时长切换。")
+            HStack(spacing: 12) {
+                Text("切换时机")
+                Picker("切换时机", selection: Binding(
+                    get: { queue.advanceMode },
+                    set: { value in update(queue) { $0.advanceMode = value } }
+                )) {
+                    ForEach(QueueAdvanceMode.allCases, id: \.self) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 300)
+                Spacer(minLength: 0)
+            }
+            Text(queue.advanceMode.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
             HStack {
-                Text("默认时长")
+                Text(queue.advanceMode == .fixedInterval ? "切换时长" : "图片/网页时长")
                 TextField("秒", value: Binding(
                     get: { queue.defaultIntervalSeconds },
                     set: { value in update(queue) { $0.defaultIntervalSeconds = value } }

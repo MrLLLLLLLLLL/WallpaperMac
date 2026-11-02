@@ -690,8 +690,10 @@ let tests: [(String, () throws -> Void)] = [
     ("evaluates playback suspension rules", testPlaybackPolicySuspensionRules),
     ("deduplicates and auto sorts playback queues", testPlaybackQueueDeduplicatesAndAutoSorts),
     ("enforces playback queue defaults and overrides", testPlaybackQueueHasDefaultConstraintsAndPerItemOverrides),
-    ("persists video completion queue setting", testPlaybackQueueVideoCompletionSettingRoundTrips),
-    ("decodes legacy queue without video completion setting", testLegacyPlaybackQueueWithoutVideoCompletionSettingDecodes),
+    ("persists queue advance mode", testPlaybackQueueAdvanceModeRoundTrips),
+    ("maps legacy advance boolean to completion mode", testLegacyPlaybackQueueAdvanceBooleanDecodes),
+    ("decodes legacy queue without advance setting", testLegacyPlaybackQueueWithoutAdvanceSettingDecodes),
+    ("falls back to fixed interval for non-video items", testNonVideoItemsFallBackToFixedIntervalInCompletionMode),
     ("requires compatibility playback for AV1", testVideoPlaybackCompatibilityRequiresCacheForAV1),
     ("plans streaming compatibility playback", testVideoCompatibilityStreamPlanPipesDecodedFrames),
     ("normalizes real HEVC sample entries", testVideoContainerCompatibilityNormalizesRealHev1Entries),
@@ -794,20 +796,44 @@ func testPlaybackQueueHasDefaultConstraintsAndPerItemOverrides() throws {
     try expect(updated.intervalOverride(for: itemID), equals: Optional(12), "queue should store item interval overrides")
 }
 
-func testPlaybackQueueVideoCompletionSettingRoundTrips() throws {
-    let queue = PlaybackQueue(name: "视频队列", advanceAfterVideoCompletion: true)
+func testPlaybackQueueAdvanceModeRoundTrips() throws {
+    let queue = PlaybackQueue(name: "视频队列", advanceMode: .videoCompletion)
     let data = try JSONEncoder().encode(queue)
     let decoded = try JSONDecoder().decode(PlaybackQueue.self, from: data)
-    try expect(decoded.advanceAfterVideoCompletion, "queue should persist video completion advance setting")
+    try expect(decoded.advanceMode, equals: .videoCompletion, "queue should persist its advance mode")
+    try expect(decoded.advanceAfterVideoCompletion, "legacy flag should mirror the completion mode")
 }
 
-func testLegacyPlaybackQueueWithoutVideoCompletionSettingDecodes() throws {
+func testLegacyPlaybackQueueAdvanceBooleanDecodes() throws {
+    // Pre-0.2.7 queues only stored the boolean.
+    let queue = PlaybackQueue(name: "旧队列", advanceMode: .videoCompletion)
+    var object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(queue)) as! [String: Any]
+    object.removeValue(forKey: "advanceMode")
+    let data = try JSONSerialization.data(withJSONObject: object)
+    let decoded = try JSONDecoder().decode(PlaybackQueue.self, from: data)
+    try expect(decoded.advanceMode, equals: .videoCompletion, "legacy true should map to completion mode")
+}
+
+func testLegacyPlaybackQueueWithoutAdvanceSettingDecodes() throws {
     let queue = PlaybackQueue(name: "旧队列")
     var object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(queue)) as! [String: Any]
+    object.removeValue(forKey: "advanceMode")
     object.removeValue(forKey: "advanceAfterVideoCompletion")
     let data = try JSONSerialization.data(withJSONObject: object)
     let decoded = try JSONDecoder().decode(PlaybackQueue.self, from: data)
-    try expect(!decoded.advanceAfterVideoCompletion, "legacy queues should default to timer-based video switching")
+    try expect(decoded.advanceMode, equals: .fixedInterval, "legacy queues should default to timer-based switching")
+}
+
+func testNonVideoItemsFallBackToFixedIntervalInCompletionMode() throws {
+    let completion = PlaybackQueue(name: "按视频结束", advanceMode: .videoCompletion)
+    try expect(completion.usesCompletionAdvance(for: .video), "completion mode should wait for videos to end")
+    try expect(!completion.usesCompletionAdvance(for: .image), "images must fall back to the fixed interval")
+    try expect(!completion.usesCompletionAdvance(for: .web), "web wallpapers must fall back to the fixed interval")
+
+    let fixed = PlaybackQueue(name: "按时长", advanceMode: .fixedInterval)
+    for type in WallpaperType.allCases {
+        try expect(!fixed.usesCompletionAdvance(for: type), "fixed mode should never wait for completion")
+    }
 }
 
 func testWallpaperLibraryPaginationUsesSamePageContractForGroups() throws {

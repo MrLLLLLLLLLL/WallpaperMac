@@ -918,7 +918,7 @@ final class LibraryViewModel: ObservableObject {
             named: "\(queue.name) 副本",
             playbackMode: queue.playbackMode,
             completionBehavior: queue.completionBehavior,
-            advanceAfterVideoCompletion: queue.advanceAfterVideoCompletion,
+            advanceMode: queue.advanceMode,
             defaultIntervalSeconds: queue.defaultIntervalSeconds,
             transition: queue.transition
         ) else {

@@ -326,7 +326,7 @@ final class WallpaperManager: ObservableObject {
         named name: String,
         playbackMode: QueuePlaybackMode = .sequential,
         completionBehavior: QueueCompletionBehavior = .loop,
-        advanceAfterVideoCompletion: Bool = false,
+        advanceMode: QueueAdvanceMode = .fixedInterval,
         defaultIntervalSeconds: Double = 30,
         transition: WallpaperTransitionEffect = .crossfade
     ) -> PlaybackQueue? {
@@ -337,7 +337,7 @@ final class WallpaperManager: ObservableObject {
             name: trimmed,
             playbackMode: playbackMode,
             completionBehavior: completionBehavior,
-            advanceAfterVideoCompletion: advanceAfterVideoCompletion,
+            advanceMode: advanceMode,
             defaultIntervalSeconds: defaultIntervalSeconds,
             transition: transition
         )
@@ -361,7 +361,7 @@ final class WallpaperManager: ObservableObject {
                 sortMode: normalized.sortMode,
                 playbackMode: normalized.playbackMode,
                 completionBehavior: normalized.completionBehavior,
-                advanceAfterVideoCompletion: normalized.advanceAfterVideoCompletion,
+                advanceMode: normalized.advanceMode,
                 defaultIntervalSeconds: normalized.defaultIntervalSeconds,
                 transition: normalized.transition,
                 itemIntervalOverrides: normalized.itemIntervalOverrides,
@@ -468,7 +468,7 @@ final class WallpaperManager: ObservableObject {
             id: queueID,
             name: isNew ? (queue.displayName.isEmpty ? "显示器队列" : queue.displayName) : (queueLibrary[queueID]?.name ?? queue.displayName),
             wallpaperIDs: queue.wallpaperIDs,
-            advanceAfterVideoCompletion: queueLibrary[queueID]?.advanceAfterVideoCompletion ?? false,
+            advanceMode: queueLibrary[queueID]?.advanceMode ?? .fixedInterval,
             defaultIntervalSeconds: queue.normalizedIntervalSeconds,
             transition: queue.transition,
             createdAt: queueLibrary[queueID]?.createdAt ?? Date(),
@@ -636,7 +636,7 @@ final class WallpaperManager: ObservableObject {
         guard let store, let allItems = try? store.items(), let wallpaper = allItems.first(where: { $0.id == itemID }) else { return }
         playbackPolicy = policy
         let activeQueue = bindings[displayID].flatMap { queueLibrary[$0.activeQueueID] }
-        let advanceAfterVideoCompletion = activeQueue?.advanceAfterVideoCompletion == true && wallpaper.type == .video
+        let advanceAfterVideoCompletion = activeQueue?.usesCompletionAdvance(for: wallpaper.type) == true
         do {
             // New session invalidates completion callbacks from the replaced
             // controller; timers are rescheduled for the new playback below.
@@ -843,7 +843,9 @@ final class WallpaperManager: ObservableObject {
     }
 
     private func shouldAdvanceAfterVideoCompletion(queue: PlaybackQueue, item: WallpaperItem) -> Bool {
-        queue.advanceAfterVideoCompletion && item.type == .video
+        // Images and web wallpapers have no completion event: a completion
+        // queue falls back to the fixed interval for them.
+        queue.usesCompletionAdvance(for: item.type)
     }
 
     private func scheduleQueueTimerIfNeeded(
@@ -885,7 +887,7 @@ final class WallpaperManager: ObservableObject {
               let queue = queueLibrary[binding.activeQueueID],
               let state = binding.queueStates[queue.id],
               state.isEnabled,
-              queue.advanceAfterVideoCompletion else { return }
+              queue.advanceMode == .videoCompletion else { return }
         let itemID = queue.wallpaperIDs[safe: state.currentIndex]
         let duration = itemID.flatMap { queueItems[$0]?.metadata?.durationSeconds }
         let stallWindow = queue.stallWatchdogInterval(forVideoWithDurationSeconds: duration)
@@ -905,7 +907,7 @@ final class WallpaperManager: ObservableObject {
               let queue = queueLibrary[binding.activeQueueID],
               let state = binding.queueStates[queue.id],
               state.isEnabled,
-              queue.advanceAfterVideoCompletion,
+              queue.advanceMode == .videoCompletion,
               let itemID = queue.wallpaperIDs[safe: state.currentIndex],
               itemID == session.itemID,
               queueItems[itemID]?.type == .video else { return }
