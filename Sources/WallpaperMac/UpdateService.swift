@@ -11,6 +11,19 @@ import WallpaperMacCore
 final class UpdateService: ObservableObject {
     static let shared = UpdateService()
 
+    /// Groups update failures so the UI can tell a retryable download problem
+    /// apart from a verification or install failure.
+    enum FailureKind: Equatable {
+        case network
+        case verification
+        case install
+        case other
+
+        var canRetryDownload: Bool {
+            self != .install
+        }
+    }
+
     enum Phase: Equatable {
         case idle
         case checking
@@ -18,10 +31,14 @@ final class UpdateService: ObservableObject {
         case available(AvailableUpdate)
         case downloading(AvailableUpdate, UpdateDownloadProgress?)
         case installing(AvailableUpdate)
-        case failed(String)
+        case failed(FailureKind, String)
     }
 
     @Published private(set) var phase: Phase = .idle
+
+    /// The update most recently approved for download. Kept after a failure so
+    /// "retry download" can resume the install flow without re-checking.
+    private(set) var retryUpdate: AvailableUpdate?
 
     private var task: Task<Void, Never>?
     private let clock: @MainActor () -> Date
@@ -39,9 +56,20 @@ final class UpdateService: ObservableObject {
         }
     }
 
+    /// True when the current failure came from the download path and the same
+    /// update can be tried again without a network round-trip to GitHub.
+    var canRetryDownload: Bool {
+        guard retryUpdate != nil, !isBusy else { return false }
+        if case .failed(let kind, _) = phase {
+            return kind.canRetryDownload
+        }
+        return false
+    }
+
     func checkForUpdates(userInitiated: Bool) {
         guard !isBusy else { return }
         phase = .checking
+        retryUpdate = nil
         let currentVersion = ApplicationVersionInfo(
             infoDictionary: Bundle.main.infoDictionary ?? [:],
             fallbackVersion: "0.2.6"
@@ -60,13 +88,27 @@ final class UpdateService: ObservableObject {
                 UserDefaults.standard.set(self.clock(), forKey: SettingsKey.lastUpdateCheckDate)
             } catch {
                 // Silent background checks only surface real updates.
-                self.phase = userInitiated ? .failed(error.localizedDescription) : .idle
+                self.phase = userInitiated
+                    ? .failed(Self.failureKind(for: error), error.localizedDescription)
+                    : .idle
             }
         }
     }
 
     func installUpdate(_ update: AvailableUpdate) {
-        guard phase == .available(update) else { return }
+        guard !isBusy else { return }
+        retryUpdate = update
+        startInstall(update)
+    }
+
+    /// Retries the last approved update's download without running the GitHub
+    /// release check again.
+    func retryDownload() {
+        guard canRetryDownload, let update = retryUpdate else { return }
+        startInstall(update)
+    }
+
+    private func startInstall(_ update: AvailableUpdate) {
         phase = .downloading(update, nil)
 
         let stagingDirectory = FileManager.default.temporaryDirectory
@@ -107,8 +149,12 @@ final class UpdateService: ObservableObject {
                     NSApp.terminate(nil)
                 }
             } catch {
+                // Hard failure: remove the attempt's staging directory so no
+                // partially downloaded or extracted update lingers.
+                try? FileManager.default.removeItem(at: stagingDirectory)
                 await MainActor.run {
-                    self.phase = .failed(error.localizedDescription)
+                    self.retryUpdate = update
+                    self.phase = .failed(Self.failureKind(for: error), error.localizedDescription)
                 }
             }
         }
@@ -132,6 +178,27 @@ final class UpdateService: ObservableObject {
         case .idle, .checking, .downloading, .installing:
             break
         }
+    }
+
+    private static func failureKind(for error: Error) -> FailureKind {
+        if error is UpdateInstallError {
+            return .install
+        }
+        if let downloadError = error as? UpdateDownloadError {
+            switch downloadError {
+            case .network, .httpStatus, .stalled:
+                return .network
+            case .checksumsUnavailable, .checksumMissingForAsset,
+                 .checksumMismatch, .signatureMissing, .signatureInvalid:
+                return .verification
+            case .writeFailed:
+                return .other
+            }
+        }
+        if error is UpdateCheckError {
+            return .network
+        }
+        return .other
     }
 
     /// Clears abandoned staging directories from crashed installers. Skips

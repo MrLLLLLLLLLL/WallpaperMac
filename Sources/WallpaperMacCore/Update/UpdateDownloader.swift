@@ -3,10 +3,14 @@ import Foundation
 public struct UpdateDownloadProgress: Equatable, Sendable {
     public let bytesReceived: Int64
     public let totalBytes: Int64?
+    /// Recent transfer rate, used for the "download speed" label. Nil until
+    /// the first bytes arrive.
+    public let bytesPerSecond: Double?
 
-    public init(bytesReceived: Int64, totalBytes: Int64?) {
+    public init(bytesReceived: Int64, totalBytes: Int64?, bytesPerSecond: Double? = nil) {
         self.bytesReceived = bytesReceived
         self.totalBytes = totalBytes
+        self.bytesPerSecond = bytesPerSecond
     }
 
     /// `0...1` when the server reports a content length, otherwise `nil`.
@@ -32,6 +36,7 @@ public struct UpdateDownloadOutcome: Equatable, Sendable {
 public enum UpdateDownloadError: Error, Equatable, Sendable, LocalizedError {
     case network(String)
     case httpStatus(Int)
+    case stalled(attempts: Int)
     case checksumsUnavailable
     case checksumMissingForAsset(String)
     case checksumMismatch(expected: String, actual: String)
@@ -45,6 +50,8 @@ public enum UpdateDownloadError: Error, Equatable, Sendable, LocalizedError {
             return "下载失败：\(message)"
         case .httpStatus(let code):
             return "下载失败：HTTP \(code)"
+        case .stalled(let attempts):
+            return "下载多次停滞（60 秒内平均速度低于 4 KB/s），已尝试 \(attempts) 次。请检查网络后重试下载。"
         case .checksumsUnavailable:
             return "无法获取校验文件，已中止安装"
         case .checksumMissingForAsset(let name):
@@ -67,15 +74,21 @@ public actor UpdateDownloader {
     private let session: URLSession
     private let signaturePolicy: UpdateSignaturePolicy
     private let publicKeyBase64: String
+    private let transferConfiguration: URLSessionConfiguration
+    private let transferPolicy: DownloadTransferPolicy
 
     public init(
         session: URLSession = .shared,
         signaturePolicy: UpdateSignaturePolicy = .required,
-        publicKeyBase64: String = UpdateSignature.releasePublicKeyBase64
+        publicKeyBase64: String = UpdateSignature.releasePublicKeyBase64,
+        transferConfiguration: URLSessionConfiguration = .ephemeral,
+        transferPolicy: DownloadTransferPolicy = .default
     ) {
         self.session = session
         self.signaturePolicy = signaturePolicy
         self.publicKeyBase64 = publicKeyBase64
+        self.transferConfiguration = transferConfiguration
+        self.transferPolicy = transferPolicy
     }
 
     public func downloadAndVerify(
@@ -101,33 +114,41 @@ public actor UpdateDownloader {
         }
 
         let destination = stagingDirectory.appendingPathComponent(zipName)
-        _ = try await downloadFile(from: update.zipURL, to: destination, onProgress: onProgress)
-
-        let actualHash: String
         do {
-            actualHash = try UpdateArtifactVerifier.sha256Hex(ofFileAt: destination)
+            // The transport may resume a partial transfer internally. Never
+            // trust transport-level bookkeeping after that: hash the complete
+            // on-disk artifact here, then verify the signature over those same
+            // bytes. Both checks are re-run in full on every install attempt.
+            _ = try await downloadFile(from: update.zipURL, to: destination, onProgress: onProgress)
+
+            let actualHash: String
+            do {
+                actualHash = try UpdateArtifactVerifier.sha256Hex(ofFileAt: destination)
+            } catch {
+                throw UpdateDownloadError.writeFailed(error.localizedDescription)
+            }
+            guard actualHash == expectedHash else {
+                throw UpdateDownloadError.checksumMismatch(expected: expectedHash, actual: actualHash)
+            }
+
+            try await verifySignatureIfNeeded(update: update, zipFileURL: destination)
+
+            return UpdateDownloadOutcome(
+                zipFileURL: destination,
+                sha256: actualHash,
+                stagingDirectory: stagingDirectory
+            )
         } catch {
-            throw UpdateDownloadError.writeFailed(error.localizedDescription)
-        }
-        guard actualHash == expectedHash else {
+            // Hard failure: no partially verified bytes may survive on disk.
             try? fileManager.removeItem(at: destination)
-            throw UpdateDownloadError.checksumMismatch(expected: expectedHash, actual: actualHash)
+            throw error
         }
-
-        try await verifySignatureIfNeeded(update: update, zipFileURL: destination)
-
-        return UpdateDownloadOutcome(
-            zipFileURL: destination,
-            sha256: actualHash,
-            stagingDirectory: stagingDirectory
-        )
     }
 
     private func verifySignatureIfNeeded(update: AvailableUpdate, zipFileURL: URL) async throws {
         switch signaturePolicy {
         case .required:
             guard let signatureURL = update.signatureURL else {
-                try? FileManager.default.removeItem(at: zipFileURL)
                 throw UpdateDownloadError.signatureMissing
             }
             try await verifySignature(signatureURL: signatureURL, zipFileURL: zipFileURL)
@@ -146,15 +167,12 @@ public actor UpdateDownloader {
             }
             signatureText = text
         } catch let error as UpdateDownloadError {
-            try? FileManager.default.removeItem(at: zipFileURL)
             throw error
         } catch {
-            try? FileManager.default.removeItem(at: zipFileURL)
             throw UpdateDownloadError.signatureInvalid
         }
 
         guard let signatureBase64 = UpdateSignature.parseSignatureFile(signatureText) else {
-            try? FileManager.default.removeItem(at: zipFileURL)
             throw UpdateDownloadError.signatureInvalid
         }
 
@@ -166,11 +184,9 @@ public actor UpdateDownloader {
                 publicKeyBase64: publicKeyBase64
             )
         } catch {
-            try? FileManager.default.removeItem(at: zipFileURL)
             throw UpdateDownloadError.signatureInvalid
         }
         guard isValid else {
-            try? FileManager.default.removeItem(at: zipFileURL)
             throw UpdateDownloadError.signatureInvalid
         }
     }
@@ -205,8 +221,12 @@ public actor UpdateDownloader {
         onProgress: (@Sendable (UpdateDownloadProgress) -> Void)?
     ) async throws -> Int64 {
         // System-managed transfer with live byte progress: the bytes never
-        // stream through user-space one byte at a time.
-        let downloader = ProgressDownload()
+        // stream through user-space one byte at a time. ProgressDownload
+        // handles stall detection and resume within this attempt.
+        let downloader = ProgressDownload(
+            configuration: transferConfiguration,
+            policy: transferPolicy
+        )
         let (tempURL, totalBytes) = try await downloader.download(from: url, onProgress: onProgress)
 
         let fileManager = FileManager.default
@@ -221,7 +241,6 @@ public actor UpdateDownloader {
         }
 
         let received = (try? fileManager.attributesOfItem(atPath: destination.path)[.size] as? Int64) ?? totalBytes
-        onProgress?(UpdateDownloadProgress(bytesReceived: received, totalBytes: totalBytes))
         return received
     }
 }

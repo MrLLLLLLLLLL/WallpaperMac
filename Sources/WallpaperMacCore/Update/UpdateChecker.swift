@@ -93,6 +93,7 @@ public struct UpdateChecker: Sendable {
                 releaseNotes: notes,
                 releasePageURL: releasePageURL,
                 zipURL: zipURL,
+                downloadSizeBytes: zip.size,
                 checksumsURL: checksumsURL,
                 signatureURL: signatureURL,
                 publishedAt: publishedAt
@@ -187,9 +188,11 @@ private struct GitHubRelease: Decodable {
 private struct GitHubAsset: Decodable {
     let name: String?
     let browserDownloadUrl: String?
+    let size: Int64?
 
     enum CodingKeys: String, CodingKey {
         case name
         case browserDownloadUrl = "browser_download_url"
+        case size
     }
 }

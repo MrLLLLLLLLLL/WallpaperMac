@@ -718,6 +718,13 @@ let tests: [(String, () throws -> Void)] = [
     ("matches SHA-256 known vectors", testUpdateSHA256OfDataMatchesKnownVector),
     ("detects artifact tampering", testUpdateFileVerificationDetectsTampering),
     ("streams large artifact hashes", testUpdateFileVerificationReadsLargeArtifactsInChunks),
+    ("parses update asset size", testUpdateCheckerParsesAssetSize),
+    ("detects download stalls by average speed", testDownloadTransferPolicyDetectsStalls),
+    ("caps download attempts and keeps resume state", testDownloadRetryStateCapsAttemptsAndKeepsResume),
+    ("resumes interrupted update download and verifies", testUpdateDownloadResumesInterruptedTransferAndVerifies),
+    ("rejects tampered bytes after resume", testUpdateDownloadRejectsTamperedBytesAfterResume),
+    ("rejects bad signature after resume", testUpdateDownloadRejectsBadSignatureAfterResume),
+    ("reports stalled transfer after retry limit", testUpdateDownloadReportsStalledTransferAfterRetryLimit),
     ("quotes shell paths safely", testUpdateShellQuotingSurvivesApostrophes),
     ("waits for parent and rolls back install", testUpdateInstallScriptWaitsForParentAndRollsBack),
     ("prepares and validates update bundle", testUpdatePrepareExtractsAndValidatesBundleVersion),
@@ -946,7 +953,7 @@ func makeReleaseJSON(
     body: String = "notes",
     htmlURL: String? = "https://github.com/MrLLLLLLLLLL/WallpaperMac/releases/tag/v0.2.6",
     publishedAt: String? = "2026-10-28T10:00:00Z",
-    assets: [[String: String]] = [
+    assets: [[String: Any]] = [
         [
             "name": "WallpaperMac-v0.2.6-macOS.zip",
             "browser_download_url": "https://example.com/WallpaperMac-v0.2.6-macOS.zip"
@@ -1238,6 +1245,671 @@ func testUpdateFileVerificationReadsLargeArtifactsInChunks() throws {
     let fileHash = try UpdateArtifactVerifier.sha256Hex(ofFileAt: artifact)
     let memoryHash = UpdateArtifactVerifier.sha256Hex(ofData: payload)
     try expect(fileHash, equals: memoryHash, "streaming hash must match one-shot hash for multi-megabyte input")
+}
+
+// MARK: - Update download transport (resume + stalls)
+
+final class AsyncTestResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var error: Error?
+
+    func record(_ error: Error?) {
+        lock.lock()
+        self.error = error
+        lock.unlock()
+    }
+
+    func recordedError() -> Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return error
+    }
+}
+
+/// Bridges an async test body into the synchronous test runner. The URLSession
+/// delegate and stall timer run on their own queues, so blocking the main
+/// thread here cannot starve them.
+func runAsyncTest(_ body: @escaping () async throws -> Void) throws {
+    let semaphore = DispatchSemaphore(value: 0)
+    let result = AsyncTestResult()
+    Task {
+        do {
+            try await body()
+            result.record(nil)
+        } catch {
+            result.record(error)
+        }
+        semaphore.signal()
+    }
+    semaphore.wait()
+    if let error = result.recordedError() {
+        throw error
+    }
+}
+
+/// In-process HTTP stand-in. Serves a release zip (with Range support), the
+/// checksum manifest and the signature, and can go silent mid-transfer so the
+/// downloader's stall watchdog has to cancel and resume it.
+final class UpdateDownloadMockURLProtocol: URLProtocol {
+    struct Stub {
+        var statusCode: Int
+        var headers: [String: String]
+        var body: Data
+        /// When set, send this many bytes and then stop writing. The task
+        /// stays active until the downloader cancels it.
+        var stallAfter: Int?
+        /// When set, deliver the body in chunks instead of one burst so the
+        /// progress rate can be sampled.
+        var chunkSize: Int? = nil
+        var chunkDelay: TimeInterval = 0.08
+    }
+
+    struct RecordedRequest {
+        let path: String
+        let range: String?
+    }
+
+    private static let stateLock = NSLock()
+    private static var stubProvider: ((URLRequest) -> Stub)?
+    private static var recorded: [RecordedRequest] = []
+
+    static func install(_ provider: @escaping (URLRequest) -> Stub) {
+        stateLock.lock()
+        stubProvider = provider
+        recorded = []
+        stateLock.unlock()
+    }
+
+    static func requests() -> [RecordedRequest] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return recorded
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.stateLock.lock()
+        Self.recorded.append(
+            RecordedRequest(
+                path: request.url?.path ?? "",
+                range: request.value(forHTTPHeaderField: "Range")
+            )
+        )
+        let provider = Self.stubProvider
+        Self.stateLock.unlock()
+
+        guard let provider, let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let stub = provider(request)
+        guard let http = HTTPURLResponse(
+            url: url,
+            statusCode: stub.statusCode,
+            httpVersion: "HTTP/1.1",
+            headerFields: stub.headers
+        ) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
+
+        if let stallAfter = stub.stallAfter {
+            client?.urlProtocol(self, didLoad: Data(stub.body.prefix(stallAfter)))
+            // Deliberately never finish: this is a stalled weak-network
+            // transfer, not a complete response.
+            return
+        }
+        if let chunkSize = stub.chunkSize, chunkSize > 0, stub.body.count > chunkSize {
+            startChunkedDelivery(body: stub.body, chunkSize: chunkSize, delay: stub.chunkDelay)
+            return
+        }
+        client?.urlProtocol(self, didLoad: stub.body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    private var chunkTimer: DispatchSourceTimer?
+    private var chunkBody = Data()
+    private var chunkOffset = 0
+    private var configuredChunkSize = 0
+
+    private func startChunkedDelivery(body: Data, chunkSize: Int, delay: TimeInterval) {
+        chunkBody = body
+        chunkOffset = 0
+        configuredChunkSize = chunkSize
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
+        timer.schedule(deadline: .now() + delay, repeating: delay)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            guard self.chunkOffset < self.chunkBody.count else {
+                timer.cancel()
+                self.client?.urlProtocolDidFinishLoading(self)
+                return
+            }
+            let end = min(self.chunkOffset + self.configuredChunkSize, self.chunkBody.count)
+            let chunk = Data(self.chunkBody[self.chunkOffset..<end])
+            self.chunkOffset = end
+            self.client?.urlProtocol(self, didLoad: chunk)
+        }
+        chunkTimer = timer
+        timer.resume()
+    }
+
+    override func stopLoading() {
+        chunkTimer?.cancel()
+        chunkTimer = nil
+    }
+}
+
+final class UpdateDownloadMockServer {
+    let zip: Data
+    let zipName: String
+    let checksums: Data
+    let signature: Data
+    let stallFirstZipAfter: Int?
+    let stallEveryZip: Bool
+
+    private let lock = NSLock()
+    private var zipRequestCount = 0
+    private let baseURL = URL(string: "https://update.test")!
+
+    init(
+        zip: Data,
+        zipName: String,
+        checksums: Data,
+        signature: Data,
+        stallFirstZipAfter: Int?,
+        stallEveryZip: Bool
+    ) {
+        self.zip = zip
+        self.zipName = zipName
+        self.checksums = checksums
+        self.signature = signature
+        self.stallFirstZipAfter = stallFirstZipAfter
+        self.stallEveryZip = stallEveryZip
+    }
+
+    var configuration: URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [UpdateDownloadMockURLProtocol.self]
+        return configuration
+    }
+
+    func makeSession() -> URLSession {
+        URLSession(configuration: configuration)
+    }
+
+    func install() {
+        UpdateDownloadMockURLProtocol.install { [weak self] request in
+            guard let self else {
+                return UpdateDownloadMockURLProtocol.Stub(
+                    statusCode: 500,
+                    headers: [:],
+                    body: Data(),
+                    stallAfter: nil
+                )
+            }
+            let path = request.url?.path ?? ""
+            if path.hasSuffix("SHA256SUMS.txt") {
+                return UpdateDownloadMockURLProtocol.Stub(
+                    statusCode: 200,
+                    headers: ["Content-Length": "\(checksums.count)"],
+                    body: checksums,
+                    stallAfter: nil
+                )
+            }
+            if path.hasSuffix(".sig") {
+                return UpdateDownloadMockURLProtocol.Stub(
+                    statusCode: 200,
+                    headers: ["Content-Length": "\(signature.count)"],
+                    body: signature,
+                    stallAfter: nil
+                )
+            }
+            if path.hasSuffix(zipName) {
+                return zipResponse(for: request)
+            }
+            return UpdateDownloadMockURLProtocol.Stub(
+                statusCode: 404,
+                headers: [:],
+                body: Data(),
+                stallAfter: nil
+            )
+        }
+    }
+
+    private func zipResponse(for request: URLRequest) -> UpdateDownloadMockURLProtocol.Stub {
+        lock.lock()
+        let attempt = zipRequestCount
+        zipRequestCount += 1
+        lock.unlock()
+
+        if let range = request.value(forHTTPHeaderField: "Range"),
+           let start = Self.rangeStart(range),
+           start > 0,
+           start < zip.count {
+            let payload = Data(zip[start...])
+            return UpdateDownloadMockURLProtocol.Stub(
+                statusCode: 206,
+                headers: [
+                    "Content-Length": "\(payload.count)",
+                    "Content-Range": "bytes \(start)-\(zip.count - 1)/\(zip.count)",
+                    "ETag": "\"v1\"",
+                    "Accept-Ranges": "bytes"
+                ],
+                body: payload,
+                stallAfter: nil,
+                chunkSize: max(1, payload.count / 4)
+            )
+        }
+
+        let stallAfter = (stallEveryZip || attempt == 0) ? stallFirstZipAfter : nil
+        return UpdateDownloadMockURLProtocol.Stub(
+            statusCode: 200,
+            headers: [
+                "Content-Length": "\(zip.count)",
+                "ETag": "\"v1\"",
+                "Accept-Ranges": "bytes"
+            ],
+            body: zip,
+            stallAfter: stallAfter
+        )
+    }
+
+    private static func rangeStart(_ header: String) -> Int? {
+        guard header.hasPrefix("bytes=") else { return nil }
+        let rest = header.dropFirst("bytes=".count)
+        guard let dash = rest.firstIndex(of: "-") else { return nil }
+        return Int(rest[..<dash])
+    }
+}
+
+final class UpdateProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [UpdateDownloadProgress] = []
+
+    func record(_ progress: UpdateDownloadProgress) {
+        lock.lock()
+        values.append(progress)
+        lock.unlock()
+    }
+
+    var last: UpdateDownloadProgress? {
+        lock.lock()
+        defer { lock.unlock() }
+        return values.last
+    }
+
+    var all: [UpdateDownloadProgress] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
+}
+
+struct UpdateDownloadFixture {
+    let zip: Data
+    let zipName: String
+    let hash: String
+    let server: UpdateDownloadMockServer
+    let session: URLSession
+    let publicKeyBase64: String
+    let update: AvailableUpdate
+    let staging: URL
+}
+
+func makeUpdateDownloadFixture(
+    stallFirstZipAfter: Int? = nil,
+    stallEveryZip: Bool = false,
+    checksumForDifferentBytes: Bool = false,
+    signatureFromDifferentKey: Bool = false
+) throws -> UpdateDownloadFixture {
+    let zipName = "WallpaperMac-v0.2.7-macOS.zip"
+    let byteCount = 64 * 1024
+    var zipBytes = [UInt8]()
+    zipBytes.reserveCapacity(byteCount)
+    for index in 0..<byteCount {
+        zipBytes.append(UInt8((index * 31 + 7) % 251))
+    }
+    let zip = Data(zipBytes)
+    let hash = UpdateArtifactVerifier.sha256Hex(ofData: zip)
+
+    let expectedHash: String
+    if checksumForDifferentBytes {
+        var altered = zip
+        altered[1024] = altered[1024] ^ 0xFF
+        expectedHash = UpdateArtifactVerifier.sha256Hex(ofData: altered)
+    } else {
+        expectedHash = hash
+    }
+    let checksums = Data("\(expectedHash)  \(zipName)\n".utf8)
+
+    let signingKey = Curve25519.Signing.PrivateKey()
+    let verificationKey = signatureFromDifferentKey ? Curve25519.Signing.PrivateKey() : signingKey
+    let signatureLine = try UpdateSignature.sign(data: zip, privateKey: signingKey)
+    let signature = Data((signatureLine + "\n").utf8)
+
+    let server = UpdateDownloadMockServer(
+        zip: zip,
+        zipName: zipName,
+        checksums: checksums,
+        signature: signature,
+        stallFirstZipAfter: stallFirstZipAfter,
+        stallEveryZip: stallEveryZip
+    )
+    server.install()
+    let session = server.makeSession()
+
+    let baseURL = URL(string: "https://update.test")!
+    let update = AvailableUpdate(
+        version: "0.2.7",
+        releaseNotes: "notes",
+        releasePageURL: baseURL,
+        zipURL: baseURL.appendingPathComponent(zipName),
+        downloadSizeBytes: Int64(zip.count),
+        checksumsURL: baseURL.appendingPathComponent("SHA256SUMS.txt"),
+        signatureURL: baseURL.appendingPathComponent("\(zipName).sig"),
+        publishedAt: nil
+    )
+
+    let staging = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WallpaperMacUpdateDownloadTests", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+
+    return UpdateDownloadFixture(
+        zip: zip,
+        zipName: zipName,
+        hash: hash,
+        server: server,
+        session: session,
+        publicKeyBase64: verificationKey.publicKey.rawRepresentation.base64EncodedString(),
+        update: update,
+        staging: staging
+    )
+}
+
+func makeFastStallPolicy(maximumAttempts: Int = 3) -> DownloadTransferPolicy {
+    DownloadTransferPolicy(
+        maximumAttempts: maximumAttempts,
+        stallWindow: 0.3,
+        // Low enough that the resumed chunked transfer is not itself judged
+        // slow, high enough that the 8 KB trickle counts as stalled.
+        minimumAverageBytesPerSecond: 50_000,
+        retryDelay: 0.05
+    )
+}
+
+func testUpdateCheckerParsesAssetSize() throws {
+    let data = makeReleaseJSON(assets: [
+        [
+            "name": "WallpaperMac-v0.2.6-macOS.zip",
+            "browser_download_url": "https://example.com/WallpaperMac-v0.2.6-macOS.zip",
+            "size": 48_234_567
+        ],
+        [
+            "name": "WallpaperMac-v0.2.6-SHA256SUMS.txt",
+            "browser_download_url": "https://example.com/WallpaperMac-v0.2.6-SHA256SUMS.txt"
+        ]
+    ])
+    let result = try UpdateChecker.parseLatestRelease(data: data, currentVersion: "0.2.5")
+    guard case .updateAvailable(let update) = result else {
+        throw TestFailure(message: "expected update available, got \(result)")
+    }
+    try expect(update.downloadSizeBytes, equals: 48_234_567, "zip asset size should be surfaced for the UI")
+}
+
+func testDownloadTransferPolicyDetectsStalls() throws {
+    let policy = DownloadTransferPolicy(
+        maximumAttempts: 3,
+        stallWindow: 60,
+        minimumAverageBytesPerSecond: 4 * 1024
+    )
+    try expect(policy.isStalled(bytesTransferred: 0, over: 60), "zero bytes over a full window is a stall")
+    try expect(
+        policy.isStalled(bytesTransferred: 4 * 1024 * 60 - 1, over: 60),
+        "just below the floor is a stall"
+    )
+    try expect(
+        !policy.isStalled(bytesTransferred: 4 * 1024 * 60, over: 60),
+        "the average floor itself is not a stall"
+    )
+    try expect(!policy.isStalled(bytesTransferred: 0, over: 59), "a partial window must not be judged")
+    try expect(!policy.isStalled(bytesTransferred: 1_000_000, over: 60), "a fast transfer is not stalled")
+}
+
+func testDownloadRetryStateCapsAttemptsAndKeepsResume() throws {
+    var state = DownloadRetryState(policy: DownloadTransferPolicy(maximumAttempts: 3))
+    try expect(state.beginAttempt(), "the first attempt should always start")
+    try expect(
+        state.recordFailure(.transport("reset"), canResume: true),
+        equals: .retry(canResume: true),
+        "a transport failure with resume data should resume"
+    )
+    try expect(state.beginAttempt(), "a retry should start another attempt")
+    try expect(
+        state.recordFailure(.stalled(averageBytesPerSecond: 100), canResume: false),
+        equals: .retry(canResume: false),
+        "a stall without resume data should restart from scratch"
+    )
+    try expect(state.beginAttempt(), "the final attempt should start")
+    try expect(
+        state.recordFailure(.transport("timeout"), canResume: false),
+        equals: .stop(.network("网络传输反复中断（已尝试 3 次）：timeout")),
+        "the attempt cap should produce a readable network error"
+    )
+    try expect(!state.beginAttempt(), "no attempt may start past the cap")
+    try expect(state.attemptsRemaining, equals: 0, "the budget should be exhausted")
+
+    var stallState = DownloadRetryState(policy: DownloadTransferPolicy(maximumAttempts: 1))
+    try expect(stallState.beginAttempt(), "the first attempt should start")
+    try expect(
+        stallState.recordFailure(.stalled(averageBytesPerSecond: 0), canResume: true),
+        equals: .stop(.stalled(attempts: 1)),
+        "the final stall should be distinguishable from a network error"
+    )
+
+    var serverState = DownloadRetryState(policy: DownloadTransferPolicy(maximumAttempts: 2))
+    try expect(serverState.beginAttempt(), "the first attempt should start")
+    try expect(
+        serverState.recordFailure(.server(statusCode: 503), canResume: true),
+        equals: .retry(canResume: false),
+        "HTTP error bodies must never be resumed"
+    )
+
+    let stallMessage = UpdateDownloadError.stalled(attempts: 3).localizedDescription
+    try expect(stallMessage.contains("停滞"), "stall failures should explain the network problem")
+    try expect(stallMessage.contains("3"), "stall failures should name the attempt count")
+}
+
+func testUpdateDownloadResumesInterruptedTransferAndVerifies() throws {
+    try runAsyncTest {
+        let fixture = try makeUpdateDownloadFixture(stallFirstZipAfter: 8 * 1024)
+        defer { try? FileManager.default.removeItem(at: fixture.staging) }
+
+        let downloader = UpdateDownloader(
+            session: fixture.session,
+            signaturePolicy: .required,
+            publicKeyBase64: fixture.publicKeyBase64,
+            transferConfiguration: fixture.server.configuration,
+            transferPolicy: makeFastStallPolicy()
+        )
+        let progress = UpdateProgressRecorder()
+        let outcome = try await downloader.downloadAndVerify(
+            update: fixture.update,
+            stagingDirectory: fixture.staging,
+            onProgress: { progress.record($0) }
+        )
+
+        try expect(outcome.sha256, equals: fixture.hash, "resumed artifact must keep its published hash")
+        let downloaded = try Data(contentsOf: outcome.zipFileURL)
+        try expect(downloaded, equals: fixture.zip, "resumed download must contain the complete artifact")
+        try expect(
+            outcome.zipFileURL.lastPathComponent,
+            equals: fixture.zipName,
+            "verified artifact should keep the release name"
+        )
+
+        let requests = UpdateDownloadMockURLProtocol.requests()
+        let zipIndices = requests.indices.filter { requests[$0].path.hasSuffix(fixture.zipName) }
+        try expect(zipIndices.count >= 2, "a stalled transfer should be retried")
+        try expect(
+            zipIndices.contains { requests[$0].range != nil },
+            "the retry must continue from a Range request instead of starting over"
+        )
+
+        guard let firstZip = zipIndices.first,
+              let lastZip = zipIndices.last,
+              let checksumsIndex = requests.firstIndex(where: { $0.path.hasSuffix("SHA256SUMS.txt") }),
+              let signatureIndex = requests.firstIndex(where: { $0.path.hasSuffix(".sig") }) else {
+            throw TestFailure(message: "expected checksum, zip and signature requests")
+        }
+        try expect(checksumsIndex < firstZip, "checksums must be fetched before the artifact")
+        try expect(signatureIndex > lastZip, "signature must be checked after the completed artifact")
+
+        guard let lastProgress = progress.last else {
+            throw TestFailure(message: "expected at least one progress update")
+        }
+        try expect(
+            lastProgress.bytesReceived,
+            equals: Int64(fixture.zip.count),
+            "final progress should cover the whole artifact"
+        )
+        try expect(
+            lastProgress.totalBytes,
+            equals: Int64(fixture.zip.count),
+            "final progress should know the artifact size"
+        )
+        try expect(
+            progress.all.contains { ($0.bytesPerSecond ?? 0) > 0 },
+            "progress should report a transfer speed"
+        )
+    }
+}
+
+func testUpdateDownloadRejectsTamperedBytesAfterResume() throws {
+    try runAsyncTest {
+        let fixture = try makeUpdateDownloadFixture(
+            stallFirstZipAfter: 8 * 1024,
+            checksumForDifferentBytes: true
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.staging) }
+
+        let downloader = UpdateDownloader(
+            session: fixture.session,
+            signaturePolicy: .required,
+            publicKeyBase64: fixture.publicKeyBase64,
+            transferConfiguration: fixture.server.configuration,
+            transferPolicy: makeFastStallPolicy()
+        )
+        do {
+            _ = try await downloader.downloadAndVerify(
+                update: fixture.update,
+                stagingDirectory: fixture.staging
+            )
+            throw TestFailure(message: "checksum mismatch must abort the install")
+        } catch let error as UpdateDownloadError {
+            guard case .checksumMismatch = error else {
+                throw TestFailure(message: "expected checksumMismatch, got \(error)")
+            }
+        }
+
+        try expect(
+            UpdateDownloadMockURLProtocol.requests().contains { $0.range != nil },
+            "verification failure must be exercised after a resumed transfer"
+        )
+        let destination = fixture.staging.appendingPathComponent(fixture.zipName)
+        try expect(
+            !FileManager.default.fileExists(atPath: destination.path),
+            "a failed checksum must delete the downloaded artifact"
+        )
+    }
+}
+
+func testUpdateDownloadRejectsBadSignatureAfterResume() throws {
+    try runAsyncTest {
+        let fixture = try makeUpdateDownloadFixture(
+            stallFirstZipAfter: 8 * 1024,
+            signatureFromDifferentKey: true
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.staging) }
+
+        let downloader = UpdateDownloader(
+            session: fixture.session,
+            signaturePolicy: .required,
+            publicKeyBase64: fixture.publicKeyBase64,
+            transferConfiguration: fixture.server.configuration,
+            transferPolicy: makeFastStallPolicy()
+        )
+        do {
+            _ = try await downloader.downloadAndVerify(
+                update: fixture.update,
+                stagingDirectory: fixture.staging
+            )
+            throw TestFailure(message: "a foreign signature must abort the install")
+        } catch let error as UpdateDownloadError {
+            try expect(error, equals: .signatureInvalid, "foreign signatures should surface signatureInvalid")
+        }
+
+        try expect(
+            UpdateDownloadMockURLProtocol.requests().contains { $0.range != nil },
+            "signature failure must be exercised after a resumed transfer"
+        )
+        let destination = fixture.staging.appendingPathComponent(fixture.zipName)
+        try expect(
+            !FileManager.default.fileExists(atPath: destination.path),
+            "a failed signature must delete the downloaded artifact"
+        )
+    }
+}
+
+func testUpdateDownloadReportsStalledTransferAfterRetryLimit() throws {
+    try runAsyncTest {
+        let fixture = try makeUpdateDownloadFixture(
+            stallFirstZipAfter: 0,
+            stallEveryZip: true
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.staging) }
+
+        let downloader = UpdateDownloader(
+            session: fixture.session,
+            signaturePolicy: .required,
+            publicKeyBase64: fixture.publicKeyBase64,
+            transferConfiguration: fixture.server.configuration,
+            transferPolicy: DownloadTransferPolicy(
+                maximumAttempts: 2,
+                stallWindow: 0.15,
+                minimumAverageBytesPerSecond: 500_000,
+                retryDelay: 0.02
+            )
+        )
+        do {
+            _ = try await downloader.downloadAndVerify(
+                update: fixture.update,
+                stagingDirectory: fixture.staging
+            )
+            throw TestFailure(message: "a permanently stalled transfer must fail")
+        } catch let error as UpdateDownloadError {
+            try expect(
+                error,
+                equals: .stalled(attempts: 2),
+                "an exhausted stall retry budget should report stalled attempts"
+            )
+        }
+
+        try expect(
+            UpdateDownloadMockURLProtocol.requests().filter { $0.path.hasSuffix(fixture.zipName) }.count == 2,
+            "the downloader should stop after the configured attempt budget"
+        )
+        let destination = fixture.staging.appendingPathComponent(fixture.zipName)
+        try expect(
+            !FileManager.default.fileExists(atPath: destination.path),
+            "a stalled transfer must not leave an artifact behind"
+        )
+    }
 }
 
 // MARK: - Update installer (M3)

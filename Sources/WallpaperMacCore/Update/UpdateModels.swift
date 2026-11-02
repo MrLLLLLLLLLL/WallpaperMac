@@ -6,6 +6,9 @@ public struct AvailableUpdate: Equatable, Sendable {
     public let releaseNotes: String
     public let releasePageURL: URL
     public let zipURL: URL
+    /// Published asset size, so the settings UI can show the package size
+    /// before the first byte arrives.
+    public let downloadSizeBytes: Int64?
     public let checksumsURL: URL?
     public let signatureURL: URL?
     public let publishedAt: Date?
@@ -15,6 +18,7 @@ public struct AvailableUpdate: Equatable, Sendable {
         releaseNotes: String,
         releasePageURL: URL,
         zipURL: URL,
+        downloadSizeBytes: Int64? = nil,
         checksumsURL: URL?,
         signatureURL: URL? = nil,
         publishedAt: Date?
@@ -23,6 +27,7 @@ public struct AvailableUpdate: Equatable, Sendable {
         self.releaseNotes = releaseNotes
         self.releasePageURL = releasePageURL
         self.zipURL = zipURL
+        self.downloadSizeBytes = downloadSizeBytes
         self.checksumsURL = checksumsURL
         self.signatureURL = signatureURL
         self.publishedAt = publishedAt

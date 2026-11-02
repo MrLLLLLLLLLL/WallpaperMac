@@ -6,7 +6,7 @@ import WallpaperMacCore
 final class SettingsWindowController: NSWindowController {
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 580),
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 640),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -55,7 +55,9 @@ private struct SettingsView: View {
     }
 
     var body: some View {
-        Form {
+        VStack(spacing: 0) {
+            updateBanner
+            Form {
             Section("壁纸库") {
                 HStack {
                     Text(libraryPath)
@@ -145,6 +147,7 @@ private struct SettingsView: View {
         .formStyle(.grouped)
         .padding(20)
         .frame(minWidth: 600, minHeight: 540)
+        }
         .onAppear {
             // Reflect external login-item changes without re-applying them.
             isSyncingLoginToggle = true
@@ -198,8 +201,16 @@ private struct SettingsView: View {
                 .foregroundStyle(.secondary)
         case .available(let update):
             VStack(alignment: .leading, spacing: 8) {
-                Text("发现新版本 \(update.version)")
-                    .font(.headline)
+                HStack(alignment: .firstTextBaseline) {
+                    Text("发现新版本 \(update.version)")
+                        .font(.headline)
+                    Spacer()
+                    if let size = update.downloadSizeBytes {
+                        Text("更新包大小 \(byteCountText(size))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 if let publishedAt = update.publishedAt {
                     Text(publishedAt.formatted(date: .abbreviated, time: .omitted))
                         .font(.caption)
@@ -215,6 +226,9 @@ private struct SettingsView: View {
                     }
                     .frame(maxHeight: 120)
                 }
+                Text("下载并校验通过后会自动安装，应用将重启。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 HStack {
                     Button("立即更新") { updateService.installUpdate(update) }
                         .keyboardShortcut(.defaultAction)
@@ -232,17 +246,35 @@ private struct SettingsView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("正在下载 \(update.version)")
                     .font(.headline)
-                if let progress, let fraction = progress.fractionCompleted {
-                    ProgressView(value: fraction)
-                    Text("\(ByteCountFormatter.string(fromByteCount: progress.bytesReceived, countStyle: .file))")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                if let progress {
+                    if let fraction = progress.fractionCompleted {
+                        ProgressView(value: fraction)
+                    } else {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    HStack(spacing: 6) {
+                        Text(downloadAmountText(progress))
+                        if let speed = progress.bytesPerSecond, speed > 0 {
+                            Text("·")
+                            Text(speedText(speed))
+                        }
+                        Spacer()
+                        if let fraction = progress.fractionCompleted {
+                            Text("\(Int((fraction * 100).rounded()))%")
+                        }
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
                 } else {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("正在下载…")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("正在连接下载服务器…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 Text("下载完成后会自动校验并安装，应用将重启。")
                     .font(.caption)
@@ -256,15 +288,67 @@ private struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-        case .failed(let message):
-            HStack {
+        case .failed(_, let message):
+            HStack(alignment: .top) {
                 Text(message)
                     .font(.caption)
                     .foregroundStyle(.red)
                 Spacer()
-                Button("重试") { updateService.checkForUpdates(userInitiated: true) }
+                if updateService.canRetryDownload {
+                    Button("重试下载") { updateService.retryDownload() }
+                        .disabled(updateService.isBusy)
+                }
             }
         }
+    }
+
+    private func byteCountText(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: max(0, bytes), countStyle: .file)
+    }
+
+    private func downloadAmountText(_ progress: UpdateDownloadProgress) -> String {
+        if let total = progress.totalBytes, total > 0 {
+            return "\(byteCountText(progress.bytesReceived)) / \(byteCountText(total))"
+        }
+        return byteCountText(progress.bytesReceived)
+    }
+
+    private func speedText(_ bytesPerSecond: Double) -> String {
+        let rate = Int64(max(0, bytesPerSecond).rounded())
+        return "\(byteCountText(rate))/s"
+    }
+
+
+    /// Always-visible prompt at the top of settings, so opening settings from
+    /// the menu-bar update hint lands on the update without scrolling.
+    @ViewBuilder
+    private var updateBanner: some View {
+        if case .available(let update) = updateService.phase {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("发现新版本 \(update.version)")
+                        .font(.headline)
+                    Text(updateBannerSubtitle(update))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("立即更新") { updateService.installUpdate(update) }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            .background(Color.accentColor.opacity(0.10))
+            Divider()
+        }
+    }
+
+    private func updateBannerSubtitle(_ update: AvailableUpdate) -> String {
+        if let size = update.downloadSizeBytes {
+            return "更新包大小 \(byteCountText(size))，安装后应用将重启"
+        }
+        return "安装后应用将重启"
     }
 
     private func chooseLibraryFolder() {
