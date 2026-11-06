@@ -109,6 +109,15 @@ public actor WallpaperStoreWorker {
         return WallpaperImportResult(snapshot: try snapshot(), importedIDs: importedIDs, failures: failures)
     }
 
+    public func importWebURL(_ url: URL) throws -> WallpaperImportResult {
+        let item = try store.importWebURL(url)
+        return WallpaperImportResult(
+            snapshot: try snapshot(),
+            importedIDs: [item.id],
+            failures: []
+        )
+    }
+
     public func createGroup(
         _ group: WallpaperGroup,
         assigning itemIDs: Set<UUID>

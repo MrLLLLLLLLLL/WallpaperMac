@@ -6,7 +6,7 @@ import WallpaperMacCore
 
 struct WallpaperResourceMetadataService {
     static func enrich(item: WallpaperItem, libraryURL: URL) async -> WallpaperItem? {
-        guard item.availability == .available else { return nil }
+        guard item.availability == .available, item.sourceURL.isFileURL else { return nil }
         let fileURL: URL
         switch item.type {
         case .web:

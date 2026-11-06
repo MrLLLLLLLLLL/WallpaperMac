@@ -1,11 +1,11 @@
 # WallpaperMac 文档中心
 
-本目录存放 WallpaperMac 的产品设计、使用方法、开发与发布资料。文档以仓库中已经实现的本地图片、视频和 HTML 壁纸工作流为准。
+本目录存放 WallpaperMac 的产品设计、使用方法、开发与发布资料。文档涵盖本地图片、视频、本地 HTML 及 HTTP/HTTPS 网页壁纸工作流。
 
 ## 使用指南
 
 - [快速开始](guides/quick-start.md)：安装、首次启动、导入素材与应用到显示器。
-- [网页壁纸模板](guides/web-wallpaper-template.md)：使用 `Templates/SimpleWebWallpaper` 验证本地 HTML 导入。
+- [网页壁纸模板](guides/web-wallpaper-template.md)：使用 `Templates/SimpleWebWallpaper` 验证本地 HTML 导入；在线网址作为远程引用单独添加。
 
 ## 开发与发布
 
@@ -23,6 +23,8 @@
 ## 发布记录
 
 - [更新记录](../CHANGELOG.md)
+- [0.2.7](release-notes/0.2.7.md)
+- [0.2.6](release-notes/0.2.6.md)
 - [0.2.5](release-notes/0.2.5.md)
 - [0.2.4](release-notes/0.2.4.md)
 - [0.2.3](release-notes/0.2.3.md)
@@ -30,6 +32,10 @@
 - [0.2.1](release-notes/0.2.1.md)
 - [0.2.0](release-notes/0.2.0.md)
 - [0.1.1](release-notes/0.1.1.md)
+
+## 项目报告
+
+- [报告索引](reports/README.md)：问题排查、修复评审与项目状态归档，不参与应用构建。
 
 ## 历史设计资料
 

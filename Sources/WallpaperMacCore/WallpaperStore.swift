@@ -6,6 +6,7 @@ public enum WallpaperStoreError: Error, LocalizedError, Equatable {
     case itemNotFound(UUID)
     case permissionDenied(URL)
     case invalidHTMLEntry(URL)
+    case invalidWebURL
 
     public var errorDescription: String? {
         switch self {
@@ -19,6 +20,8 @@ public enum WallpaperStoreError: Error, LocalizedError, Equatable {
             return "没有权限读取壁纸资源：\(url.path)"
         case .invalidHTMLEntry(let url):
             return "网页入口文件无效：\(url.path)"
+        case .invalidWebURL:
+            return "请输入有效的 HTTP 或 HTTPS 网址，且不要包含账号密码。"
         }
     }
 }
@@ -352,7 +355,28 @@ public final class WallpaperStore {
     }
 
     @discardableResult
+    public func importWebURL(_ url: URL) throws -> WallpaperItem {
+        guard WebWallpaperURL.isValid(url) else {
+            throw WallpaperStoreError.invalidWebURL
+        }
+        try ensureLibraryDirectories()
+        let item = WallpaperItem(
+            name: url.host ?? url.absoluteString,
+            type: .web,
+            sourceURL: url,
+            storageMode: .externalReference
+        )
+        var currentItems = try items()
+        currentItems.append(item)
+        try save(currentItems)
+        return item
+    }
+
+    @discardableResult
     public func importItem(at sourceURL: URL, storageMode: StorageMode, entryURL: URL? = nil) throws -> WallpaperItem {
+        guard sourceURL.isFileURL else {
+            throw WallpaperStoreError.unsupportedSource(sourceURL)
+        }
         guard fileManager.fileExists(atPath: sourceURL.path) else {
             throw WallpaperStoreError.sourceMissing(sourceURL)
         }
@@ -630,7 +654,9 @@ public final class WallpaperStore {
     /// Best-effort resource cleanup after the index no longer references the item.
     /// Failures are logged as orphans; they must not roll back the index write.
     private func removeManagedResources(for item: WallpaperItem) {
-        if item.storageMode == .managedCopy, fileManager.fileExists(atPath: item.sourceURL.path) {
+        if item.sourceURL.isFileURL,
+           item.storageMode == .managedCopy,
+           fileManager.fileExists(atPath: item.sourceURL.path) {
             do {
                 try fileManager.removeItem(at: item.sourceURL)
             } catch {
@@ -695,6 +721,9 @@ public final class WallpaperStore {
     }
 
     private func availability(for item: WallpaperItem) -> WallpaperAvailability {
+        if !item.sourceURL.isFileURL {
+            return item.type == .web && WebWallpaperURL.isValid(item.sourceURL) ? .available : .unsupported
+        }
         guard fileManager.fileExists(atPath: item.sourceURL.path) else {
             return .missing
         }

@@ -51,6 +51,19 @@ public enum StorageMode: String, Codable, CaseIterable, Equatable, Sendable {
     case externalReference
 }
 
+public enum WebWallpaperURL {
+    public static func isValid(_ url: URL) -> Bool {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = components.host, !host.isEmpty,
+              components.user == nil, components.password == nil else {
+            return false
+        }
+        return true
+    }
+}
+
 public enum WallpaperAvailability: String, Codable, CaseIterable, Equatable, Sendable {
     case available
     case importing

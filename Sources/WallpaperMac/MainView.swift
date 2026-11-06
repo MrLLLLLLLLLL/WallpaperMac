@@ -115,6 +115,7 @@ final class LibraryViewModel: ObservableObject {
     @Published var playbackPolicy: PlaybackPolicy
     @Published var isDropTargeted = false
     @Published var isImporting = false
+    @Published var isWebURLImportPresented = false
     @Published var pendingImportURLs: [URL] = []
     @Published private(set) var pendingImportCandidates: [WallpaperImportCandidate] = []
     @Published private(set) var pendingWebEntryCandidates: [URL] = []
@@ -665,6 +666,21 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
+    func importWebWallpaper(_ url: URL) {
+        let worker = storeWorker
+        Task { [weak self] in
+            do {
+                let result = try await worker.importWebURL(url)
+                guard let self else { return }
+                self.applyMutationSnapshot(result.snapshot, enrichMetadata: false)
+                self.selectedWallpaperID = result.importedIDs.first
+                self.importSummary = ImportSummary(importedCount: 1, failures: [])
+            } catch {
+                self?.lastError = error.localizedDescription
+            }
+        }
+    }
+
     func importDroppedFiles(from providers: [NSItemProvider]) {
         let collector = DropURLCollector(providerCount: providers.count)
         for (index, provider) in providers.enumerated() {
@@ -889,7 +905,11 @@ final class LibraryViewModel: ObservableObject {
 
     func showInFinder(_ item: WallpaperItem) {
         let url = item.entryURL ?? item.sourceURL
-        NSWorkspace.shared.activateFileViewerSelecting([url])
+        if url.isFileURL {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     var queueLibrary: [PlaybackQueue] { wallpaperManager.playbackQueues }
@@ -1052,6 +1072,9 @@ struct MainView: View {
         .preferredColorScheme(.dark)
         .sheet(isPresented: $model.isImporting) {
             ImportSheet(model: model)
+        }
+        .sheet(isPresented: $model.isWebURLImportPresented) {
+            WebWallpaperURLImportSheet { model.importWebWallpaper($0) }
         }
         .sheet(isPresented: $model.isNewGroupSheetPresented) {
             NewGroupSheet { name in
@@ -1216,7 +1239,7 @@ private struct OnboardingView: View {
 
     private var message: String {
         switch step {
-        case 0: return "用图片、视频和本地 HTML 项目打造属于你的 macOS 壁纸。所有素材默认保存在本机，不需要账号或云同步。"
+        case 0: return "用图片、视频、本地 HTML 项目或在线网址打造 macOS 壁纸。本地素材保存在壁纸库，在线网页需要网络连接。"
         case 1: return "选择一个长期稳定、拥有读写权限的文件夹。托管副本会复制到这里，外部引用则只保存原文件位置。"
         case 2: return "这些选项可以随时在设置中修改。动态壁纸默认静音，避免意外播放声音。"
         default: return "WallpaperMac 会检查壁纸库的读写权限。无法自动获得权限时仍可继续，但受影响的导入或维护操作会提示处理。"
@@ -1230,7 +1253,7 @@ private struct OnboardingView: View {
             HStack(spacing: 12) {
                 OnboardingFeature(title: "图片", icon: "photo")
                 OnboardingFeature(title: "视频", icon: "film")
-                OnboardingFeature(title: "本地网页", icon: "safari")
+                OnboardingFeature(title: "网页 / 网址", icon: "safari")
             }
         case 1:
             VStack(alignment: .leading, spacing: 12) {
@@ -1774,7 +1797,10 @@ private struct LibraryContentView: View {
                         Label("批量管理", systemImage: "checklist")
                     }
                     .buttonStyle(.borderless)
-                    Button(action: { model.importWallpapers() }) {
+                    Menu {
+                        Button("导入文件或文件夹") { model.importWallpapers() }
+                        Button("导入网址") { model.isWebURLImportPresented = true }
+                    } label: {
                         Label("添加壁纸", systemImage: "plus")
                     }
                     .buttonStyle(.borderedProminent)
@@ -1791,7 +1817,11 @@ private struct LibraryContentView: View {
             Divider()
 
             if model.filteredWallpapers.isEmpty {
-                EmptyLibraryView(hasItems: !model.wallpapers.isEmpty, importAction: { model.importWallpapers() })
+                EmptyLibraryView(
+                    hasItems: !model.wallpapers.isEmpty,
+                    importAction: { model.importWallpapers() },
+                    importURLAction: { model.isWebURLImportPresented = true }
+                )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if model.layout == .grid {
                 ScrollView {
@@ -2169,7 +2199,7 @@ private struct ThumbnailView: View {
                     .font(.system(size: 30, weight: .light))
                     .foregroundStyle(.secondary)
                 if item.type != .image {
-                    Text(item.type == .video ? "视频" : "HTML")
+                    Text(item.type == .video ? "视频" : (item.sourceURL.isFileURL ? "HTML" : "URL"))
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                         .padding(.top, 58)
@@ -2196,6 +2226,44 @@ private struct ThumbnailView: View {
 
     private var iconName: String {
         switch item.type { case .image: return "photo"; case .video: return "film"; case .web: return "safari" }
+    }
+}
+
+private struct WebWallpaperURLImportSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var address = ""
+    let onImport: (URL) -> Void
+
+    private var candidateURL: URL? {
+        guard let url = URL(string: address.trimmingCharacters(in: .whitespacesAndNewlines)),
+              WebWallpaperURL.isValid(url) else { return nil }
+        return url
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("添加网页壁纸")
+                .font(.title2.weight(.semibold))
+            TextField("https://example.com", text: $address)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("网页地址")
+            Text("支持 HTTP 和 HTTPS。网址以明文保存在壁纸库中，网页会运行网站脚本；请勿使用含敏感令牌的网址，只添加可信网站。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }
+                Button("添加") {
+                    guard let candidateURL else { return }
+                    onImport(candidateURL)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(candidateURL == nil)
+            }
+        }
+        .padding(24)
+        .frame(width: 460)
     }
 }
 
@@ -2350,6 +2418,7 @@ private struct ImportSheet: View {
 private struct EmptyLibraryView: View {
     let hasItems: Bool
     let importAction: () -> Void
+    let importURLAction: () -> Void
 
     var body: some View {
         VStack(spacing: 14) {
@@ -2363,7 +2432,12 @@ private struct EmptyLibraryView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
             if !hasItems {
-                Button("添加第一张壁纸", action: importAction)
+                Menu {
+                    Button("导入文件或文件夹", action: importAction)
+                    Button("导入网址", action: importURLAction)
+                } label: {
+                    Label("添加第一张壁纸", systemImage: "plus")
+                }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
             }
@@ -2485,18 +2559,44 @@ private struct InspectorView: View {
                         }
                         GroupBox("资源信息") {
                             VStack(alignment: .leading, spacing: 9) {
-                                InspectorRow(title: "存储模式", value: item.storageMode == .managedCopy ? "应用库副本" : "外部文件引用")
-                                InspectorRow(title: "状态", value: availabilityLabel(item.availability))
-                                InspectorRow(title: "文件格式", value: metadataValue(item.metadata?.fileExtension?.uppercased(), fallback: "正在读取…"))
-                                InspectorRow(title: "文件大小", value: fileSizeText(item.metadata?.fileSizeBytes))
+                                InspectorRow(
+                                    title: "存储模式",
+                                    value: item.sourceURL.isFileURL
+                                        ? (item.storageMode == .managedCopy ? "应用库副本" : "外部文件引用")
+                                        : "远程网址"
+                                )
+                                InspectorRow(
+                                    title: "状态",
+                                    value: !item.sourceURL.isFileURL && item.availability == .available
+                                        ? "网址已保存，联网时加载"
+                                        : availabilityLabel(item.availability)
+                                )
+                                InspectorRow(
+                                    title: "文件格式",
+                                    value: item.sourceURL.isFileURL
+                                        ? metadataValue(item.metadata?.fileExtension?.uppercased(), fallback: "正在读取…")
+                                        : "远程网页"
+                                )
+                                InspectorRow(
+                                    title: "文件大小",
+                                    value: item.sourceURL.isFileURL ? fileSizeText(item.metadata?.fileSizeBytes) : "不适用"
+                                )
                                 if item.type == .image || item.type == .video {
                                     InspectorRow(title: "分辨率", value: resolutionText(item.metadata))
                                 }
                                 if item.type == .video {
                                     InspectorRow(title: "时长", value: durationText(item.metadata?.durationSeconds))
                                 }
-                                InspectorRow(title: "路径", value: item.sourceURL.path)
-                                if let entryURL = item.entryURL { InspectorRow(title: "入口文件", value: entryURL.path) }
+                                InspectorRow(
+                                    title: item.sourceURL.isFileURL ? "路径" : "网址",
+                                    value: item.sourceURL.isFileURL ? item.sourceURL.path : item.sourceURL.absoluteString
+                                )
+                                if let entryURL = item.entryURL {
+                                    InspectorRow(
+                                        title: entryURL.isFileURL ? "入口文件" : "网页地址",
+                                        value: entryURL.isFileURL ? entryURL.path : entryURL.absoluteString
+                                    )
+                                }
                                 if item.availability != .available {
                                     Text(availabilityExplanation(item.availability))
                                         .font(.caption)

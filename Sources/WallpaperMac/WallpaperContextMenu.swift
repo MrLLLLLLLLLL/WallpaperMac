@@ -67,7 +67,7 @@ struct WallpaperContextMenu: View {
         }
 
         if !isBatch {
-            Button("在 Finder 中显示") { model.showInFinder(item) }
+            Button(item.sourceURL.isFileURL ? "在 Finder 中显示" : "在浏览器中打开") { model.showInFinder(item) }
         }
 
         if !queuesContainingSelection.isEmpty {

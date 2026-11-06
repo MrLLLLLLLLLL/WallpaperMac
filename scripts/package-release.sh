@@ -54,6 +54,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoadsInWebContent</key>
+        <true/>
+    </dict>
 </dict>
 </plist>
 PLIST

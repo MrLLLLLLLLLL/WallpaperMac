@@ -1200,7 +1200,7 @@ private final class WallpaperWindow: NSWindow {
     }
 }
 
-private final class WallpaperContentView: NSView, WKNavigationDelegate {
+private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDelegate {
     private let item: WallpaperItem
     /// The user's requested playback state. System suspension never changes this value.
     private var isPlaying: Bool
@@ -1215,6 +1215,7 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
     private var playerLayer: AVPlayerLayer?
     private var streamingController: WallpaperVideoStreamController?
     private var webView: WKWebView?
+    private var webErrorLabel: NSTextField?
     private var loopObserver: NSObjectProtocol?
     private var compatibilityTask: Task<Void, Never>?
     private var isTornDown = false
@@ -1297,6 +1298,8 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
         webView?.uiDelegate = nil
         webView?.removeFromSuperview()
         webView = nil
+        webErrorLabel?.removeFromSuperview()
+        webErrorLabel = nil
     }
 
     deinit {
@@ -1355,6 +1358,12 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
         playerLayer?.frame = bounds
         streamingController?.setFrame(bounds)
         webView?.frame = bounds
+        webErrorLabel?.frame = NSRect(
+            x: bounds.minX + 24,
+            y: bounds.midY - 28,
+            width: max(0, bounds.width - 48),
+            height: 56
+        )
     }
 
     func togglePlayback() {
@@ -1471,12 +1480,30 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
             webView.autoresizingMask = [.width, .height]
             webView.allowsBackForwardNavigationGestures = false
             webView.navigationDelegate = self
+            webView.uiDelegate = self
             webView.setValue(false, forKey: "drawsBackground")
             let entryURL = item.entryURL ?? item.sourceURL
-            let readRoot = item.sourceURL.isExistingDirectory ? item.sourceURL : item.sourceURL.deletingLastPathComponent()
-            webView.loadFileURL(entryURL, allowingReadAccessTo: readRoot)
+            if entryURL.isFileURL {
+                let readRoot = item.sourceURL.isExistingDirectory
+                    ? item.sourceURL
+                    : item.sourceURL.deletingLastPathComponent()
+                webView.loadFileURL(entryURL, allowingReadAccessTo: readRoot)
+            } else if WebWallpaperURL.isValid(entryURL) {
+                webView.load(URLRequest(url: entryURL))
+            } else {
+                throw WallpaperContentError.cannotLoadResource(entryURL)
+            }
             addSubview(webView)
             self.webView = webView
+            let errorLabel = NSTextField(wrappingLabelWithString: "网页加载失败，请检查网络后重新加载。")
+            errorLabel.alignment = .center
+            errorLabel.textColor = .white
+            errorLabel.backgroundColor = NSColor.black.withAlphaComponent(0.72)
+            errorLabel.drawsBackground = true
+            errorLabel.isBezeled = false
+            errorLabel.isHidden = true
+            addSubview(errorLabel)
+            self.webErrorLabel = errorLabel
         }
     }
 
@@ -1587,10 +1614,57 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        webErrorLabel?.isHidden = true
         setMuted(isMuted)
         if isPlaying && !isSystemSuspended {
             evaluateMediaScript("play")
         }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        if item.sourceURL.isFileURL {
+            decisionHandler(.allow)
+            return
+        }
+        guard let url = navigationAction.request.url,
+              WebWallpaperURL.isValid(url) else {
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        guard navigationAction.navigationType == .linkActivated,
+              let url = navigationAction.request.url,
+              WebWallpaperURL.isValid(url) else {
+            return nil
+        }
+        NSWorkspace.shared.open(url)
+        return nil
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard (error as NSError).code != NSURLErrorCancelled else { return }
+        webErrorLabel?.isHidden = false
+        NSLog("WallpaperMac web wallpaper failed to load: \(error.localizedDescription)")
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        self.webView(webView, didFail: navigation, withError: error)
     }
 
 
@@ -1602,7 +1676,7 @@ private enum WallpaperContentError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .cannotLoadResource(let url):
-            return "无法加载壁纸资源：\(url.path)"
+            return "无法加载壁纸资源：\(url.isFileURL ? url.path : url.absoluteString)"
         }
     }
 }

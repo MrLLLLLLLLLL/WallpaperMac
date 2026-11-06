@@ -58,6 +58,11 @@ if /usr/bin/otool -L "$APP/Contents/Resources/ffmpeg" | /usr/bin/grep -E '/opt/h
     exit 1
 fi
 /usr/bin/plutil -lint "$APP/Contents/Info.plist"
+WEB_CONTENT_TRANSPORT_POLICY="$(/usr/bin/plutil -extract NSAppTransportSecurity.NSAllowsArbitraryLoadsInWebContent raw -o - "$APP/Contents/Info.plist")"
+[[ "$WEB_CONTENT_TRANSPORT_POLICY" == "true" ]] || {
+    print -u2 "Web content transport policy is missing; HTTP web wallpapers will not load."
+    exit 1
+}
 SHORT_VERSION="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist")"
 BUNDLE_VERSION="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$APP/Contents/Info.plist")"
 [[ "$SHORT_VERSION" == "$VERSION" ]] || { print -u2 "CFBundleShortVersionString mismatch: $SHORT_VERSION != $VERSION"; exit 1; }

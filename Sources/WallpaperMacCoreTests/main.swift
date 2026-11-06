@@ -100,6 +100,47 @@ func testDetectsWallpaperTypes() throws {
     try expect(WallpaperType.detect(from: URL(fileURLWithPath: "/tmp/site/index.html")), equals: .web, "detects web")
 }
 
+func testRemoteWebWallpaperImportPersistsWithoutNetworkAccess() throws {
+    let fixture = try Fixture()
+    let url = URL(string: "https://example.com/wallpaper?scene=night#top")!
+    let httpURL = URL(string: "http://example.com/wallpaper")!
+    try expect(WebWallpaperURL.isValid(url), "HTTPS website URLs should be accepted")
+    try expect(WebWallpaperURL.isValid(httpURL), "HTTP website URLs should be accepted")
+    let item = try fixture.store.importWebURL(url)
+
+    try expect(item.type, equals: .web, "URL import should create a web wallpaper")
+    try expect(item.sourceURL, equals: url, "the exact URL should be preserved")
+    try expect(item.storageMode, equals: .externalReference, "a remote URL should never be copied as a file")
+    let managedAssets = try FileManager.default.contentsOfDirectory(
+        at: fixture.library.appendingPathComponent("Assets", isDirectory: true),
+        includingPropertiesForKeys: nil,
+        options: []
+    )
+    try expect(managedAssets.isEmpty, "URL import should not create managed site assets")
+
+    let refreshed = try fixture.store.refreshAvailability(for: item)
+    try expect(refreshed.availability, equals: .available, "network availability must not control library persistence")
+    let persistedItems = try fixture.store.items()
+    try expect(persistedItems.count, equals: 1, "the remote item should survive a library refresh")
+
+    _ = try fixture.store.remove(item: refreshed)
+    let remainingItems = try fixture.store.items()
+    try expect(remainingItems.isEmpty, "removing the URL should remove its record")
+
+    let invalidURLs = [
+        URL(string: "file:///tmp/index.html")!,
+        URL(string: "javascript:alert(1)")!,
+        URL(string: "https://user:password@example.com")!
+    ]
+    for invalidURL in invalidURLs {
+        try expect(!WebWallpaperURL.isValid(invalidURL), "non-web or credential URLs should be rejected")
+        do {
+            _ = try fixture.store.importWebURL(invalidURL)
+            throw TestFailure(message: "invalid remote URL should not be imported")
+        } catch WallpaperStoreError.invalidWebURL { }
+    }
+}
+
 func mp4Box(_ type: String, payload: Data) -> Data {
     precondition(type.utf8.count == 4)
     var data = Data()
@@ -662,6 +703,7 @@ let tests: [(String, () throws -> Void)] = [
     ("legacy wallpaper JSON without metadata decodes", testLegacyWallpaperJSONWithoutMetadataDecodes),
     ("bulk metadata save preserves wallpaper state", testBulkMetadataSavePreservesWallpaperState),
     ("detects wallpaper types", testDetectsWallpaperTypes),
+    ("imports remote web wallpapers without network checks", testRemoteWebWallpaperImportPersistsWithoutNetworkAccess),
     ("managed import copies file", testManagedImportCopiesFile),
     ("normalizes HEVC sample entries for playback", testVideoContainerCompatibilityNormalizesRealHev1Entries),
     ("external import keeps reference", testExternalImportKeepsReference),
