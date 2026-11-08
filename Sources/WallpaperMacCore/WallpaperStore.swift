@@ -7,6 +7,7 @@ public enum WallpaperStoreError: Error, LocalizedError, Equatable {
     case permissionDenied(URL)
     case invalidHTMLEntry(URL)
     case invalidWebURL
+    case queuePersistenceBlocked(String)
 
     public var errorDescription: String? {
         switch self {
@@ -22,8 +23,33 @@ public enum WallpaperStoreError: Error, LocalizedError, Equatable {
             return "网页入口文件无效：\(url.path)"
         case .invalidWebURL:
             return "请输入有效的 HTTP 或 HTTPS 网址，且不要包含账号密码。"
+        case .queuePersistenceBlocked(let reason):
+            return "播放队列文件读取失败，已暂停写入以避免覆盖原文件：\(reason)"
         }
     }
+}
+
+public enum PlaybackQueueFileState: Equatable, Sendable {
+    case missing
+    case loaded
+    case failed(String)
+}
+
+public struct PlaybackQueueLoadResult: Equatable, Sendable {
+    public let queues: [PlaybackQueue]
+    public let bindings: [DisplayPlaybackBinding]
+    public let queuesFile: PlaybackQueueFileState
+    public let bindingsFile: PlaybackQueueFileState
+
+    public var loadError: String? {
+        if case .failed(let message) = queuesFile { return message }
+        if case .failed(let message) = bindingsFile { return message }
+        return nil
+    }
+
+    /// A read/decode failure means the in-memory fallback must never be
+    /// written back over the user's original files.
+    public var blocksPersistence: Bool { loadError != nil }
 }
 
 public final class WallpaperStore {
@@ -31,6 +57,7 @@ public final class WallpaperStore {
     private let fileManager: FileManager
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
+    private var queuePersistenceGate = LibraryPersistenceGate()
 
     private var metadataURL: URL {
         libraryURL.appendingPathComponent("wallpapers.json")
@@ -116,6 +143,7 @@ public final class WallpaperStore {
     }
 
     public func save(playbackQueues: [PlaybackQueue]) throws {
+        try ensureQueuePersistenceAllowed()
         try ensureLibraryDirectories()
         let normalized = normalizedQueues(playbackQueues)
         let data = try encoder.encode(normalized)
@@ -131,9 +159,72 @@ public final class WallpaperStore {
     }
 
     public func save(displayPlaybackBindings: [DisplayPlaybackBinding]) throws {
+        try ensureQueuePersistenceAllowed()
         try ensureLibraryDirectories()
         let data = try encoder.encode(displayPlaybackBindings)
         try data.write(to: displayPlaybackBindingsURL, options: .atomic)
+    }
+
+    public var isPlaybackQueuePersistenceBlocked: Bool {
+        queuePersistenceGate.blocksPersistence
+    }
+
+    public var playbackQueuePersistenceError: String? {
+        queuePersistenceGate.loadError
+    }
+
+    /// Loads both queue files as one recovery point and records whether a
+    /// failed read must block all future writes. A missing file is a normal
+    /// first-run state and stays writable; only a present-but-unreadable file
+    /// blocks persistence.
+    public func loadPlaybackQueueConfiguration() -> PlaybackQueueLoadResult {
+        let queuesExisted = fileManager.fileExists(atPath: playbackQueuesURL.path)
+        var queues: [PlaybackQueue] = [.defaultQueue]
+        var queuesFile: PlaybackQueueFileState = .missing
+        do {
+            queues = try playbackQueues()
+            queuesFile = queuesExisted ? .loaded : .missing
+        } catch {
+            queuesFile = .failed("无法读取播放队列：\(error.localizedDescription)")
+        }
+
+        let bindingsExisted = fileManager.fileExists(atPath: displayPlaybackBindingsURL.path)
+        var bindings: [DisplayPlaybackBinding] = []
+        var bindingsFile: PlaybackQueueFileState = .missing
+        do {
+            bindings = try displayPlaybackBindings()
+            bindingsFile = bindingsExisted ? .loaded : .missing
+        } catch {
+            bindingsFile = .failed("无法读取显示器队列绑定：\(error.localizedDescription)")
+        }
+
+        let result = PlaybackQueueLoadResult(
+            queues: queues,
+            bindings: bindings,
+            queuesFile: queuesFile,
+            bindingsFile: bindingsFile
+        )
+        if let error = result.loadError {
+            queuePersistenceGate.recordLoadFailure(error)
+        } else {
+            queuePersistenceGate.recordSuccessfulLoad()
+        }
+        return result
+    }
+
+    public func save(
+        playbackQueues: [PlaybackQueue],
+        displayPlaybackBindings: [DisplayPlaybackBinding]
+    ) throws {
+        try ensureQueuePersistenceAllowed()
+        try save(playbackQueues: playbackQueues)
+        try save(displayPlaybackBindings: displayPlaybackBindings)
+    }
+
+    private func ensureQueuePersistenceAllowed() throws {
+        if let error = queuePersistenceGate.loadError {
+            throw WallpaperStoreError.queuePersistenceBlocked(error)
+        }
     }
 
     private func normalizedQueues(_ queues: [PlaybackQueue]) -> [PlaybackQueue] {
@@ -187,16 +278,7 @@ public final class WallpaperStore {
             return
         }
 
-        // Users who migrated with an older build kept display-queues.json and
-        // never wrote a marker — and may have edited queues/bindings since.
-        // The validated modern pair is authoritative; only regenerate when it
-        // is missing or fails cross-checks (an interrupted newer migration).
-        if validatesModernQueueFiles() {
-            try commitMigration(removingLegacy: true)
-            return
-        }
-
-        let legacyQueues: [DisplayPlaybackQueue]
+        let legacyQueues: [DisplayPlaybackQueue]?
         do {
             let data = try Data(contentsOf: displayQueuesURL)
             legacyQueues = try decoder.decode([DisplayPlaybackQueue].self, from: data)
@@ -204,8 +286,22 @@ public final class WallpaperStore {
             // Corrupt or unreadable legacy must not fail queue loading. Skip
             // migration and leave whatever modern files exist in place.
             NSLog("WallpaperMac: skipping legacy queue migration: \(error.localizedDescription)")
+            legacyQueues = nil
+        }
+
+        // Users who migrated with an older build kept display-queues.json and
+        // never wrote a marker — and may have edited queues/bindings since.
+        // The validated modern pair is authoritative; only regenerate when it
+        // is missing or fails cross-checks (an interrupted newer migration).
+        // A non-empty legacy file paired with empty modern bindings is an
+        // incomplete migration, not an authoritative modern state: retiring it
+        // would silently drop every display's active queue and progress.
+        if validatesModernQueueFiles(requiringBindingsFor: legacyQueues) {
+            try commitMigration(removingLegacy: true)
             return
         }
+
+        guard let legacyQueues else { return }
 
         var queues: [PlaybackQueue] = [.defaultQueue]
         var bindings: [DisplayPlaybackBinding] = []
@@ -284,7 +380,14 @@ public final class WallpaperStore {
     }
 
     /// True when both modern files decode and cross-reference cleanly.
-    private func validatesModernQueueFiles() -> Bool {
+    ///
+    /// When a non-empty legacy queue file is still present, an empty modern
+    /// bindings file cannot represent a completed migration: the legacy file
+    /// is the only remaining source of per-display queue state. Treat that
+    /// combination as incomplete so it is regenerated instead of retired.
+    private func validatesModernQueueFiles(
+        requiringBindingsFor legacyQueues: [DisplayPlaybackQueue]? = nil
+    ) -> Bool {
         guard fileManager.fileExists(atPath: playbackQueuesURL.path),
               fileManager.fileExists(atPath: displayPlaybackBindingsURL.path) else {
             return false
@@ -293,6 +396,9 @@ public final class WallpaperStore {
               let queues = try? decoder.decode([PlaybackQueue].self, from: queueData),
               let bindingData = try? Data(contentsOf: displayPlaybackBindingsURL),
               let bindings = try? decoder.decode([DisplayPlaybackBinding].self, from: bindingData) else {
+            return false
+        }
+        if let legacyQueues, !legacyQueues.isEmpty, bindings.isEmpty {
             return false
         }
         let queueIDs = Set(queues.map(\.id))
@@ -387,9 +493,9 @@ public final class WallpaperStore {
         try ensureLibraryDirectories()
         let id = UUID()
         let sourceIsDirectory = (try? sourceURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-        let managedCopySourceURL = type == .web && !sourceIsDirectory
-            ? sourceURL.deletingLastPathComponent()
-            : sourceURL
+        // A single HTML file is not a project directory. Never copy or grant
+        // its parent implicitly; relative resources require an explicit folder.
+        let managedCopySourceURL = sourceURL
         let storedURL: URL
 
         switch storageMode {
@@ -403,6 +509,7 @@ public final class WallpaperStore {
         }
 
         var playbackURL: URL?
+        var relativeEntryPath: String?
         do {
             let resolvedEntryURL: URL?
             if type == .web {
@@ -413,9 +520,18 @@ public final class WallpaperStore {
                     throw WallpaperStoreError.invalidHTMLEntry(sourceURL)
                 }
                 let relativePath = relativePath(of: selectedEntry, to: entryValidationRoot)
-                let candidateURL = storageMode == .managedCopy
-                    ? storedURL.appendingPathComponent(relativePath)
-                    : selectedEntry
+                let isProjectDirectory = storageMode == .managedCopy
+                    ? managedCopySourceURL.isExistingDirectory
+                    : sourceIsDirectory
+                relativeEntryPath = isProjectDirectory && !relativePath.isEmpty ? relativePath : nil
+                let candidateURL: URL
+                if storageMode == .managedCopy {
+                    candidateURL = managedCopySourceURL.isExistingDirectory
+                        ? storedURL.appendingPathComponent(relativePath)
+                        : storedURL
+                } else {
+                    candidateURL = selectedEntry
+                }
                 guard fileManager.fileExists(atPath: candidateURL.path),
                       fileManager.isReadableFile(atPath: candidateURL.path) else {
                     throw WallpaperStoreError.invalidHTMLEntry(selectedEntry)
@@ -439,6 +555,7 @@ public final class WallpaperStore {
                 sourceURL: storedURL,
                 playbackURL: playbackURL,
                 entryURL: resolvedEntryURL,
+                relativeEntryPath: relativeEntryPath,
                 storageMode: storageMode
             )
             var currentItems = try items()
@@ -463,6 +580,37 @@ public final class WallpaperStore {
         currentItems[index] = item
         try save(currentItems)
         return item
+    }
+
+    /// Changes only the fit override so a concurrent metadata enrichment or
+    /// last-used update cannot be clobbered by a stale whole-item snapshot.
+    @discardableResult
+    public func updateFitModeOverride(
+        id: UUID,
+        mode: WallpaperFitMode?
+    ) throws -> WallpaperItem {
+        var currentItems = try items()
+        guard let index = currentItems.firstIndex(where: { $0.id == id }) else {
+            throw WallpaperStoreError.itemNotFound(id)
+        }
+        guard currentItems[index].fitModeOverride != mode else {
+            return currentItems[index]
+        }
+        currentItems[index].fitModeOverride = mode
+        try save(currentItems)
+        return currentItems[index]
+    }
+
+    /// Field-level last-used update; never writes a stale whole-item snapshot.
+    @discardableResult
+    public func touchLastUsed(id: UUID, date: Date = Date()) throws -> WallpaperItem {
+        var currentItems = try items()
+        guard let index = currentItems.firstIndex(where: { $0.id == id }) else {
+            throw WallpaperStoreError.itemNotFound(id)
+        }
+        currentItems[index].lastUsedAt = date
+        try save(currentItems)
+        return currentItems[index]
     }
 
     /// Patches only enrichment fields for several items in one read-modify-write.
@@ -550,11 +698,16 @@ public final class WallpaperStore {
             throw WallpaperStoreError.permissionDenied(item.sourceURL)
         }
 
-        let originalSourceURL = item.sourceURL
-        let isOriginalDirectory = (try? originalSourceURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
         let relativeEntryPath: String? = {
-            guard item.type == .web, let entryURL = item.entryURL, isOriginalDirectory else { return nil }
-            return relativePath(of: entryURL, to: originalSourceURL)
+            guard item.type == .web else { return nil }
+            if let stored = item.relativeEntryPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !stored.isEmpty {
+                return stored
+            }
+            // Legacy records predate `relativeEntryPath`: derive it from the
+            // old URLs by string comparison. The original directory may
+            // already be gone, so do not consult the file system here.
+            return storedRelativeEntryPath(for: item)
         }()
 
         var updated = item
@@ -590,12 +743,20 @@ public final class WallpaperStore {
             if item.type == .web {
                 let baseURL = item.storageMode == .managedCopy ? item.sourceURL : replacementURL
                 if let relativeEntryPath, !relativeEntryPath.isEmpty {
-                    updated.entryURL = baseURL.appendingPathComponent(relativeEntryPath)
+                    let candidateURL = baseURL.appendingPathComponent(relativeEntryPath)
+                    // Never silently switch to index.html: if the replacement
+                    // lacks the user's original entry, report it and let the
+                    // caller re-select instead of persisting a different page.
+                    guard isValidWebEntry(candidateURL, for: baseURL) else {
+                        throw WallpaperStoreError.invalidHTMLEntry(candidateURL)
+                    }
+                    updated.entryURL = candidateURL
                 } else if baseURL.isExistingDirectory {
                     updated.entryURL = webEntryURL(for: baseURL)
                 } else {
                     updated.entryURL = baseURL
                 }
+                updated.relativeEntryPath = relativeEntryPath
                 guard let entryURL = updated.entryURL,
                       isValidWebEntry(entryURL, for: baseURL) else {
                     throw WallpaperStoreError.invalidHTMLEntry(baseURL)
@@ -881,5 +1042,18 @@ public final class WallpaperStore {
             return entryURL.lastPathComponent
         }
         return String(entry.dropFirst(base.count + (entry == base ? 0 : 1)))
+    }
+
+    /// Derives a project-relative entry path from already-persisted URLs.
+    /// Uses string paths only so it works after the original directory is gone.
+    private func storedRelativeEntryPath(for item: WallpaperItem) -> String? {
+        guard item.type == .web, let entryURL = item.entryURL else { return nil }
+        let base = item.sourceURL.standardizedFileURL.path
+        let entry = entryURL.standardizedFileURL.path
+        guard entry != base else { return nil }
+        let basePrefix = base.hasSuffix("/") ? base : base + "/"
+        guard entry.hasPrefix(basePrefix) else { return nil }
+        let relative = String(entry.dropFirst(basePrefix.count))
+        return relative.isEmpty ? nil : relative
     }
 }

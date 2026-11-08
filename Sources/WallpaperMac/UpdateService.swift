@@ -114,12 +114,16 @@ final class UpdateService: ObservableObject {
         let stagingDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("WallpaperMacUpdate", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        Self.pruneStaleStagingDirectories()
 
         task = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             do {
                 try UpdateInstaller.preflight()
+                // Hold the target lock across download, prepare and the
+                // detached helper handoff. Another app instance must not
+                // prune or replace the same target concurrently.
+                let installLock = try UpdateInstallLock(targetAppURL: Bundle.main.bundleURL)
+                Self.pruneStaleStagingDirectories()
 
                 let downloader = UpdateDownloader()
                 let outcome = try await downloader.downloadAndVerify(
@@ -144,7 +148,7 @@ final class UpdateService: ObservableObject {
                 await MainActor.run {
                     self.phase = .installing(update)
                 }
-                try UpdateInstaller.launchDetachedInstall(of: prepared)
+                try UpdateInstaller.launchDetachedInstall(of: prepared, installLock: installLock)
                 await MainActor.run {
                     NSApp.terminate(nil)
                 }
@@ -203,7 +207,7 @@ final class UpdateService: ObservableObject {
 
     /// Clears abandoned staging directories from crashed installers. Skips
     /// anything modified recently so an in-flight install is never deleted.
-    private static func pruneStaleStagingDirectories() {
+    private nonisolated static func pruneStaleStagingDirectories() {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("WallpaperMacUpdate", isDirectory: true)
         guard let entries = try? FileManager.default.contentsOfDirectory(

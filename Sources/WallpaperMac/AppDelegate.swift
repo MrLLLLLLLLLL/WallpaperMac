@@ -1,4 +1,5 @@
 import AppKit
+import WallpaperMacCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -19,6 +20,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Daily update check runs at launch, independent of the settings UI.
         if UserDefaults.standard.object(forKey: SettingsKey.autoCheckUpdates) as? Bool ?? true {
             UpdateService.shared.runDailyCheckIfNeeded()
+        }
+
+        do {
+            _ = try UpdateHealthHandshake.acknowledge(arguments: CommandLine.arguments)
+        } catch {
+            NSLog("WallpaperMac update health acknowledgement failed: \(error.localizedDescription)")
         }
     }
 

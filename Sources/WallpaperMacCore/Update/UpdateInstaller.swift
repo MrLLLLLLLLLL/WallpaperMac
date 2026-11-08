@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 public enum UpdateInstallError: Error, Equatable, Sendable, LocalizedError {
     case notAnApplicationBundle
@@ -49,9 +50,10 @@ public struct PreparedUpdateInstall: Equatable, Sendable {
 
 /// Preflight checks, zip extraction, and the detached swap/relaunch handoff.
 ///
-/// The running process never deletes its own bundle. A short shell script
-/// waits for this PID to exit, moves the previous app aside, copies the new
-/// bundle in place, clears quarantine, and relaunches.
+/// The running process never deletes its own bundle. A detached shell script
+/// waits for this PID to exit, builds and verifies a complete sibling, then
+/// uses RENAME_SWAP to exchange old/new bundles without a target-path gap.
+/// A failed relaunch swaps the previous generation back into place.
 public enum UpdateInstaller {
     /// Everything needed before any bytes are written to the install location.
     public static func preflight(
@@ -121,6 +123,7 @@ public enum UpdateInstaller {
     public static func launchDetachedInstall(
         of prepared: PreparedUpdateInstall,
         currentProcessID: Int32 = ProcessInfo.processInfo.processIdentifier,
+        installLock: UpdateInstallLock? = nil,
         fileManager: FileManager = .default
     ) throws {
         let scriptURL = prepared.stagingDirectory.appendingPathComponent("install.sh")
@@ -128,7 +131,10 @@ public enum UpdateInstaller {
             parentPID: currentProcessID,
             sourceAppPath: prepared.appBundleURL.path,
             targetAppPath: prepared.targetAppURL.path,
-            stagingPath: prepared.stagingDirectory.path
+            stagingPath: prepared.stagingDirectory.path,
+            expectedVersion: prepared.version,
+            lockPath: installLock?.lockURL.path,
+            lockToken: installLock?.ownerToken
         )
         do {
             try script.write(to: scriptURL, atomically: true, encoding: .utf8)
@@ -143,6 +149,9 @@ public enum UpdateInstaller {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = [scriptURL.path]
+        if let installLock {
+            process.standardInput = installLock.fileHandle
+        }
         // Detach from us entirely: no pipes, no inherited console coupling.
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -153,7 +162,54 @@ public enum UpdateInstaller {
         }
     }
 
+    /// Verifies that the inherited descriptor is the same lock inode and that
+    /// its current owner token matches this transaction. Runs in the existing
+    /// Swift helper so installation does not depend on Python or another tool.
+    public static func verifyInheritedLock(
+        lockURL: URL,
+        expectedToken: String
+    ) throws {
+        var inherited = stat()
+        var lockFile = stat()
+        guard fstat(0, &inherited) == 0,
+              stat(lockURL.path, &lockFile) == 0,
+              inherited.st_dev == lockFile.st_dev,
+              inherited.st_ino == lockFile.st_ino else {
+            throw UpdateInstallError.scriptFailed("更新锁描述符不匹配")
+        }
+        guard let data = FileManager.default.contents(atPath: lockURL.path),
+              let text = String(data: data, encoding: .utf8),
+              text.split(whereSeparator: \.isNewline).first.map(String.init) == expectedToken else {
+            throw UpdateInstallError.scriptFailed("更新锁所有者不匹配")
+        }
+    }
+
     // MARK: - Script
+
+    /// Atomically exchanges two complete app bundles on the same filesystem.
+    /// Unlike two sequential `mv` calls, RENAME_SWAP never leaves the standard
+    /// application path missing between the old and new generations.
+    public static func atomicSwap(
+        pendingAppURL: URL,
+        targetAppURL: URL,
+        fileManager: FileManager = .default
+    ) throws {
+        guard pendingAppURL.pathExtension == "app",
+              targetAppURL.pathExtension == "app",
+              pendingAppURL.deletingLastPathComponent().standardizedFileURL
+                == targetAppURL.deletingLastPathComponent().standardizedFileURL else {
+            throw UpdateInstallError.scriptFailed("更新交换要求同目录的两个 .app Bundle")
+        }
+        guard fileManager.fileExists(atPath: pendingAppURL.path),
+              fileManager.fileExists(atPath: targetAppURL.path) else {
+            throw UpdateInstallError.scriptFailed("交换前后的 App 必须同时存在")
+        }
+        if renamex_np(pendingAppURL.path, targetAppURL.path, UInt32(RENAME_SWAP)) != 0 {
+            throw UpdateInstallError.scriptFailed(
+                "原子交换失败：\(String(cString: strerror(errno)))"
+            )
+        }
+    }
 
     /// Generated installer. Kept as plain shell so it survives the app going
     /// away mid-update and can be inspected in the staging directory.
@@ -161,7 +217,10 @@ public enum UpdateInstaller {
         parentPID: Int32,
         sourceAppPath: String,
         targetAppPath: String,
-        stagingPath: String
+        stagingPath: String,
+        expectedVersion: String? = nil,
+        lockPath: String? = nil,
+        lockToken: String? = nil
     ) -> String {
         """
         #!/bin/zsh
@@ -171,7 +230,57 @@ public enum UpdateInstaller {
         SOURCE_APP=\(shellQuote(sourceAppPath))
         TARGET_APP=\(shellQuote(targetAppPath))
         STAGING_DIR=\(shellQuote(stagingPath))
+        EXPECTED_VERSION=\(shellQuote(expectedVersion ?? ""))
+        DITTO="${WALLPAPERMAC_DITTO:-/usr/bin/ditto}"
+        OPEN="${WALLPAPERMAC_OPEN:-/usr/bin/open}"
+        XATTR="${WALLPAPERMAC_XATTR:-/usr/bin/xattr}"
+        CODESIGN="${WALLPAPERMAC_CODESIGN:-/usr/bin/codesign}"
+        LOCK_PATH=\(shellQuote(lockPath ?? ""))
+        LOCK_TOKEN=\(shellQuote(lockToken ?? ""))
+        SWAPPER="${WALLPAPERMAC_UPDATE_SWAPPER:-$TARGET_APP/Contents/MacOS/WallpaperMac}"
         TARGET_PREVIOUS="${TARGET_APP}.previous"
+        TARGET_PENDING="${TARGET_APP}.installing.$$"
+        BACKUP_APP="$TARGET_PENDING"
+        SWAPPED=0
+        SWAP_STARTED=0
+
+        restore_previous() {
+            if (( SWAPPED == 1 )) && [[ -d "$BACKUP_APP" ]]; then
+                ROLLBACK_SWAPPER="${WALLPAPERMAC_UPDATE_SWAPPER:-$BACKUP_APP/Contents/MacOS/WallpaperMac}"
+                if ! "$ROLLBACK_SWAPPER" --update-swap "$BACKUP_APP" "$TARGET_APP"; then
+                    echo "rollback swap failed; preserving the backup for manual recovery" >&2
+                    return 1
+                fi
+                "$OPEN" "$TARGET_APP" || true
+                SWAPPED=0
+            fi
+        }
+        finish() {
+            STATUS=$?
+            set +e
+            if (( STATUS != 0 )); then
+                restore_previous
+            fi
+            # A failed rollback may still have its only complete old app in
+            # pending. Never delete that backup in the EXIT cleanup.
+            if (( SWAPPED == 0 && SWAP_STARTED == 0 )); then
+                rm -rf "$TARGET_PENDING"
+            fi
+            exit $STATUS
+        }
+        trap finish EXIT
+        trap 'exit 1' INT TERM HUP
+        fail() {
+            echo "$1" >&2
+            exit 1
+        }
+        verify_lock() {
+            if [[ -n "$LOCK_PATH" ]]; then
+                [[ -f "$LOCK_PATH" ]] || fail "update lock is missing"
+                "$SWAPPER" --update-lock-check "$LOCK_PATH" "$LOCK_TOKEN" || fail "update lock verification failed"
+                [[ "$(head -n 1 "$LOCK_PATH")" == "$LOCK_TOKEN" ]] || fail "update lock ownership mismatch"
+            fi
+        }
 
         # Wait for the running app to exit before touching its bundle.
         # Bounded so PID reuse cannot strand the installer forever.
@@ -189,39 +298,78 @@ public enum UpdateInstaller {
             fi
         done
 
-        # Keep the outgoing build around long enough to restore it if the
-        # replacement fails to launch.
-        rm -rf "$TARGET_PREVIOUS"
-        if [[ -d "$TARGET_APP" ]]; then
-            mv "$TARGET_APP" "$TARGET_PREVIOUS"
+        # Build the complete replacement beside the target while the known-good
+        # app remains in place. A partial copy never becomes the target.
+        verify_lock
+        rm -rf "$TARGET_PENDING"
+        if ! "$DITTO" "$SOURCE_APP" "$TARGET_PENDING"; then
+            fail "unable to copy the replacement app"
         fi
+        PENDING_PLIST="$TARGET_PENDING/Contents/Info.plist"
+        [[ -f "$PENDING_PLIST" ]] || fail "replacement Info.plist is missing"
+        /usr/bin/plutil -lint "$PENDING_PLIST" >/dev/null || fail "replacement Info.plist is invalid"
+        if [[ -n "$EXPECTED_VERSION" ]]; then
+            ACTUAL_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PENDING_PLIST" 2>/dev/null || true)"
+            [[ "$ACTUAL_VERSION" == "$EXPECTED_VERSION" ]] || fail "replacement version mismatch: $ACTUAL_VERSION"
+        fi
+        EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PENDING_PLIST" 2>/dev/null || true)"
+        [[ -n "$EXECUTABLE_NAME" && -x "$TARGET_PENDING/Contents/MacOS/$EXECUTABLE_NAME" ]] || fail "replacement executable is missing"
+        "$CODESIGN" --verify --deep --strict "$TARGET_PENDING" || fail "replacement signature verification failed"
+        [[ -x "$SWAPPER" ]] || fail "update swap helper is unavailable"
 
-        if ! /usr/bin/ditto "$SOURCE_APP" "$TARGET_APP"; then
-            if [[ -d "$TARGET_PREVIOUS" ]]; then
-                mv "$TARGET_PREVIOUS" "$TARGET_APP"
-            fi
-            exit 1
+        # RENAME_SWAP exchanges the complete old and new apps atomically. The
+        # standard target path never disappears, even if the machine loses power.
+        verify_lock
+        rm -rf "$TARGET_PREVIOUS"
+        SWAP_STARTED=1
+        if ! "$SWAPPER" --update-swap "$TARGET_PENDING" "$TARGET_APP"; then
+            fail "atomic replacement failed"
+        fi
+        SWAPPED=1
+        BACKUP_APP="$TARGET_PENDING"
+        if mv "$TARGET_PENDING" "$TARGET_PREVIOUS"; then
+            BACKUP_APP="$TARGET_PREVIOUS"
         fi
 
         # In-app downloads are not quarantined; clear anyway so a restored
         # bundle never trips Gatekeeper after a partial transfer.
-        /usr/bin/xattr -cr "$TARGET_APP" 2>/dev/null || true
+        "$XATTR" -cr "$TARGET_APP" 2>/dev/null || true
 
-        if /usr/bin/open "$TARGET_APP"; then
-            # Clean staging after a successful swap; keep it on failure paths.
-            rm -rf "$STAGING_DIR"
-            # Leave .previous behind for one generation as a manual rollback
-            # handle; the next successful install removes it.
-            exit 0
+        HEALTH_TOKEN="$(/usr/bin/uuidgen)"
+        HEALTH_ACK="$STAGING_DIR/update-health-$HEALTH_TOKEN"
+        HEALTH_WAIT_STEPS="${WALLPAPERMAC_HEALTH_WAIT_STEPS:-50}"
+        if "$OPEN" -n "$TARGET_APP" --args \
+            --update-health-token "$HEALTH_TOKEN" \
+            --update-health-file "$HEALTH_ACK"; then
+            HEALTHY=0
+            for (( HEALTH_STEP=0; HEALTH_STEP < HEALTH_WAIT_STEPS; HEALTH_STEP++ )); do
+                if [[ -f "$HEALTH_ACK" ]] \
+                    && /usr/bin/grep -q "^token=$HEALTH_TOKEN$" "$HEALTH_ACK" \
+                    && /usr/bin/grep -Eq '^pid=[0-9]+$' "$HEALTH_ACK"; then
+                    if [[ -z "$EXPECTED_VERSION" ]] || /usr/bin/grep -q "^version=$EXPECTED_VERSION$" "$HEALTH_ACK"; then
+                        HEALTHY=1
+                        break
+                    fi
+                fi
+                sleep 0.2
+            done
+            if (( HEALTHY == 1 )); then
+                # Clean staging only after the new instance has completed its
+                # critical initialization and acknowledged this exact install.
+                rm -rf "$STAGING_DIR" || true
+                exit 0
+            fi
+            # Do not kill an unrelated existing instance. Only a process still
+            # carrying this install's token is a failed new launch.
+            # Match the executable path and token as literal strings. Paths
+            # containing regex characters must still be cleaned up correctly.
+            TARGET_APP_FOR_CLEANUP="$TARGET_APP/Contents/MacOS/WallpaperMac"
+            export TARGET_APP_FOR_CLEANUP HEALTH_TOKEN
+            NEW_PID="$(ps -axo pid,command | /usr/bin/awk 'index($0, ENVIRON["TARGET_APP_FOR_CLEANUP"]) && index($0, ENVIRON["HEALTH_TOKEN"]) { print $1; exit }' | head -1 || true)"
+            [[ -z "$NEW_PID" ]] || kill "$NEW_PID" 2>/dev/null || true
+            fail "replacement did not become healthy"
         fi
-
-        # Relaunch failed: restore the previous build and surface the failure.
-        rm -rf "$TARGET_APP"
-        if [[ -d "$TARGET_PREVIOUS" ]]; then
-            mv "$TARGET_PREVIOUS" "$TARGET_APP"
-            /usr/bin/open "$TARGET_APP" || true
-        fi
-        exit 1
+        fail "replacement failed to launch"
         """
     }
 

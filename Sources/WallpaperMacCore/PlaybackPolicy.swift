@@ -3,12 +3,20 @@ import Foundation
 public enum WallpaperFitMode: String, Codable, CaseIterable, Equatable, Sendable {
     case fill
     case fit
+    case stretch
+    case tile
 
     public var title: String {
         switch self {
-        case .fill: return "填充屏幕"
-        case .fit: return "完整显示"
+        case .fill: return "填充"
+        case .fit: return "适应"
+        case .stretch: return "拉伸"
+        case .tile: return "平铺"
         }
+    }
+
+    public var preservesAspectRatio: Bool {
+        self != .stretch
     }
 }
 

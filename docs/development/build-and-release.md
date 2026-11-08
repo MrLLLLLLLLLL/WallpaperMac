@@ -76,12 +76,11 @@ CI 不替代真实桌面验证：显示器分配、`AVPlayer`、`WKWebView`、�
 版本号由根目录 `VERSION` 控制，格式必须是 `major.minor.patch`。修改版本前请同步更新 `CHANGELOG.md` 与对应的 `docs/release-notes/<version>.md`。
 
 ```bash
-# 生成 App Bundle 与版本化 ZIP
+# 一次打包冻结 App，并生成同源 ZIP、DMG、签名与 SHA256SUMS
 ./scripts/build-release.sh
-
-# 重新构建 App Bundle，生成并验证版本化 DMG
-./scripts/build-dmg.sh
 ```
+
+`build-release.sh` 是完整发布产物入口：它只打包一次 App，ZIP 和 DMG 使用同一快照，最后生成并验证签名与清单。`build-dmg.sh` 只消费现有已验证 App，不会再次构建。
 
 产物位于：
 
@@ -97,11 +96,11 @@ dist/WallpaperMac-v<version>-macOS.dmg
 
 1. 确认 `VERSION`、`CHANGELOG.md`、README 当前版本和发布说明一致。
 2. 在干净工作区运行 `git diff --check`。
-3. 运行 `./scripts/test-release.sh`、`./scripts/queue-memory-regression.sh` 与 `./scripts/build-dmg.sh`。
+3. 运行 `./scripts/test-release.sh`、`./scripts/queue-memory-regression.sh` 与 `./scripts/build-release.sh`；后者一次生成同源 ZIP/DMG/SIG/SUMS。
 4. 使用 `hdiutil attach` 或 Finder 挂载 DMG，确认其中有 `WallpaperMac.app` 和 `Applications` 快捷方式。
 5. 用 `codesign --verify --deep --strict --verbose=2 dist/WallpaperMac.app` 复查 App Bundle。
 6. 在目标 macOS 版本启动 App，确认菜单栏图标、持久化壁纸库和至少一条动态队列。
-7. 上传 ZIP/DMG、SHA-256、发布说明；如面向外部分发，完成 Developer ID 签名和 Apple 公证后再发布。
+7. 上传 ZIP/DMG、SHA-256、发布说明；上传完成后用 `./scripts/update-artifact-smoke.sh` 对真实远程 ZIP、清单与签名做生产模式冒烟。如面向外部分发，完成 Developer ID 签名和 Apple 公证后再发布。
 
 ## 仓库清理
 

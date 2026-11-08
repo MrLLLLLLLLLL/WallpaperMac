@@ -139,6 +139,13 @@ final class LibraryViewModel: ObservableObject {
     private var metadataEnrichmentGeneration = 0
     private var libraryLoadTask: Task<Void, Never>?
     private var libraryLoadGeneration = 0
+    /// Rotated whenever the library root changes. Async mutations capture the
+    /// session they started in and must not publish results into a newer one.
+    private var librarySessionID = UUID()
+
+    private func isCurrentLibrarySession(_ session: UUID) -> Bool {
+        session == librarySessionID
+    }
     private static let pageSize = WallpaperLibraryPagination.defaultPageSize
 
     init() {
@@ -340,6 +347,7 @@ final class LibraryViewModel: ObservableObject {
         libraryLoadGeneration += 1
         let metadataGeneration = metadataEnrichmentGeneration
         let loadGeneration = libraryLoadGeneration
+        let session = librarySessionID
         let worker = storeWorker
         libraryLoadTask?.cancel()
         libraryLoadTask = Task { [weak self] in
@@ -347,12 +355,16 @@ final class LibraryViewModel: ObservableObject {
                 let snapshot = try await worker.loadLibrary()
                 guard !Task.isCancelled,
                       let self,
-                      self.libraryLoadGeneration == loadGeneration else { return }
+                      self.libraryLoadGeneration == loadGeneration,
+                      self.isCurrentLibrarySession(session) else { return }
                 self.applyLibrarySnapshot(snapshot)
                 self.startMetadataEnrichment(for: snapshot.items, generation: metadataGeneration)
                 afterLoad?()
             } catch {
-                guard !Task.isCancelled, let self, self.libraryLoadGeneration == loadGeneration else { return }
+                guard !Task.isCancelled,
+                      let self,
+                      self.libraryLoadGeneration == loadGeneration,
+                      self.isCurrentLibrarySession(session) else { return }
                 self.lastError = error.localizedDescription
                 self.visibleWallpapers = []
             }
@@ -446,6 +458,7 @@ final class LibraryViewModel: ObservableObject {
         }
         guard !candidates.isEmpty else { return }
 
+        let session = librarySessionID
         metadataEnrichmentTask = Task { [weak self] in
             let enriched = await Task.detached(priority: .utility) {
                 var results: [WallpaperItem] = []
@@ -459,7 +472,10 @@ final class LibraryViewModel: ObservableObject {
                 return results
             }.value
 
-            guard !Task.isCancelled, let self, self.metadataEnrichmentGeneration == generation else { return }
+            guard !Task.isCancelled,
+                  let self,
+                  self.metadataEnrichmentGeneration == generation,
+                  self.isCurrentLibrarySession(session) else { return }
             guard !enriched.isEmpty else { return }
 
             // Field-level patches only: a full merged array would overwrite
@@ -479,7 +495,12 @@ final class LibraryViewModel: ObservableObject {
             guard !patches.isEmpty else { return }
             do {
                 let updated = try await self.storeWorker.updateMetadata(patches)
-                guard !Task.isCancelled, self.metadataEnrichmentGeneration == generation else { return }
+                guard !Task.isCancelled,
+                      self.metadataEnrichmentGeneration == generation,
+                      self.isCurrentLibrarySession(session) else { return }
+                for item in updated where item.type == .video {
+                    self.wallpaperManager.updateDuration(for: item.id, duration: item.metadata?.durationSeconds)
+                }
                 var merged = self.wallpapers
                 for item in updated {
                     guard let index = merged.firstIndex(where: { $0.id == item.id }) else { continue }
@@ -488,6 +509,7 @@ final class LibraryViewModel: ObservableObject {
                 self.wallpapers = merged
                 self.refreshVisibleWallpapers()
             } catch {
+                guard self.isCurrentLibrarySession(session) else { return }
                 self.lastError = "保存资源信息失败：\(error.localizedDescription)"
             }
         }
@@ -519,14 +541,16 @@ final class LibraryViewModel: ObservableObject {
         let group = WallpaperGroup(name: trimmedName)
         let assignmentIDs = pendingGroupAssignmentIDs
         let worker = storeWorker
+        let session = librarySessionID
         Task { [weak self] in
             do {
                 let snapshot = try await worker.createGroup(group, assigning: assignmentIDs)
-                guard let self else { return }
+                guard let self, self.isCurrentLibrarySession(session) else { return }
                 self.pendingGroupAssignmentIDs.removeAll()
                 self.applyMutationSnapshot(snapshot, enrichMetadata: false)
             } catch {
-                self?.lastError = error.localizedDescription
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.lastError = error.localizedDescription
             }
         }
     }
@@ -544,12 +568,15 @@ final class LibraryViewModel: ObservableObject {
         let selectedIDs = Set(wallpapers.lazy.map(\.id)).intersection(ids)
         guard !selectedIDs.isEmpty else { return }
         let worker = storeWorker
+        let session = librarySessionID
         Task { [weak self] in
             do {
                 let snapshot = try await worker.assign(itemsWithIDs: selectedIDs, to: groupID)
-                self?.applyMutationSnapshot(snapshot, enrichMetadata: false)
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.applyMutationSnapshot(snapshot, enrichMetadata: false)
             } catch {
-                self?.lastError = error.localizedDescription
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.lastError = error.localizedDescription
             }
         }
     }
@@ -557,20 +584,25 @@ final class LibraryViewModel: ObservableObject {
     func removeSelectedWallpapers() {
         let selectedItems = wallpapers.filter { selectedWallpaperIDs.contains($0.id) }
         guard !selectedItems.isEmpty else { return }
-        let selectedIDs = Set(selectedItems.map(\.id))
-        wallpaperManager.removeWallpaperIDs(selectedIDs)
+        let removedIDs = Set(selectedItems.map(\.id))
         let worker = storeWorker
+        let session = librarySessionID
         Task { [weak self] in
             do {
                 let snapshot = try await worker.remove(items: selectedItems)
-                guard let self else { return }
-                self.selectedWallpaperIDs.subtract(selectedIDs)
-                if let selectedWallpaperID, selectedIDs.contains(selectedWallpaperID) {
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                // Commit the index first. Only after it succeeds do we ask the
+                // player to drop references, so a failed delete cannot leave a
+                // half-removed queue/assignment state behind.
+                self.wallpaperManager.removeWallpaperIDs(removedIDs)
+                self.selectedWallpaperIDs.subtract(removedIDs)
+                if let selectedWallpaperID, removedIDs.contains(selectedWallpaperID) {
                     self.selectedWallpaperID = nil
                 }
                 self.applyMutationSnapshot(snapshot, enrichMetadata: false)
             } catch {
-                self?.lastError = error.localizedDescription
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.lastError = error.localizedDescription
             }
         }
     }
@@ -630,9 +662,12 @@ final class LibraryViewModel: ObservableObject {
         isImportInspectionInProgress = true
         isImporting = true
         let worker = storeWorker
+        let session = librarySessionID
         Task { [weak self] in
             let inspection = await worker.inspectImportURLs(urls)
-            guard let self, self.pendingImportURLs == urls else { return }
+            guard let self,
+                  self.isCurrentLibrarySession(session),
+                  self.pendingImportURLs == urls else { return }
             self.pendingImportCandidates = inspection.candidates
             self.pendingWebEntryCandidates = inspection.webEntryCandidates
             self.isImportInspectionInProgress = false
@@ -642,10 +677,11 @@ final class LibraryViewModel: ObservableObject {
     func importURLs(_ urls: [URL], entryURL: URL? = nil, storageMode: StorageMode? = nil) {
         let selectedStorageMode = storageMode ?? self.storageMode
         let worker = storeWorker
+        let session = librarySessionID
         Task { [weak self] in
             do {
                 let result = try await worker.importItems(at: urls, entryURL: entryURL, storageMode: selectedStorageMode)
-                guard let self else { return }
+                guard let self, self.isCurrentLibrarySession(session) else { return }
                 self.isImporting = false
                 self.isImportInspectionInProgress = false
                 self.pendingImportURLs = []
@@ -658,7 +694,7 @@ final class LibraryViewModel: ObservableObject {
                     self.importSummary = ImportSummary(importedCount: result.importedIDs.count, failures: result.failures)
                 }
             } catch {
-                guard let self else { return }
+                guard let self, self.isCurrentLibrarySession(session) else { return }
                 self.isImporting = false
                 self.isImportInspectionInProgress = false
                 self.lastError = error.localizedDescription
@@ -668,28 +704,32 @@ final class LibraryViewModel: ObservableObject {
 
     func importWebWallpaper(_ url: URL) {
         let worker = storeWorker
+        let session = librarySessionID
         Task { [weak self] in
             do {
                 let result = try await worker.importWebURL(url)
-                guard let self else { return }
+                guard let self, self.isCurrentLibrarySession(session) else { return }
                 self.applyMutationSnapshot(result.snapshot, enrichMetadata: false)
                 self.selectedWallpaperID = result.importedIDs.first
                 self.importSummary = ImportSummary(importedCount: 1, failures: [])
             } catch {
-                self?.lastError = error.localizedDescription
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.lastError = error.localizedDescription
             }
         }
     }
 
     func importDroppedFiles(from providers: [NSItemProvider]) {
         let collector = DropURLCollector(providerCount: providers.count)
+        let session = librarySessionID
         for (index, provider) in providers.enumerated() {
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { [weak self] data, error in
                 guard error == nil else {
                     collector.submit(nil, at: index)
                     Task { @MainActor [weak self] in
+                        guard let self, self.isCurrentLibrarySession(session) else { return }
                         if let urls = collector.drain() {
-                            self?.beginImport(urls)
+                            self.beginImport(urls)
                         }
                     }
                     return
@@ -706,8 +746,9 @@ final class LibraryViewModel: ObservableObject {
                 }
                 collector.submit(url, at: index)
                 Task { @MainActor [weak self] in
+                    guard let self, self.isCurrentLibrarySession(session) else { return }
                     if let urls = collector.drain() {
-                        self?.beginImport(urls)
+                        self.beginImport(urls)
                     }
                 }
             }
@@ -729,6 +770,33 @@ final class LibraryViewModel: ObservableObject {
         }
         libraryURL = normalizedURL
         shouldCreateMissingLibraryDirectory = false
+        // Invalidate every in-flight mutation from the previous library before
+        // swapping workers, and clear the old library's UI state so it cannot
+        // be used to delete/apply items in the new one.
+        librarySessionID = UUID()
+        metadataEnrichmentTask?.cancel()
+        libraryLoadTask?.cancel()
+        wallpapers = []
+        groups = []
+        visibleWallpapers = []
+        selectedWallpaperIDs.removeAll()
+        selectedWallpaperID = nil
+        pendingImportURLs = []
+        pendingImportCandidates = []
+        pendingWebEntryCandidates = []
+        isImporting = false
+        isImportInspectionInProgress = false
+        pendingDeleteIDs = []
+        pendingGroupAssignmentIDs = []
+        pendingQueueAssignmentIDs = []
+        isNewGroupSheetPresented = false
+        isQueueEditorPresented = false
+        queueEditorDisplayID = nil
+        isDeleteConfirmationPresented = false
+        undoOperation = nil
+        toastMessage = nil
+        activeToastID = nil
+        lastError = nil
         store = WallpaperStore(libraryURL: libraryURL)
         storeWorker = WallpaperStoreWorker(libraryURL: libraryURL)
         UserDefaults.standard.set(libraryURL.path, forKey: SettingsKey.libraryPath)
@@ -763,6 +831,26 @@ final class LibraryViewModel: ObservableObject {
         setLibraryURL(url)
     }
 
+    func setFitModeOverride(_ mode: WallpaperFitMode?, for item: WallpaperItem) {
+        guard item.fitModeOverride != mode else { return }
+        let worker = storeWorker
+        let session = librarySessionID
+        Task { [weak self] in
+            do {
+                let persisted = try await worker.updateFitModeOverride(id: item.id, mode: mode)
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                if let index = self.wallpapers.firstIndex(where: { $0.id == item.id }) {
+                    self.wallpapers[index] = persisted
+                    self.refreshVisibleWallpapers()
+                }
+                self.wallpaperManager.updateFitMode(for: persisted)
+            } catch {
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.lastError = error.localizedDescription
+            }
+        }
+    }
+
     func apply(item: WallpaperItem, to display: DisplayService.Display) {
         guard item.availability == .available else {
             lastError = "资源不可用，请先恢复文件后重试。"
@@ -771,17 +859,21 @@ final class LibraryViewModel: ObservableObject {
         do {
             try wallpaperManager.apply(item: item, to: display, policy: playbackPolicy)
             if let index = wallpapers.firstIndex(where: { $0.id == item.id }) {
-                var updated = wallpapers[index]
-                updated.lastUsedAt = Date()
-                wallpapers[index] = updated
+                wallpapers[index].lastUsedAt = Date()
                 let worker = storeWorker
+                let session = librarySessionID
                 Task { [weak self] in
                     do {
-                        let persisted = try await worker.update(item: updated)
-                        guard let self, let currentIndex = self.wallpapers.firstIndex(where: { $0.id == persisted.id }) else { return }
+                        // Field-level write: a stale whole-item snapshot could
+                        // erase a concurrent fit-mode or metadata change.
+                        let persisted = try await worker.touchLastUsed(id: item.id)
+                        guard let self,
+                              self.isCurrentLibrarySession(session),
+                              let currentIndex = self.wallpapers.firstIndex(where: { $0.id == persisted.id }) else { return }
                         self.wallpapers[currentIndex] = persisted
                     } catch {
-                        self?.lastError = error.localizedDescription
+                        guard let self, self.isCurrentLibrarySession(session) else { return }
+                        self.lastError = error.localizedDescription
                     }
                 }
             }
@@ -840,14 +932,18 @@ final class LibraryViewModel: ObservableObject {
 
     func refreshAvailability(for item: WallpaperItem) {
         let worker = storeWorker
+        let session = librarySessionID
         Task { [weak self] in
             do {
                 let refreshed = try await worker.refreshAvailability(for: item)
-                guard let self, let index = self.wallpapers.firstIndex(where: { $0.id == item.id }) else { return }
+                guard let self,
+                      self.isCurrentLibrarySession(session),
+                      let index = self.wallpapers.firstIndex(where: { $0.id == item.id }) else { return }
                 self.wallpapers[index] = refreshed
                 self.refreshVisibleWallpapers()
             } catch {
-                self?.lastError = error.localizedDescription
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.lastError = error.localizedDescription
             }
         }
     }
@@ -861,12 +957,15 @@ final class LibraryViewModel: ObservableObject {
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let worker = storeWorker
+        let session = librarySessionID
         Task { [weak self] in
             do {
                 let snapshot = try await worker.relocate(item: item, to: url)
-                self?.applyMutationSnapshot(snapshot)
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.applyMutationSnapshot(snapshot)
             } catch {
-                self?.lastError = error.localizedDescription
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.lastError = error.localizedDescription
             }
         }
     }
@@ -886,19 +985,22 @@ final class LibraryViewModel: ObservableObject {
         let items = wallpapers.filter { ids.contains($0.id) }
         guard !items.isEmpty else { return }
         let removedIDs = Set(items.map(\.id))
-        wallpaperManager.removeWallpaperIDs(removedIDs)
         let worker = storeWorker
+        let session = librarySessionID
         Task { [weak self] in
             do {
                 let snapshot = try await worker.remove(items: items)
-                guard let self else { return }
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                // Index first; keep queue/display references intact on failure.
+                self.wallpaperManager.removeWallpaperIDs(removedIDs)
                 self.selectedWallpaperIDs.subtract(removedIDs)
                 if let selectedWallpaperID, removedIDs.contains(selectedWallpaperID) {
                     self.selectedWallpaperID = nil
                 }
                 self.applyMutationSnapshot(snapshot, enrichMetadata: false)
             } catch {
-                self?.lastError = error.localizedDescription
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.lastError = error.localizedDescription
             }
         }
     }
@@ -993,12 +1095,15 @@ final class LibraryViewModel: ObservableObject {
         guard !items.isEmpty else { return }
         let shouldFavorite = !items.allSatisfy(\.isFavorite)
         let worker = storeWorker
+        let session = librarySessionID
         Task { [weak self] in
             do {
                 let snapshot = try await worker.setFavorite(itemIDs: ids, isFavorite: shouldFavorite)
-                self?.applyMutationSnapshot(snapshot, enrichMetadata: false)
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.applyMutationSnapshot(snapshot, enrichMetadata: false)
             } catch {
-                self?.lastError = error.localizedDescription
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.lastError = error.localizedDescription
             }
         }
     }
@@ -1791,6 +1896,8 @@ private struct LibraryContentView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .accessibilityLabel("视图")
                     .frame(width: 76)
                     .help("切换网格或列表")
                     Button { model.isSelectionMode = true } label: {
@@ -2288,6 +2395,10 @@ private struct ImportSheet: View {
         model.pendingImportCandidates.first(where: { $0.url == url })?.type
     }
 
+    private func importCandidate(for url: URL) -> WallpaperImportCandidate? {
+        model.pendingImportCandidates.first(where: { $0.url == url })
+    }
+
     private var requiresEntrySelection: Bool {
         webProject != nil && candidates.count > 1
     }
@@ -2314,6 +2425,17 @@ private struct ImportSheet: View {
                                 Text(typeDescription(for: type))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                if let candidate = importCandidate(for: url) {
+                                    Text("范围：\(candidate.scopeURL.path)")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                    if let count = candidate.fileCount, let bytes = candidate.estimatedBytes {
+                                        Text("\(count) 个文件 · \(ByteCountFormatter().string(fromByteCount: bytes))")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
                             }
                             Spacer()
                             if model.isImportInspectionInProgress {
@@ -2333,6 +2455,10 @@ private struct ImportSheet: View {
                 }
                 .padding(.vertical, 4)
             }
+
+            Text("单个 HTML 只处理所选文件；需要相对 CSS、JS 或其他资源时，请显式导入整个项目目录。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             Picker("存储策略", selection: $selectedStorageMode) {
                 Text("复制到应用库").tag(StorageMode.managedCopy)
@@ -2468,6 +2594,26 @@ private struct InspectorView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(item.name).font(.title3.weight(.semibold))
                             Text(typeName(for: item)).font(.caption).foregroundStyle(.secondary)
+                        }
+                        if item.type == .image || item.type == .video {
+                            GroupBox("适配方式") {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Picker("此壁纸", selection: Binding<WallpaperFitMode?>(
+                                        get: { item.fitModeOverride },
+                                        set: { model.setFitModeOverride($0, for: item) }
+                                    )) {
+                                        Text("跟随全局（\(model.playbackPolicy.fitMode.title)）").tag(nil as WallpaperFitMode?)
+                                        ForEach(WallpaperFitMode.allCases, id: \.self) { mode in
+                                            Text(mode.title).tag(Optional(mode))
+                                        }
+                                    }
+                                    .pickerStyle(.menu)
+                                    Text(item.fitModeOverride == nil ? "当前跟随全局：\(model.playbackPolicy.fitMode.title)。" : "当前使用此壁纸独立的适配方式，不受全局设置影响。")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(.vertical, 4)
+                            }
                         }
                         GroupBox("显示器") {
                             VStack(alignment: .leading, spacing: 8) {

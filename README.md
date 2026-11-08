@@ -4,7 +4,7 @@
 
 WallpaperMac 是一款使用 **SwiftUI + AppKit** 构建的原生 macOS 壁纸管理工具。它将本地图片、视频、本地 HTML 项目和 HTTP/HTTPS 网页网址统一纳入壁纸库，支持多显示器独立分配、播放队列、分组、菜单栏控制和可迁移的壁纸库存储位置。
 
-当前已发布版本：**0.2.7** · 下一版本开发内容归入 **0.2.8** · 目标平台：**macOS 13+** · 构建方式：**Swift Package Manager**
+当前已发布版本：**0.2.8** · 下一版本开发内容归入 **0.2.9** · 目标平台：**macOS 13+** · 构建方式：**Swift Package Manager**
 
 App 内置兼容视频转换工具，用于播放 AV1 等 macOS AVFoundation 不直接支持的编码。
 
@@ -26,7 +26,7 @@ App 内置兼容视频转换工具，用于播放 AV1 等 macOS AVFoundation 不
 | 播放器 | 图片窗口、`AVPlayer` 视频窗口、`WKWebView` 本地或在线网页窗口；视频和网页默认静音，支持播放、暂停、静音、循环与网页重新加载。 |
 | 菜单栏 | 常驻 WallpaperMac 图标，可打开窗口、暂停/恢复动态壁纸、静音/取消静音、打开壁纸库、打开设置或退出应用。 |
 | 性能 | 壁纸库和分组以每页 20 项递增加载；扫描、导入、删除与分组持久化在后台串行执行，避免主界面因文件 I/O 卡顿；队列切换释放前一播放器资源，降低长期切换时内存持续增长的风险。 |
-| 设置与系统策略 | 可配置壁纸库路径、默认导入方式、静音/循环、适配方式、电池与全屏优化、登录时启动和快捷键状态；“关于 WallpaperMac”显示当前版本与构建号。 |
+| 设置与系统策略 | 可配置壁纸库路径、默认导入方式、静音/循环、全局适配方式（默认填充）、单壁纸适配覆盖、电池与全屏优化、登录时启动和快捷键状态；“关于 WallpaperMac”显示当前版本与构建号。 |
 
 ## 界面与工作流
 
@@ -186,6 +186,9 @@ Templates/SimpleWebWallpaper/
 # 校验网页模板
 ./scripts/validate-web-wallpaper-template.sh
 
+# 校验图片、H.264 与 AV1 的平铺、填充及单壁纸适配覆盖（默认优先选择竖屏，需要真实桌面）
+./scripts/wallpaper-fit-runtime-test.sh
+
 # 运行核心领域与存储回归测试
 swift run WallpaperMacCoreTests
 
@@ -205,8 +208,8 @@ git diff --check
 # 验证连续队列切换中的播放器释放和内存回归
 ./scripts/queue-memory-regression.sh
 
-# 生成并验证 DMG
-./scripts/build-dmg.sh
+# 一次生成并验证同源 ZIP、DMG、签名与 SHA256SUMS
+./scripts/build-release.sh
 ```
 
 发布产物生成在 `dist/`：
@@ -215,6 +218,8 @@ git diff --check
 WallpaperMac.app
 WallpaperMac-v<version>-macOS.zip
 WallpaperMac-v<version>-macOS.dmg
+WallpaperMac-v<version>-macOS.zip.sig
+WallpaperMac-v<version>-SHA256SUMS.txt
 ```
 
 这些文件是可再生二进制产物，不提交到 Git。版本号来自根目录 [`VERSION`](VERSION)，具体发布内容见 [`CHANGELOG.md`](CHANGELOG.md) 和 [`docs/release-notes/`](docs/release-notes/)。

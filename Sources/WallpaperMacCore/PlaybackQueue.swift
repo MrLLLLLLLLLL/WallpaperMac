@@ -40,6 +40,26 @@ public enum QueueCompletionBehavior: String, Codable, CaseIterable, Equatable, S
     }
 }
 
+/// Chooses the index a display should use after queue members are removed.
+///
+/// If the wallpaper that was playing is still present, keep pointing at it even
+/// when earlier members were removed and all indices shifted. If it was
+/// removed, fall back to its old position clamped into the remaining members
+/// (the successor, or the previous item when the last member was removed).
+public enum PlaybackIndexReconciler {
+    public static func reconciledIndex(
+        currentItemID: UUID?,
+        fallbackIndex: Int,
+        remainingIDs: [UUID]
+    ) -> Int {
+        guard !remainingIDs.isEmpty else { return 0 }
+        if let currentItemID, let preserved = remainingIDs.firstIndex(of: currentItemID) {
+            return preserved
+        }
+        return min(max(fallbackIndex, 0), remainingIDs.count - 1)
+    }
+}
+
 /// What moves a queue from the current wallpaper to the next one.
 ///
 /// The two choices are exclusive: a video-completion queue never advances a

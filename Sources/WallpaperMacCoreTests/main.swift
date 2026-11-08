@@ -1,5 +1,8 @@
+import AppKit
+import AVFoundation
 import CryptoKit
 import Foundation
+import QuartzCore
 import WallpaperMacCore
 
 struct TestFailure: Error, CustomStringConvertible {
@@ -365,7 +368,7 @@ func testManagedCopyOfNestedHTMLEntryPreservesProjectResources() throws {
     try Data("body { color: white; }".utf8).write(to: stylesheet)
     try Data("document.body.dataset.loaded = 'true';".utf8).write(to: script)
 
-    let item = try fixture.store.importItem(at: entry, storageMode: .managedCopy, entryURL: entry)
+    let item = try fixture.store.importItem(at: pages, storageMode: .managedCopy, entryURL: entry)
     let copiedProject = item.sourceURL
     let copiedEntry = copiedProject.appendingPathComponent("index.html")
     let copiedStylesheet = copiedProject.appendingPathComponent("styles/site.css")
@@ -376,6 +379,32 @@ func testManagedCopyOfNestedHTMLEntryPreservesProjectResources() throws {
     try expect(FileManager.default.fileExists(atPath: copiedEntry.path), "copied HTML entry should exist")
     try expect(FileManager.default.fileExists(atPath: copiedStylesheet.path), "HTML relative stylesheet should exist beside copied entry")
     try expect(FileManager.default.fileExists(atPath: copiedScript.path), "HTML relative script should exist beside copied entry")
+}
+
+func testSingleHTMLImportOnlyCopiesSelectedFile() throws {
+    let fixture = try Fixture()
+    let sourceDirectory = fixture.root.appendingPathComponent("source", isDirectory: true)
+    try FileManager.default.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
+    let entry = sourceDirectory.appendingPathComponent("clock.html")
+    try Data("<html><body>clock</body></html>".utf8).write(to: entry)
+    let sibling = sourceDirectory.appendingPathComponent("unrelated.txt")
+    let hidden = sourceDirectory.appendingPathComponent(".hidden-sentinel")
+    let nested = sourceDirectory.appendingPathComponent("nested/payload.bin")
+    try Data("unrelated".utf8).write(to: sibling)
+    try Data("hidden".utf8).write(to: hidden)
+    try FileManager.default.createDirectory(at: nested.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data("payload".utf8).write(to: nested)
+
+    let item = try fixture.store.importItem(at: entry, storageMode: .managedCopy)
+    try expect(item.sourceURL.isExistingDirectory == false, "single HTML must be stored as a file, not a directory")
+    try expect(item.entryURL?.standardizedFileURL, equals: item.sourceURL.standardizedFileURL, "single HTML entry should be the copied file itself")
+    try expect(item.relativeEntryPath, equals: nil, "single HTML has no project-relative entry")
+    let assets = fixture.library.appendingPathComponent("Assets", isDirectory: true)
+    let entries = try FileManager.default.contentsOfDirectory(at: assets, includingPropertiesForKeys: nil)
+    try expect(entries.count, equals: 1, "only the selected HTML file may be copied")
+    try expect(entries.first?.lastPathComponent.hasSuffix("-clock.html") == true, "the managed asset should be the selected file")
+    try expect(!FileManager.default.fileExists(atPath: item.sourceURL.appendingPathComponent("unrelated.txt").path), "unrelated sibling must not be copied")
+    try expect(!FileManager.default.fileExists(atPath: item.sourceURL.appendingPathComponent(".hidden-sentinel").path), "hidden sibling must not be copied")
 }
 
 func testHTMLProjectImportPersistsSelectedEntry() throws {
@@ -471,6 +500,71 @@ func testRelocatesHTMLProjectAndPreservesEntry() throws {
     try expect(relocated.availability, equals: .available, "relocated HTML project should be available")
 }
 
+func testRelocationPreservesNestedEntryAfterRestart() throws {
+    for storageMode in [StorageMode.externalReference, .managedCopy] {
+        let fixture = try Fixture()
+        let oldProject = fixture.root.appendingPathComponent("old-site-\(storageMode.rawValue)", isDirectory: true)
+        let oldPages = oldProject.appendingPathComponent("pages", isDirectory: true)
+        try FileManager.default.createDirectory(at: oldPages, withIntermediateDirectories: true)
+        try Data("old-index".utf8).write(to: oldProject.appendingPathComponent("index.html"))
+        let oldEntry = oldPages.appendingPathComponent("home.html")
+        try Data("old-home".utf8).write(to: oldEntry)
+
+        let imported = try fixture.store.importItem(at: oldProject, storageMode: storageMode, entryURL: oldEntry)
+        try expect(imported.relativeEntryPath, equals: "pages/home.html", "\(storageMode) import should persist the relative entry")
+
+        // Simulate an app restart: reload the index from disk before relocating.
+        let reloadedStore = WallpaperStore(libraryURL: fixture.library)
+        guard let decoded = try reloadedStore.items().first else {
+            throw TestFailure(message: "imported item should persist")
+        }
+        try expect(decoded.relativeEntryPath, equals: "pages/home.html", "\(storageMode) relative entry should survive JSON round-trip")
+
+        let replacement = fixture.root.appendingPathComponent("new-site-\(storageMode.rawValue)", isDirectory: true)
+        let replacementPages = replacement.appendingPathComponent("pages", isDirectory: true)
+        try FileManager.default.createDirectory(at: replacementPages, withIntermediateDirectories: true)
+        try Data("new-index".utf8).write(to: replacement.appendingPathComponent("index.html"))
+        let replacementEntry = replacementPages.appendingPathComponent("home.html")
+        try Data("new-home".utf8).write(to: replacementEntry)
+
+        try FileManager.default.removeItem(at: decoded.sourceURL)
+        let missing = try reloadedStore.refreshAvailability(for: decoded)
+        let relocated = try reloadedStore.relocate(item: missing, to: replacement)
+
+        let expectedEntry = storageMode == .managedCopy
+            ? decoded.sourceURL.appendingPathComponent("pages/home.html")
+            : replacementEntry
+        try expect(relocated.entryURL?.standardizedFileURL, equals: expectedEntry.standardizedFileURL, "\(storageMode) relocation should keep the nested entry")
+        let persisted = try WallpaperStore(libraryURL: fixture.library).items().first
+        try expect(persisted?.entryURL?.standardizedFileURL, equals: expectedEntry.standardizedFileURL, "\(storageMode) relocation should persist the nested entry")
+        try expect(persisted?.relativeEntryPath, equals: "pages/home.html", "\(storageMode) relative entry should persist after relocation")
+    }
+}
+
+func testRelocationRejectsMissingOriginalEntry() throws {
+    let fixture = try Fixture()
+    let oldProject = fixture.root.appendingPathComponent("old-site", isDirectory: true)
+    let oldPages = oldProject.appendingPathComponent("pages", isDirectory: true)
+    try FileManager.default.createDirectory(at: oldPages, withIntermediateDirectories: true)
+    let oldEntry = oldPages.appendingPathComponent("home.html")
+    try Data("home".utf8).write(to: oldEntry)
+    let item = try fixture.store.importItem(at: oldProject, storageMode: .externalReference, entryURL: oldEntry)
+    try FileManager.default.removeItem(at: oldProject)
+
+    let replacement = fixture.root.appendingPathComponent("replacement", isDirectory: true)
+    try FileManager.default.createDirectory(at: replacement, withIntermediateDirectories: true)
+    try Data("index".utf8).write(to: replacement.appendingPathComponent("index.html"))
+
+    var didReject = false
+    do {
+        _ = try fixture.store.relocate(item: item, to: replacement)
+    } catch WallpaperStoreError.invalidHTMLEntry(_) {
+        didReject = true
+    }
+    try expect(didReject, "relocation must not silently switch to index.html")
+    try expect(try fixture.store.items().first?.entryURL, equals: item.entryURL, "failed relocation must not persist a different entry")
+}
+
 func testRemovesManagedWallpaperAndAsset() throws {
     let fixture = try Fixture()
     let source = fixture.root.appendingPathComponent("remove-me.png")
@@ -537,18 +631,38 @@ func testPlaybackPolicySuspensionRules() throws {
 func testWebMouseEventScriptActivatesClickOnce() throws {
     let mouseUp = WebMouseEventScript.source(x: 120, y: 80, phase: .mouseUp)
     try expect(
-        mouseUp.components(separatedBy: "element.click()").count - 1,
+        mouseUp.components(separatedBy: "target.click()").count - 1,
         equals: 1,
-        "mouseup should use exactly one native element click activation"
+        "a matched mouseup should use exactly one native target click activation"
     )
     try expect(
-        mouseUp.contains("if (typeof element.click === 'function')"),
+        mouseUp.contains("if (typeof target.click === 'function')"),
         "HTML elements should use their native click activation"
+    )
+    try expect(
+        mouseUp.contains("window.__wallpaperMacMouseDown"),
+        "mouseup must inspect the saved mousedown target"
+    )
+    try expect(
+        mouseUp.contains("Math.hypot(x - down.x, y - down.y) <= 6"),
+        "dragging beyond the threshold must cancel activation"
+    )
+    try expect(
+        mouseUp.contains("down.target === element"),
+        "only the pressed target or its ancestor may be activated"
+    )
+    try expect(
+        WebMouseEventScript.linkTarget(x: 120, y: 80).contains("element.click()") == false,
+        "link preflight must not activate the target"
     )
     try expect(
         mouseUp.components(separatedBy: "new MouseEvent('click'").count - 1,
         equals: 1,
         "non-HTML elements should have one mutually exclusive fallback click activation"
+    )
+    try expect(
+        WebMouseEventScript.activateMouseUp().contains("clientX: point ? point.x : 0"),
+        "fallback click activation must preserve the real pointer coordinates"
     )
     let mouseDown = WebMouseEventScript.source(x: 120, y: 80, phase: .mouseDown)
     try expect(
@@ -713,11 +827,14 @@ let tests: [(String, () throws -> Void)] = [
     ("persists display assignments", testDisplayAssignmentsPersist),
     ("imports HTML project with selected entry", testHTMLProjectImportPersistsSelectedEntry),
     ("managed copy preserves nested HTML project resources", testManagedCopyOfNestedHTMLEntryPreservesProjectResources),
+    ("single HTML import copies only the selected file", testSingleHTMLImportOnlyCopiesSelectedFile),
     ("rejects unsupported and missing sources", testUnsupportedAndMissingSourcesFailClearly),
     ("persists and recovers availability", testPersistenceAndAvailabilityRecovery),
     ("relocates missing external wallpaper", testRelocatesMissingExternalWallpaper),
     ("removes managed wallpaper and asset", testRemovesManagedWallpaperAndAsset),
     ("relocates HTML project and preserves entry", testRelocatesHTMLProjectAndPreservesEntry),
+    ("relocation keeps nested entry after restart", testRelocationPreservesNestedEntryAfterRestart),
+    ("relocation rejects a missing original entry", testRelocationRejectsMissingOriginalEntry),
     ("cleans invalid managed HTML imports", testInvalidHTMLImportCleansManagedAsset),
     ("rejects mismatched managed relocation", testRelocateManagedWallpaperCleansCopyOnFailure),
     ("activates web click once", testWebMouseEventScriptActivatesClickOnce),
@@ -738,7 +855,6 @@ let tests: [(String, () throws -> Void)] = [
     ("falls back to fixed interval for non-video items", testNonVideoItemsFallBackToFixedIntervalInCompletionMode),
     ("requires compatibility playback for AV1", testVideoPlaybackCompatibilityRequiresCacheForAV1),
     ("plans streaming compatibility playback", testVideoCompatibilityStreamPlanPipesDecodedFrames),
-    ("normalizes real HEVC sample entries", testVideoContainerCompatibilityNormalizesRealHev1Entries),
     ("ignores media payload lookalikes", testVideoContainerCompatibilityIgnoresMediaPayloadLookalikes),
     ("keeps external references without video proxies", testExternalReferenceDoesNotPersistVideoProxy),
     ("removes legacy external playback proxies", testStoreRemovesLegacyExternalPlaybackProxy),
@@ -749,6 +865,19 @@ let tests: [(String, () throws -> Void)] = [
     ("round trips display queue state", testQueueStoreRoundTripsDisplayQueueState),
     ("formats application version information", testApplicationVersionInfoFormatting),
     ("bounds video-completion stall watchdog", testPlaybackQueueStallWatchdogInterval),
+    ("reconciles queue index after deleting members", testPlaybackIndexReconcilerKeepsCurrentItemAndChoosesSuccessor),
+    ("separates playback pause from queue stop", testPlaybackSchedulingStateSeparatesPauseFromQueueStop),
+    ("supports all fit modes and bounded tile layout", testFitModesAndTileLayout),
+    ("fill covers portrait viewport on both axes", testFillCoversPortraitViewportOnBothAxes),
+    ("per-wallpaper override persists and legacy inherits", testPerWallpaperFitOverridePersistsAndLegacyRecordsInherit),
+    ("field-level updates preserve unrelated fields", testFieldLevelUpdatesPreserveOtherChanges),
+    ("preserves remaining playback deadlines", testPlaybackDeadlineMathPreservesRemainingTime),
+    ("only loops ffmpeg after a clean drained EOF", testVideoStreamExitPolicyOnlyLoopsCleanEOF),
+    ("tracks AVPlayer time and duration progress", testVideoPlaybackProgressUsesActualTimeAndDuration),
+    ("keeps unchanged displays during screen reconciliation", testDisplayReconcilerDoesNotRebuildUnchangedScreens),
+    ("requires a one-shot native gesture for external navigation", testExternalNavigationRequiresOneShotNativeGesture),
+    ("bounds WebContent recovery with healthy reset", testWebContentRecoveryUsesBoundedBackoffAndHealthyReset),
+    ("delivers fragmented video tail frames without loss", testVideoFrameBufferDeliversFragmentedTailWithoutLoss),
     ("parses and compares semantic versions", testSemVerParsingAndComparison),
     ("parses newer GitHub release", testUpdateCheckerParsesNewerRelease),
     ("reports up to date releases", testUpdateCheckerReportsUpToDate),
@@ -771,6 +900,16 @@ let tests: [(String, () throws -> Void)] = [
     ("reports stalled transfer after retry limit", testUpdateDownloadReportsStalledTransferAfterRetryLimit),
     ("quotes shell paths safely", testUpdateShellQuotingSurvivesApostrophes),
     ("waits for parent and rolls back install", testUpdateInstallScriptWaitsForParentAndRollsBack),
+    ("copy failure leaves original app untouched", testUpdateCopyFailureLeavesOriginalAppUntouched),
+    ("relaunch failure restores original app", testUpdateRelaunchFailureRestoresOriginalApp),
+    ("validated sibling installs successfully", testUpdateSuccessfulInstallUsesValidatedSibling),
+    ("wrong pending version aborts before swap", testUpdateRejectsWrongPendingVersionBeforeSwap),
+    ("atomic swap keeps a complete app at target", testAtomicSwapKeepsCompleteAppAtTarget),
+    ("open without health confirmation rolls back", testUpdateOpenWithoutHealthConfirmationRollsBack),
+    ("rollback failure preserves the complete old backup", testUpdateRollbackFailurePreservesBackupAndDoesNotOpenBrokenTarget),
+    ("health acknowledgement matches the install token", testUpdateHealthHandshakeWritesMatchingTokenAtomically),
+    ("install lock excludes other owners and releases", testUpdateInstallLockExcludesOtherOwnersAndReleases),
+    ("helper accepts inherited lock and releases on exit", testInstallScriptUsesInheritedLockAndReleasesAfterHelperExit),
     ("prepares and validates update bundle", testUpdatePrepareExtractsAndValidatesBundleVersion),
     ("rejects translocated and bare binaries", testUpdatePreflightRejectsTranslocatedAndBareBinaries),
     ("locates nested app bundles", testUpdateLocateAppBundleFindsNestedLayout),
@@ -785,6 +924,11 @@ let tests: [(String, () throws -> Void)] = [
     ("persists index before deleting managed files", testRemovePersistsIndexBeforeDeletingFiles),
     ("resumes legacy queue migration from partial writes", testMigrationResumesFromPlanAfterPartialWrite),
     ("requires cross-referenced modern queue files", testModernQueueValidationRequiresCrossReferences),
+    ("keeps legacy display state when modern bindings are empty", testEmptyModernBindingsDoNotRetireNonEmptyLegacyQueues),
+    ("blocks queue persistence after a load failure", testLibraryPersistenceGateBlocksAfterLoadFailure),
+    ("load failure blocks writes and preserves bytes", testQueueLoadFailureBlocksWritesAndPreservesBytes),
+    ("missing queue files allow writes", testMissingQueueFilesAllowWrites),
+    ("queue load recovers after repair", testQueueLoadRecoversAfterRepair),
     ("decodes legacy items with safe fallbacks", testWallpaperItemLegacyDecodeUsesSafeFallbacks),
     ("aggregates drop URLs in drag order", testDropURLCollectorPreservesOrderAndDrainsOnce),
     ("keeps edited modern pair over legacy residual", testMigrationKeepsEditedModernPairWhenLegacyResidualExists),
@@ -795,6 +939,23 @@ let tests: [(String, () throws -> Void)] = [
     ("cleans full staging directory on install", testInstallScriptCleansFullStagingDirectory),
     ("keeps deleted placeholders across reorder", testQueueReorderKeepsDeletedPlaceholders)
 ]
+
+// Limited integration probe used by scripts/update-install-lock-smoke.sh.
+// It exercises a real process/descriptor boundary without starting the app.
+if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--update-lock-probe" {
+    do {
+        let lock = try UpdateInstallLock(
+            targetAppURL: URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+        )
+        print("LOCKED \(lock.ownerToken)")
+        fflush(stdout)
+        Thread.sleep(forTimeInterval: 2)
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
+        exit(1)
+    }
+}
 
 var failures = 0
 for (name, test) in tests {
@@ -1439,36 +1600,52 @@ final class UpdateDownloadMockURLProtocol: URLProtocol {
         client?.urlProtocolDidFinishLoading(self)
     }
 
+    private let chunkLock = NSLock()
     private var chunkTimer: DispatchSourceTimer?
     private var chunkBody = Data()
     private var chunkOffset = 0
     private var configuredChunkSize = 0
 
     private func startChunkedDelivery(body: Data, chunkSize: Int, delay: TimeInterval) {
+        let timer = DispatchSource.makeTimerSource(
+            queue: DispatchQueue(label: "wallpapermac.update-download-mock.chunks")
+        )
+        chunkLock.lock()
         chunkBody = body
         chunkOffset = 0
         configuredChunkSize = chunkSize
-        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
+        chunkTimer = timer
+        chunkLock.unlock()
         timer.schedule(deadline: .now() + delay, repeating: delay)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            guard self.chunkOffset < self.chunkBody.count else {
-                timer.cancel()
-                self.client?.urlProtocolDidFinishLoading(self)
-                return
-            }
-            let end = min(self.chunkOffset + self.configuredChunkSize, self.chunkBody.count)
-            let chunk = Data(self.chunkBody[self.chunkOffset..<end])
-            self.chunkOffset = end
-            self.client?.urlProtocol(self, didLoad: chunk)
+            self.deliverNextChunk(timer: timer)
         }
-        chunkTimer = timer
         timer.resume()
     }
 
+    private func deliverNextChunk(timer: DispatchSourceTimer) {
+        chunkLock.lock()
+        guard chunkOffset < chunkBody.count else {
+            chunkOffset = 0
+            chunkLock.unlock()
+            timer.cancel()
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+        let end = min(chunkOffset + configuredChunkSize, chunkBody.count)
+        let chunk = Data(chunkBody[chunkOffset..<end])
+        chunkOffset = end
+        chunkLock.unlock()
+        client?.urlProtocol(self, didLoad: chunk)
+    }
+
     override func stopLoading() {
-        chunkTimer?.cancel()
+        chunkLock.lock()
+        let timer = chunkTimer
         chunkTimer = nil
+        chunkLock.unlock()
+        timer?.cancel()
     }
 }
 
@@ -1995,6 +2172,328 @@ func testUpdateShellQuotingSurvivesApostrophes() throws {
     )
 }
 
+private struct UpdateScriptFixture {
+    let root: URL
+    let sourceApp: URL
+    let targetApp: URL
+    let staging: URL
+    let script: URL
+    let openLog: URL
+}
+
+private func writeMiniApp(at app: URL, version: String, marker: String) throws {
+    let executable = app.appendingPathComponent("Contents/MacOS/WallpaperMac")
+    try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data(marker.utf8).write(to: executable)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+    let plist: [String: Any] = [
+        "CFBundleShortVersionString": version,
+        "CFBundleVersion": version,
+        "CFBundleExecutable": "WallpaperMac",
+    ]
+    let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+    try data.write(to: app.appendingPathComponent("Contents/Info.plist"))
+}
+
+private func makeUpdateScriptFixture(expectedVersion: String = "9.9.9") throws -> UpdateScriptFixture {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WallpaperMacUpdateScriptTests", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let sourceApp = root.appendingPathComponent("staging/extracted/WallpaperMac.app")
+    let targetApp = root.appendingPathComponent("Applications/WallpaperMac.app")
+    try writeMiniApp(at: sourceApp, version: expectedVersion, marker: "new-complete")
+    try writeMiniApp(at: targetApp, version: "0.1.0", marker: "old-complete")
+    let script = root.appendingPathComponent("staging/install.sh")
+    let scriptText = UpdateInstaller.installScript(
+        parentPID: 999_999_999,
+        sourceAppPath: sourceApp.path,
+        targetAppPath: targetApp.path,
+        stagingPath: root.appendingPathComponent("staging").path,
+        expectedVersion: expectedVersion
+    )
+    try scriptText.write(to: script, atomically: true, encoding: .utf8)
+    return UpdateScriptFixture(
+        root: root,
+        sourceApp: sourceApp,
+        targetApp: targetApp,
+        staging: root.appendingPathComponent("staging"),
+        script: script,
+        openLog: root.appendingPathComponent("open.log")
+    )
+}
+
+private func runUpdateScript(_ fixture: UpdateScriptFixture, ditto: String, openStatus: Int32, healthAck: Bool = true, installLock: UpdateInstallLock? = nil, failRollback: Bool = false) throws -> Int32 {
+    let fakeOpen = fixture.root.appendingPathComponent("fake-open.sh")
+    let script = """
+    #!/bin/zsh
+    print -r -- "$1" >> "$OPEN_LOG"
+    TOKEN=""
+    ACK=""
+    NEXT=""
+    for ARG in "$@"; do
+        if [[ "$ARG" == "--update-health-token" ]]; then
+            NEXT="token"
+        elif [[ "$ARG" == "--update-health-file" ]]; then
+            NEXT="file"
+        elif [[ "$NEXT" == "token" ]]; then
+            TOKEN="$ARG"
+            NEXT=""
+        elif [[ "$NEXT" == "file" ]]; then
+            ACK="$ARG"
+            NEXT=""
+        fi
+    done
+    if [[ "$OPEN_STATUS" == "0" && "$WALLPAPERMAC_HEALTH_ACK" == "1" && -n "$TOKEN" && -n "$ACK" ]]; then
+        printf 'token=%s\\npid=%s\\nversion=%s\\n' "$TOKEN" "$$" "$WALLPAPERMAC_HEALTH_VERSION" > "$ACK"
+    fi
+    exit $OPEN_STATUS
+    """
+    try script.write(to: fakeOpen, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeOpen.path)
+    let fakeSwapper = fixture.root.appendingPathComponent("fake-swapper.sh")
+    let swapScript = """
+    #!/bin/zsh
+    [[ "$1" == "--update-swap" ]] || {
+        [[ "$1" == "--update-lock-check" ]] || exit 2
+        /usr/bin/python3 -I -c 'import os,sys; a=os.stat(sys.argv[1]); b=os.fstat(0); sys.exit((a.st_dev,a.st_ino)!=(b.st_dev,b.st_ino))' "$2" || exit 1
+        [[ "$(head -n 1 "$2")" == "$3" ]] || exit 1
+        exit 0
+    }
+    if [[ "${WALLPAPERMAC_FAIL_ROLLBACK:-0}" == "1" && -f "$WALLPAPERMAC_SWAP_COUNT" ]]; then
+        exit 1
+    fi
+    print -r -- 'swap' >> "$WALLPAPERMAC_SWAP_COUNT"
+    TEMP="${3}.swap-temp"
+    mv "$3" "$TEMP"
+    mv "$2" "$3"
+    mv "$TEMP" "$2"
+    """
+    try swapScript.write(to: fakeSwapper, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeSwapper.path)
+    if let installLock {
+        let lockedScript = UpdateInstaller.installScript(
+            parentPID: 999_999_999,
+            sourceAppPath: fixture.sourceApp.path,
+            targetAppPath: fixture.targetApp.path,
+            stagingPath: fixture.staging.path,
+            expectedVersion: "9.9.9",
+            lockPath: installLock.lockURL.path,
+            lockToken: installLock.ownerToken
+        )
+        try lockedScript.write(to: fixture.script, atomically: true, encoding: .utf8)
+    }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    process.arguments = [fixture.script.path]
+    process.environment = [
+        "PATH": "/bin:/usr/bin",
+        "WALLPAPERMAC_DITTO": ditto,
+        "WALLPAPERMAC_OPEN": fakeOpen.path,
+        "WALLPAPERMAC_XATTR": "/usr/bin/xattr",
+        "WALLPAPERMAC_CODESIGN": "/usr/bin/true",
+        "WALLPAPERMAC_UPDATE_SWAPPER": fakeSwapper.path,
+        "WALLPAPERMAC_HEALTH_WAIT_STEPS": "2",
+        "WALLPAPERMAC_HEALTH_ACK": healthAck ? "1" : "0",
+        "WALLPAPERMAC_HEALTH_VERSION": "9.9.9",
+        "WALLPAPERMAC_FAIL_ROLLBACK": failRollback ? "1" : "0",
+        "WALLPAPERMAC_SWAP_COUNT": fixture.root.appendingPathComponent("swap-count").path,
+        "OPEN_LOG": fixture.openLog.path,
+        "OPEN_STATUS": String(openStatus),
+    ]
+    process.standardOutput = FileHandle.nullDevice
+    let errorLog = fixture.root.appendingPathComponent("script-error.log")
+    FileManager.default.createFile(atPath: errorLog.path, contents: nil)
+    process.standardError = FileHandle(forWritingAtPath: errorLog.path)
+    if let installLock {
+        process.standardInput = installLock.fileHandle
+    }
+    try process.run()
+    process.waitUntilExit()
+    return process.terminationStatus
+}
+
+private func makeFailingDitto(at url: URL) throws {
+    let script = """
+    #!/bin/zsh
+    mkdir -p "$2/Contents/MacOS"
+    print -r -- 'partial-new' > "$2/Contents/MacOS/WallpaperMac"
+    exit 1
+    """
+    try script.write(to: url, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+}
+
+private func appMarker(_ app: URL) -> String {
+    (try? String(contentsOf: app.appendingPathComponent("Contents/MacOS/WallpaperMac"), encoding: .utf8)) ?? "MISSING"
+}
+
+func testUpdateCopyFailureLeavesOriginalAppUntouched() throws {
+    let fixture = try makeUpdateScriptFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let failingDitto = fixture.root.appendingPathComponent("failing-ditto.sh")
+    try makeFailingDitto(at: failingDitto)
+    let status = try runUpdateScript(fixture, ditto: failingDitto.path, openStatus: 0)
+    try expect(status, equals: 1, "a partial copy must fail the install")
+    try expect(appMarker(fixture.targetApp), equals: "old-complete", "copy failure must leave the old app in place")
+    try expect(!FileManager.default.fileExists(atPath: fixture.targetApp.appendingPathComponent("WallpaperMac.app.previous").path), "rollback must never nest the previous app")
+    try expect(!FileManager.default.fileExists(atPath: fixture.targetApp.appendingPathComponent("Contents/MacOS/WallpaperMac.installing").path), "partial content must not reach the real executable path")
+}
+
+func testUpdateRelaunchFailureRestoresOriginalApp() throws {
+    let fixture = try makeUpdateScriptFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let status = try runUpdateScript(fixture, ditto: "/usr/bin/ditto", openStatus: 1)
+    try expect(status, equals: 1, "a failed relaunch must return failure")
+    try expect(appMarker(fixture.targetApp), equals: "old-complete", "failed relaunch must restore the old app")
+    let previous = fixture.targetApp.appendingPathExtension("previous")
+    try expect(appMarker(previous), equals: "new-complete", "rollback should leave the failed new generation in the backup for diagnosis")
+    try expect(!FileManager.default.fileExists(atPath: fixture.targetApp.appendingPathComponent("WallpaperMac.app.previous").path), "restore must not nest the previous app")
+}
+
+func testUpdateSuccessfulInstallUsesValidatedSibling() throws {
+    let fixture = try makeUpdateScriptFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let status = try runUpdateScript(fixture, ditto: "/usr/bin/ditto", openStatus: 0)
+    try expect(status, equals: 0, "a valid install should succeed")
+    try expect(appMarker(fixture.targetApp), equals: "new-complete", "the validated new app should become the target")
+    try expect(!FileManager.default.fileExists(atPath: fixture.staging.path), "successful install should clean staging")
+    try expect(appMarker(fixture.targetApp.appendingPathExtension("previous")), equals: "old-complete", "one old generation should remain for manual rollback")
+}
+
+func testUpdateRejectsWrongPendingVersionBeforeSwap() throws {
+    let fixture = try makeUpdateScriptFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let script = UpdateInstaller.installScript(
+        parentPID: 999_999_999,
+        sourceAppPath: fixture.sourceApp.path,
+        targetAppPath: fixture.targetApp.path,
+        stagingPath: fixture.staging.path,
+        expectedVersion: "1.0.0"
+    )
+    try script.write(to: fixture.script, atomically: true, encoding: .utf8)
+    let status = try runUpdateScript(fixture, ditto: "/usr/bin/ditto", openStatus: 0)
+    try expect(status, equals: 1, "a wrong pending version must abort the install")
+    try expect(appMarker(fixture.targetApp), equals: "old-complete", "version rejection must not move the old app")
+    try expect(!FileManager.default.fileExists(atPath: fixture.targetApp.appendingPathExtension("previous").path), "version rejection must happen before backup/swap")
+}
+
+func testAtomicSwapKeepsCompleteAppAtTarget() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WallpaperMacAtomicSwapTests", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let pending = root.appendingPathComponent("Pending.app")
+    let target = root.appendingPathComponent("WallpaperMac.app")
+    try writeMiniApp(at: pending, version: "2.0.0", marker: "new-complete")
+    try writeMiniApp(at: target, version: "1.0.0", marker: "old-complete")
+
+    try UpdateInstaller.atomicSwap(pendingAppURL: pending, targetAppURL: target)
+    try expect(appMarker(target), equals: "new-complete", "atomic swap should install the new app")
+    try expect(appMarker(pending), equals: "old-complete", "atomic swap should move the old app to pending")
+
+    // The same operation restores the old generation without deleting target.
+    try UpdateInstaller.atomicSwap(pendingAppURL: pending, targetAppURL: target)
+    try expect(appMarker(target), equals: "old-complete", "swapping back should restore the old app")
+    try expect(appMarker(pending), equals: "new-complete", "swapping back should retain the new app")
+}
+
+func testUpdateOpenWithoutHealthConfirmationRollsBack() throws {
+    let fixture = try makeUpdateScriptFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let status = try runUpdateScript(fixture, ditto: "/usr/bin/ditto", openStatus: 0, healthAck: false)
+    try expect(status, equals: 1, "open success without a health acknowledgement must fail")
+    try expect(appMarker(fixture.targetApp), equals: "old-complete", "an unhealthy launch must restore the old app")
+    try expect(appMarker(fixture.targetApp.appendingPathExtension("previous")), equals: "new-complete", "the failed new generation should remain in the backup")
+}
+
+func testUpdateInstallLockExcludesOtherOwnersAndReleases() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WallpaperMacUpdateLockTests", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let target = root.appendingPathComponent("WallpaperMac.app")
+    try writeMiniApp(at: target, version: "1.0.0", marker: "old-complete")
+
+    var first: UpdateInstallLock? = try UpdateInstallLock(targetAppURL: target)
+    var rejected = false
+    do {
+        _ = try UpdateInstallLock(targetAppURL: target)
+    } catch UpdateInstallError.alreadyInstalling {
+        rejected = true
+    }
+    try expect(rejected, "a second owner must receive alreadyInstalling")
+    try expect(FileManager.default.fileExists(atPath: first!.lockURL.path), "the lock file should remain stable for contenders")
+    let token = first!.ownerToken
+    first = nil
+    var second: UpdateInstallLock? = try UpdateInstallLock(targetAppURL: target)
+    try expect(second != nil, "closing the first descriptor should release the lock")
+    try expect(second!.ownerToken != token, "a new owner needs a fresh token")
+    second = nil
+}
+
+func testInstallScriptUsesInheritedLockAndReleasesAfterHelperExit() throws {
+    let fixture = try makeUpdateScriptFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    var lock: UpdateInstallLock? = try UpdateInstallLock(targetAppURL: fixture.targetApp)
+    let status = try runUpdateScript(
+        fixture,
+        ditto: "/usr/bin/ditto",
+        openStatus: 0,
+        healthAck: true,
+        installLock: lock
+    )
+    if status != 0 {
+        if let errorText = try? String(
+            contentsOf: fixture.root.appendingPathComponent("script-error.log"),
+            encoding: .utf8
+        ) {
+            print(errorText)
+        }
+    }
+    try expect(status, equals: 0, "the helper should accept the inherited target lock")
+    try expect(appMarker(fixture.targetApp), equals: "new-complete", "the locked helper should complete the install")
+    lock = nil
+    let nextLock = try UpdateInstallLock(targetAppURL: fixture.targetApp)
+    _ = nextLock
+}
+
+func testUpdateRollbackFailurePreservesBackupAndDoesNotOpenBrokenTarget() throws {
+    let fixture = try makeUpdateScriptFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let status = try runUpdateScript(
+        fixture,
+        ditto: "/usr/bin/ditto",
+        openStatus: 0,
+        healthAck: false,
+        failRollback: true
+    )
+    try expect(status, equals: 1, "a failed rollback must still return failure")
+    try expect(appMarker(fixture.targetApp), equals: "new-complete", "a failed rollback must not open/replace the target with a partial app")
+    try expect(appMarker(fixture.targetApp.appendingPathExtension("previous")), equals: "old-complete", "the complete old app must remain in the backup")
+    try expect(!FileManager.default.fileExists(atPath: fixture.targetApp.appendingPathComponent("WallpaperMac.app.previous").path), "no nested backup may be created")
+}
+
+func testUpdateHealthHandshakeWritesMatchingTokenAtomically() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WallpaperMacHealthTests", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let token = UUID().uuidString
+    let acknowledgement = root.appendingPathComponent("health").appendingPathComponent("ack.txt")
+    let written = try UpdateHealthHandshake.acknowledge(
+        arguments: ["WallpaperMac", "--update-health-token", token, "--update-health-file", acknowledgement.path],
+        processID: 1234,
+        version: "9.9.9"
+    )
+    try expect(written, "health arguments should be acknowledged")
+    let contents = try String(contentsOf: acknowledgement, encoding: .utf8)
+    try expect(contents.contains("token=\(token)"), "acknowledgement should carry the exact install token")
+    try expect(contents.contains("pid=1234"), "acknowledgement should carry the new process ID")
+    try expect(contents.contains("version=9.9.9"), "acknowledgement should carry the installed version")
+    let ignored = try UpdateHealthHandshake.acknowledge(arguments: ["WallpaperMac"])
+    try expect(!ignored, "an ordinary launch must not write an acknowledgement")
+}
+
 func testUpdateInstallScriptWaitsForParentAndRollsBack() throws {
     let script = UpdateInstaller.installScript(
         parentPID: 4242,
@@ -2005,11 +2504,16 @@ func testUpdateInstallScriptWaitsForParentAndRollsBack() throws {
 
     try expect(script.contains("PARENT_PID=4242"), "script should wait on the updater process")
     try expect(script.contains("while kill -0 \"$PARENT_PID\""), "script must not swap bundles before we exit")
-    try expect(script.contains("mv \"$TARGET_APP\" \"$TARGET_PREVIOUS\""), "previous build should be kept for rollback")
-    try expect(script.contains("/usr/bin/ditto \"$SOURCE_APP\" \"$TARGET_APP\""), "new bundle should be copied with ditto")
-    try expect(script.contains("/usr/bin/xattr -cr \"$TARGET_APP\""), "quarantine bits should be cleared")
-    try expect(script.contains("/usr/bin/open \"$TARGET_APP\""), "relaunch should open the replaced app")
-    try expect(script.contains("mv \"$TARGET_PREVIOUS\" \"$TARGET_APP\""), "failed relaunch must restore the previous build")
+    try expect(script.contains("mv \"$TARGET_PENDING\" \"$TARGET_PREVIOUS\""), "previous build should be kept for rollback")
+    try expect(script.contains("\"$DITTO\" \"$SOURCE_APP\" \"$TARGET_PENDING\""), "new bundle should be copied to a sibling before the swap")
+    try expect(script.contains("--update-swap \"$TARGET_PENDING\" \"$TARGET_APP\""), "complete bundles should be exchanged atomically")
+    try expect(script.contains("SWAP_STARTED=1"), "signal cleanup must track an in-flight swap")
+    try expect(script.contains("SWAPPED == 0 && SWAP_STARTED == 0"), "an in-flight swap must never have its pending backup deleted")
+    try expect(script.contains("--update-lock-check \"$LOCK_PATH\" \"$LOCK_TOKEN\""), "the Swift helper should verify the inherited lock without Python")
+    try expect(script.contains("mv \"$TARGET_PENDING\" \"$TARGET_PREVIOUS\""), "the outgoing app should be retained as the backup")
+    try expect(script.contains("\"$XATTR\" -cr \"$TARGET_APP\""), "quarantine bits should be cleared")
+    try expect(script.contains("\"$OPEN\" -n \"$TARGET_APP\""), "relaunch should create a fresh instance even if an old instance remains")
+    try expect(script.contains("--update-swap \"$BACKUP_APP\" \"$TARGET_APP\""), "rollback should atomically exchange the backup and target")
     try expect(script.contains("rm -rf \"$STAGING_DIR\""), "staging directory should be cleaned after success")
 }
 
@@ -2361,6 +2865,619 @@ func testMigrationResumesFromPlanAfterPartialWrite() throws {
     try expect(bindings.first?.activeQueueID, equals: queues.first(where: { !$0.isDefault })?.id ?? bindings.first?.activeQueueID, "binding should reference a migrated queue")
 }
 
+func testQueueLoadFailureBlocksWritesAndPreservesBytes() throws {
+    let fixture = try Fixture()
+    try FileManager.default.createDirectory(at: fixture.library, withIntermediateDirectories: true)
+    let queuesURL = fixture.library.appendingPathComponent("playback-queues.json")
+    let bindingsURL = fixture.library.appendingPathComponent("display-playback-bindings.json")
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    try encoder.encode([PlaybackQueue.defaultQueue]).write(to: queuesURL)
+    try encoder.encode([DisplayPlaybackBinding]()).write(to: bindingsURL)
+    let originalBindings = try Data(contentsOf: bindingsURL)
+
+    let corruptQueues = Data("{not json".utf8)
+    try corruptQueues.write(to: queuesURL)
+
+    let store = WallpaperStore(libraryURL: fixture.library)
+    let result = store.loadPlaybackQueueConfiguration()
+    try expect(result.blocksPersistence, equals: true, "a corrupt queue file must block persistence")
+    var queuesFailed = false
+    if case .failed = result.queuesFile { queuesFailed = true }
+    try expect(queuesFailed, "the queue file should be reported as failed")
+    try expect(result.bindingsFile, equals: .loaded, "readable bindings should still load")
+    try expect(result.queues, equals: [PlaybackQueue.defaultQueue], "the fallback queue should stay in memory")
+
+    var queueSaveThrew = false
+    do {
+        try store.save(playbackQueues: [PlaybackQueue.defaultQueue])
+    } catch WallpaperStoreError.queuePersistenceBlocked(_) {
+        queueSaveThrew = true
+    }
+    try expect(queueSaveThrew, "queue saves must be blocked after a load failure")
+
+    var bindingSaveThrew = false
+    do {
+        try store.save(displayPlaybackBindings: [])
+    } catch WallpaperStoreError.queuePersistenceBlocked(_) {
+        bindingSaveThrew = true
+    }
+    try expect(bindingSaveThrew, "binding saves must be blocked after a load failure")
+
+    try expect(try Data(contentsOf: queuesURL), equals: corruptQueues, "a blocked save must not rewrite the corrupt file")
+    try expect(try Data(contentsOf: bindingsURL), equals: originalBindings, "a blocked save must not rewrite bindings")
+}
+
+func testMissingQueueFilesAllowWrites() throws {
+    let fixture = try Fixture()
+    let store = WallpaperStore(libraryURL: fixture.library)
+    let result = store.loadPlaybackQueueConfiguration()
+    try expect(result.queuesFile, equals: .missing, "a new library has no queue file")
+    try expect(result.bindingsFile, equals: .missing, "a new library has no bindings file")
+    try expect(result.blocksPersistence, equals: false, "missing files must not block writes")
+
+    try store.save(playbackQueues: [.defaultQueue], displayPlaybackBindings: [])
+    let reloaded = WallpaperStore(libraryURL: fixture.library).loadPlaybackQueueConfiguration()
+    try expect(reloaded.blocksPersistence, equals: false, "saved files should load cleanly")
+    try expect(reloaded.queues.count, equals: 1, "default queue should persist")
+}
+
+func testQueueLoadRecoversAfterRepair() throws {
+    let fixture = try Fixture()
+    try FileManager.default.createDirectory(at: fixture.library, withIntermediateDirectories: true)
+    let queuesURL = fixture.library.appendingPathComponent("playback-queues.json")
+    let bindingsURL = fixture.library.appendingPathComponent("display-playback-bindings.json")
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    let validQueues = try encoder.encode([PlaybackQueue.defaultQueue])
+    let validBindings = try encoder.encode([DisplayPlaybackBinding]())
+    try validQueues.write(to: queuesURL)
+    try validBindings.write(to: bindingsURL)
+
+    let store = WallpaperStore(libraryURL: fixture.library)
+    try Data("{broken".utf8).write(to: queuesURL)
+    try expect(store.loadPlaybackQueueConfiguration().blocksPersistence, equals: true, "corrupt file should block")
+
+    // The user repairs the file outside the app; reloading the same store
+    // must clear the block and allow writes again.
+    try validQueues.write(to: queuesURL)
+    let repaired = store.loadPlaybackQueueConfiguration()
+    try expect(repaired.blocksPersistence, equals: false, "a repaired file should unblock persistence")
+    try store.save(playbackQueues: [PlaybackQueue.defaultQueue], displayPlaybackBindings: [])
+}
+
+func testLibraryPersistenceGateBlocksAfterLoadFailure() throws {
+    var gate = LibraryPersistenceGate()
+    try expect(gate.blocksPersistence, equals: false, "a fresh gate should allow persistence")
+    gate.recordLoadFailure("播放队列读取失败")
+    try expect(gate.blocksPersistence, equals: true, "a load failure must block persistence")
+    try expect(gate.loadError, equals: "播放队列读取失败", "the load error should stay visible")
+    gate.recordLoadFailure("显示器绑定读取失败")
+    try expect(gate.loadError, equals: "播放队列读取失败", "the first failure should be kept")
+    gate.recordSuccessfulLoad()
+    try expect(gate.blocksPersistence, equals: false, "a successful reload should unblock persistence")
+    try expect(gate.loadError, equals: nil, "a successful reload should clear the error")
+}
+
+func testVideoPlaybackProgressUsesActualTimeAndDuration() throws {
+    var tracker = VideoPlaybackProgressTracker()
+    var sample = tracker.sample(currentTime: 0, duration: nil)
+    try expect(!sample.advanced, "the first timestamp establishes a baseline")
+    try expect(sample.durationSeconds, equals: nil, "unknown duration stays unknown")
+
+    sample = tracker.sample(currentTime: 1, duration: nil)
+    try expect(sample.advanced, "forward playback time is a heartbeat")
+
+    sample = tracker.sample(currentTime: 1, duration: nil)
+    try expect(!sample.advanced, "a frozen timestamp is not a heartbeat")
+
+    sample = tracker.sample(currentTime: 0.5, duration: nil)
+    try expect(!sample.advanced, "seeking backwards is not forward progress")
+
+    sample = tracker.sample(currentTime: 2, duration: 600)
+    try expect(sample.advanced, "progress continues after a seek")
+    try expect(sample.durationChanged, "a newly available duration must be published")
+    try expect(sample.durationSeconds, equals: 600, "the actual duration is now known")
+
+    tracker.resetClock()
+    sample = tracker.sample(currentTime: 3, duration: 600)
+    try expect(!sample.advanced, "resume establishes a fresh time baseline without counting paused time")
+
+    sample = tracker.sample(currentTime: 4, duration: nil)
+    try expect(sample.durationSeconds, equals: 600, "an unavailable later duration must not clear a known duration")
+    try expect(!sample.durationChanged, "an unavailable later duration must not re-arm the watchdog")
+}
+
+func testExternalNavigationRequiresOneShotNativeGesture() throws {
+    let url = URL(string: "https://Example.com:443/docs")!
+    let equivalent = URL(string: "https://example.com/docs")!
+    let now: TimeInterval = 100
+    var gate = ExternalNavigationAuthorizer()
+
+    try expect(
+        !gate.consume(url: url, now: now, interactionEnabled: true, isPlaying: true, isSystemSuspended: false),
+        "script-generated navigation without a native gesture must be denied"
+    )
+
+    gate.prepare(url: url, now: now, interactionEnabled: true, isPlaying: true, isSystemSuspended: false)
+    try expect(
+        gate.consume(url: equivalent, now: now, interactionEnabled: true, isPlaying: true, isSystemSuspended: false),
+        "one native gesture should authorize the equivalent absolute URL once"
+    )
+    try expect(
+        !gate.consume(url: url, now: now, interactionEnabled: true, isPlaying: true, isSystemSuspended: false),
+        "the same gesture must not authorize a second navigation"
+    )
+
+    gate.prepare(url: url, now: now, interactionEnabled: true, isPlaying: true, isSystemSuspended: false)
+    try expect(
+        !gate.consume(url: url, now: now + 2, interactionEnabled: true, isPlaying: true, isSystemSuspended: false),
+        "an expired gesture must not open a browser"
+    )
+
+    gate.prepare(url: url, now: now, interactionEnabled: true, isPlaying: true, isSystemSuspended: false)
+    try expect(
+        !gate.consume(url: URL(string: "https://example.com/other")!, now: now, interactionEnabled: true, isPlaying: true, isSystemSuspended: false),
+        "a gesture must only authorize its original target URL"
+    )
+
+    gate.prepare(url: url, now: now, interactionEnabled: true, isPlaying: true, isSystemSuspended: false)
+    try expect(
+        !gate.consume(url: url, now: now, interactionEnabled: false, isPlaying: true, isSystemSuspended: false),
+        "interaction-disabled wallpaper must not open a browser"
+    )
+
+    gate.prepare(url: url, now: now, interactionEnabled: true, isPlaying: true, isSystemSuspended: false)
+    try expect(
+        !gate.consume(url: url, now: now, interactionEnabled: true, isPlaying: false, isSystemSuspended: false),
+        "a paused wallpaper must not open a browser"
+    )
+
+    gate.prepare(url: url, now: now, interactionEnabled: true, isPlaying: true, isSystemSuspended: true)
+    try expect(
+        !gate.consume(url: url, now: now, interactionEnabled: true, isPlaying: true, isSystemSuspended: true),
+        "a system-suspended wallpaper must not open a browser"
+    )
+}
+
+func testWebContentRecoveryUsesBoundedBackoffAndHealthyReset() throws {
+    var state = WebContentRecoveryState(maximumAttempts: 3)
+    try expect(state.nextDelay(isPlaying: true, isSystemSuspended: false), equals: 1, "first recovery should be delayed by one second")
+    try expect(state.nextDelay(isPlaying: true, isSystemSuspended: false), equals: 2, "second recovery should back off to two seconds")
+    try expect(state.nextDelay(isPlaying: true, isSystemSuspended: false), equals: 4, "third recovery should back off to four seconds")
+    try expect(state.isExhausted, "the third attempt exhausts the budget")
+    try expect(state.nextDelay(isPlaying: true, isSystemSuspended: false), equals: nil, "no further reload after the budget is exhausted")
+    state.markHealthy()
+    try expect(state.attempts, equals: 0, "a stable healthy interval resets the budget")
+    try expect(state.nextDelay(isPlaying: true, isSystemSuspended: false), equals: 1, "a new failure after stability gets a fresh budget")
+
+    var paused = WebContentRecoveryState()
+    try expect(paused.nextDelay(isPlaying: false, isSystemSuspended: false), equals: nil, "manual pause must not schedule recovery")
+    try expect(paused.nextDelay(isPlaying: true, isSystemSuspended: true), equals: nil, "system suspension must not schedule recovery")
+}
+
+func testDisplayReconcilerDoesNotRebuildUnchangedScreens() throws {
+    try expect(
+        DisplayReconciler.action(
+            isConnected: true,
+            wasConnected: true,
+            hasController: true,
+            geometryChanged: false,
+            currentItemMatches: true,
+            expectedItemAvailable: true
+        ),
+        equals: .keep,
+        "an unrelated screen event must keep the existing player"
+    )
+    try expect(
+        DisplayReconciler.action(
+            isConnected: true,
+            wasConnected: true,
+            hasController: true,
+            geometryChanged: true,
+            currentItemMatches: true,
+            expectedItemAvailable: true
+        ),
+        equals: .updateFrame,
+        "a geometry-only change should update the frame without a new player"
+    )
+    try expect(
+        DisplayReconciler.action(
+            isConnected: false,
+            wasConnected: true,
+            hasController: true,
+            geometryChanged: false,
+            currentItemMatches: true,
+            expectedItemAvailable: true
+        ),
+        equals: .disconnect,
+        "a disconnected display releases its playback resources"
+    )
+    try expect(
+        DisplayReconciler.action(
+            isConnected: true,
+            wasConnected: false,
+            hasController: false,
+            geometryChanged: false,
+            currentItemMatches: false,
+            expectedItemAvailable: true
+        ),
+        equals: .restore,
+        "a reconnected display restores only its own player"
+    )
+    try expect(
+        DisplayReconciler.action(
+            isConnected: true,
+            wasConnected: true,
+            hasController: true,
+            geometryChanged: false,
+            currentItemMatches: true,
+            expectedItemAvailable: false
+        ),
+        equals: .restore,
+        "an unavailable current item needs recovery rather than a no-op"
+    )
+}
+
+func testVideoStreamExitPolicyOnlyLoopsCleanEOF() throws {
+    try expect(
+        VideoStreamExitPolicy.shouldRestartAfterDrain(
+            terminationStatus: 0,
+            loops: true,
+            emittedFrameCount: 1,
+            hasIncompleteTail: false
+        ),
+        "a clean EOF may loop after its frames are drained"
+    )
+    try expect(
+        !VideoStreamExitPolicy.shouldRestartAfterDrain(
+            terminationStatus: 0,
+            loops: false,
+            emittedFrameCount: 1,
+            hasIncompleteTail: false
+        ),
+        "a clean EOF without looping must complete"
+    )
+    try expect(
+        !VideoStreamExitPolicy.shouldRestartAfterDrain(
+            terminationStatus: 1,
+            loops: true,
+            emittedFrameCount: 1,
+            hasIncompleteTail: false
+        ),
+        "a decoder failure must not restart even when looping is enabled"
+    )
+    try expect(
+        !VideoStreamExitPolicy.shouldRestartAfterDrain(
+            terminationStatus: 9,
+            loops: true,
+            emittedFrameCount: 1,
+            hasIncompleteTail: false
+        ),
+        "a signal-style failure must not restart"
+    )
+    try expect(
+        !VideoStreamExitPolicy.shouldRestartAfterDrain(
+            terminationStatus: 0,
+            loops: true,
+            emittedFrameCount: 0,
+            hasIncompleteTail: false
+        ),
+        "a zero-frame EOF must not create a tight loop"
+    )
+    try expect(
+        !VideoStreamExitPolicy.shouldRestartAfterDrain(
+            terminationStatus: 0,
+            loops: true,
+            emittedFrameCount: 1,
+            hasIncompleteTail: true
+        ),
+        "an incomplete tail must not be treated as a clean loop"
+    )
+}
+
+func testVideoFrameBufferDeliversFragmentedTailWithoutLoss() throws {
+    var buffer = VideoFrameBuffer(frameSize: 6)
+    buffer.append(Data([0, 1, 2, 3, 4]))
+    try expect(buffer.nextFrame(), equals: nil, "N-1 bytes must not produce a partial frame")
+    buffer.append(Data([5]))
+    try expect(buffer.nextFrame(), equals: Data([0, 1, 2, 3, 4, 5]), "the last byte must complete the tail frame")
+
+    buffer.append(Data([6, 7, 8, 9, 10, 11, 12]))
+    try expect(buffer.nextFrame(), equals: Data([6, 7, 8, 9, 10, 11]), "frames must preserve byte order")
+    try expect(buffer.count, equals: 1, "one incomplete trailing byte should remain buffered")
+    try expect(buffer.nextFrame(), equals: nil, "an incomplete EOF tail must not be emitted as a frame")
+}
+
+func testPlaybackDeadlineMathPreservesRemainingTime() throws {
+    let now = Date(timeIntervalSince1970: 100)
+    let deadline = Date(timeIntervalSince1970: 125)
+    let remaining = PlaybackDeadlineMath.remaining(fireDate: deadline, now: now)
+    try expect(remaining, equals: 25, "pausing at t=100 must preserve the t=125 deadline")
+    try expect(
+        PlaybackDeadlineMath.interval(full: 30, remaining: remaining, resume: true),
+        equals: 25,
+        "resume must use the saved remaining interval"
+    )
+    try expect(
+        PlaybackDeadlineMath.interval(full: 30, remaining: nil, resume: true),
+        equals: 30,
+        "a missing snapshot falls back to a full interval"
+    )
+    let expired = PlaybackDeadlineMath.remaining(fireDate: deadline, now: Date(timeIntervalSince1970: 200))
+    try expect(expired, equals: 0, "an expired deadline must clamp to zero")
+}
+
+func testPerWallpaperFitOverridePersistsAndLegacyRecordsInherit() throws {
+    let fixture = try Fixture()
+    let source = fixture.root.appendingPathComponent("photo.png")
+    try Data("png".utf8).write(to: source)
+    let item = try fixture.store.importItem(at: source, storageMode: .externalReference)
+    try expect(item.fitModeOverride, equals: nil, "new items inherit the global fill mode")
+    var updated = item
+    updated.fitModeOverride = .stretch
+    try fixture.store.save(items: [updated])
+    let reloaded = try WallpaperStore(libraryURL: fixture.library).items().first
+    try expect(reloaded?.fitModeOverride, equals: .stretch, "per-wallpaper override must persist")
+    try expect(reloaded?.effectiveFitMode(global: .fit), equals: .stretch, "an explicit override must survive later global changes")
+    var inheriting = reloaded
+    inheriting?.fitModeOverride = nil
+    try expect(inheriting?.effectiveFitMode(global: .tile), equals: .tile, "clearing the override must follow the current global mode")
+
+    let legacyJSON = """
+    {"id":"11111111-2222-3333-4444-555555555555","name":"legacy","type":"image","sourceURL":"file:///tmp/old.png","storageMode":"externalReference"}
+    """
+    let legacy = try JSONDecoder().decode(WallpaperItem.self, from: Data(legacyJSON.utf8))
+    try expect(legacy.fitModeOverride, equals: nil, "legacy records without the field keep inheriting the global default")
+    try expect(legacy.effectiveFitMode(global: .fill), equals: .fill, "legacy records inherit the global fill default")
+}
+
+func testFieldLevelUpdatesPreserveOtherChanges() throws {
+    let fixture = try Fixture()
+    let source = fixture.root.appendingPathComponent("photo.png")
+    try Data("png".utf8).write(to: source)
+    let item = try fixture.store.importItem(at: source, storageMode: .externalReference)
+    let updated = try fixture.store.updateFitModeOverride(id: item.id, mode: .fit)
+    try expect(updated.fitModeOverride, equals: .fit, "field update must persist the override")
+    let touched = try fixture.store.touchLastUsed(id: item.id, date: Date(timeIntervalSince1970: 42))
+    try expect(touched.fitModeOverride, equals: .fit, "last-used writes must not clobber the override")
+    let reloaded = try WallpaperStore(libraryURL: fixture.library).items().first
+    try expect(reloaded?.fitModeOverride, equals: .fit, "override must survive a reload")
+    try expect(reloaded?.lastUsedAt?.timeIntervalSince1970, equals: 42, "last-used field must survive a reload")
+    let cleared = try fixture.store.updateFitModeOverride(id: item.id, mode: nil)
+    try expect(cleared.fitModeOverride, equals: nil, "clearing the override must persist")
+}
+
+func testFillCoversPortraitViewportOnBothAxes() throws {
+    let contentSize = CGSize(width: 1920, height: 1080)
+    let viewport = CGRect(x: 0, y: 0, width: 1600, height: 2560)
+    let scale = max(viewport.width / contentSize.width, viewport.height / contentSize.height)
+    let scaledSize = CGSize(width: contentSize.width * scale, height: contentSize.height * scale)
+    try expect(scaledSize.width >= viewport.width && scaledSize.height >= viewport.height, "fill must cover both viewport axes")
+    try expect(scaledSize.width > viewport.width, "16:9 content in a portrait 16:10 viewport must crop horizontal overflow")
+
+    let sourceContext = CGContext(
+        data: nil,
+        width: Int(contentSize.width),
+        height: Int(contentSize.height),
+        bitsPerComponent: 8,
+        bytesPerRow: 0,
+        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    )!
+    sourceContext.setFillColor(NSColor.red.cgColor)
+    sourceContext.fill(CGRect(origin: .zero, size: contentSize))
+    let sourceImage = sourceContext.makeImage()!
+
+    func render(_ mode: WallpaperFitMode) throws -> NSBitmapImageRep {
+        let content = CALayer()
+        content.contents = sourceImage
+        let presentation = WallpaperLayerLayout.make(
+            content: content,
+            originalSize: contentSize,
+            bounds: viewport,
+            mode: mode
+        )
+        let canvas = CALayer()
+        canvas.frame = viewport
+        canvas.backgroundColor = NSColor.black.cgColor
+        canvas.masksToBounds = true
+        canvas.addSublayer(presentation)
+        let context = CGContext(
+            data: nil,
+            width: Int(viewport.width),
+            height: Int(viewport.height),
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        canvas.render(in: context)
+        return NSBitmapImageRep(cgImage: context.makeImage()!)
+    }
+
+    func isRed(_ color: NSColor?) -> Bool {
+        guard let color else { return false }
+        return color.redComponent > 0.9 && color.greenComponent < 0.1 && color.blueComponent < 0.1
+    }
+    func isBlack(_ color: NSColor?) -> Bool {
+        guard let color else { return false }
+        return color.redComponent < 0.1 && color.greenComponent < 0.1 && color.blueComponent < 0.1
+    }
+
+    let filled = try render(.fill)
+    for (x, y) in [(0, 1280), (1599, 1280), (800, 0), (800, 2559)] {
+        try expect(isRed(filled.colorAt(x: x, y: y)), "fill must cover the viewport edge at \(x),\(y)")
+    }
+    let fitted = try render(.fit)
+    try expect(isBlack(fitted.colorAt(x: 800, y: 0)), "fit must preserve the aspect-fit letterbox control")
+    try expect(isRed(fitted.colorAt(x: 800, y: 1280)), "fit must still render the complete source in the center")
+
+    let playerLayer = AVPlayerLayer()
+    let playerPresentation = WallpaperLayerLayout.make(content: playerLayer, originalSize: contentSize, bounds: viewport, mode: .fill)
+    try expect(playerPresentation === playerLayer, "fill should install the original player layer")
+    try expect(playerLayer.frame, equals: viewport, "AVPlayerLayer must cover the full portrait viewport")
+    try expect(playerLayer.videoGravity, equals: .resizeAspectFill, "AVPlayerLayer fill must use aspect-fill")
+
+    let displayLayer = AVSampleBufferDisplayLayer()
+    let displayPresentation = WallpaperLayerLayout.make(content: displayLayer, originalSize: contentSize, bounds: viewport, mode: .fill)
+    try expect(displayPresentation === displayLayer, "fill should install the original sample-buffer layer")
+    try expect(displayLayer.frame, equals: viewport, "ffmpeg display layer must cover the full portrait viewport")
+    try expect(displayLayer.videoGravity, equals: .resizeAspectFill, "ffmpeg fill must use aspect-fill")
+}
+
+func testFitModesAndTileLayout() throws {
+    try expect(WallpaperFitMode.allCases, equals: [.fill, .fit, .stretch, .tile], "all four fit modes should be exposed")
+    try expect(WallpaperFitMode.fill.title, equals: "填充", "fill label")
+    try expect(WallpaperFitMode.fit.title, equals: "适应", "fit label")
+    try expect(WallpaperFitMode.stretch.title, equals: "拉伸", "stretch label")
+    try expect(WallpaperFitMode.tile.title, equals: "平铺", "tile label")
+    try expect(WallpaperFitMode.stretch.preservesAspectRatio, equals: false, "stretch may distort the aspect ratio")
+    try expect(WallpaperFitMode.tile.preservesAspectRatio, equals: true, "each tile must preserve its own ratio")
+
+    let grid = WallpaperTileLayout.grid(
+        originalSize: CGSize(width: 100, height: 50),
+        bounds: CGSize(width: 250, height: 120)
+    )
+    try expect(grid?.columns, equals: 3, "tile columns should cover the width")
+    try expect(grid?.rows, equals: 3, "tile rows should cover the height")
+    try expect(grid?.tileSize, equals: CGSize(width: 100, height: 50), "tiles must retain native dimensions")
+
+    let retina = WallpaperTileLayout.grid(
+        originalSize: CGSize(width: 32, height: 16),
+        bounds: CGSize(width: 250, height: 120),
+        contentScale: 2
+    )
+    try expect(retina?.tileSize, equals: CGSize(width: 16, height: 8), "on a 2x screen a pixel-sized tile must use half as many points")
+    try expect(retina?.columns, equals: 16, "retina tile columns must be recomputed from point size")
+    try expect(retina?.rows, equals: 15, "retina tile rows must be recomputed from point size")
+
+    let huge = WallpaperTileLayout.grid(
+        originalSize: CGSize(width: 0.1, height: 0.1),
+        bounds: CGSize(width: 2560, height: 1440)
+    )
+    try expect(huge, equals: nil, "pathological tiny assets must not request an unbounded tile grid")
+    let overflowing = WallpaperTileLayout.grid(
+        originalSize: CGSize(width: 1e-20, height: 1e-20),
+        bounds: CGSize(width: 2560, height: 1440)
+    )
+    try expect(overflowing, equals: nil, "extreme positive dimensions must return nil instead of overflowing Int")
+}
+
+func testPlaybackSchedulingStateSeparatesPauseFromQueueStop() throws {
+    let running = PlaybackSchedulingState(
+        isQueueEnabled: true,
+        isPlaybackWanted: true,
+        isSystemSuspended: false,
+        isDisplayConnected: true
+    )
+    try expect(running.shouldSchedule, "an enabled, playing, connected queue should schedule")
+
+    let manuallyPaused = PlaybackSchedulingState(
+        isQueueEnabled: true,
+        isPlaybackWanted: false,
+        isSystemSuspended: false,
+        isDisplayConnected: true
+    )
+    try expect(!manuallyPaused.shouldAdvance, "manual pause must not advance even though the queue stays enabled")
+
+    let systemSuspended = PlaybackSchedulingState(
+        isQueueEnabled: true,
+        isPlaybackWanted: true,
+        isSystemSuspended: true,
+        isDisplayConnected: true
+    )
+    try expect(!systemSuspended.shouldAdvance, "system suspension must not advance or change queue intent")
+
+    let resumed = PlaybackSchedulingState(
+        isQueueEnabled: true,
+        isPlaybackWanted: true,
+        isSystemSuspended: false,
+        isDisplayConnected: true
+    )
+    try expect(resumed.shouldAdvance, "resume should schedule again")
+
+    let disconnected = PlaybackSchedulingState(
+        isQueueEnabled: true,
+        isPlaybackWanted: true,
+        isSystemSuspended: false,
+        isDisplayConnected: false
+    )
+    try expect(!disconnected.shouldAdvance, "a disconnected display must not advance")
+}
+
+func testPlaybackIndexReconcilerKeepsCurrentItemAndChoosesSuccessor() throws {
+    let a = UUID()
+    let b = UUID()
+    let c = UUID()
+    try expect(
+        PlaybackIndexReconciler.reconciledIndex(currentItemID: b, fallbackIndex: 1, remainingIDs: [b, c]),
+        equals: 0,
+        "removing an earlier member must keep the same current item"
+    )
+    try expect(
+        PlaybackIndexReconciler.reconciledIndex(currentItemID: nil, fallbackIndex: 1, remainingIDs: [a, c]),
+        equals: 1,
+        "removing the current item must choose its successor"
+    )
+    try expect(
+        PlaybackIndexReconciler.reconciledIndex(currentItemID: nil, fallbackIndex: 2, remainingIDs: [a]),
+        equals: 0,
+        "removing the last member must clamp to the previous item"
+    )
+    try expect(
+        PlaybackIndexReconciler.reconciledIndex(currentItemID: nil, fallbackIndex: 0, remainingIDs: []),
+        equals: 0,
+        "an empty queue keeps index zero"
+    )
+}
+
+func testEmptyModernBindingsDoNotRetireNonEmptyLegacyQueues() throws {
+    let fixture = try Fixture()
+    try FileManager.default.createDirectory(at: fixture.library, withIntermediateDirectories: true)
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+
+    let wallpaperIDs = [UUID(), UUID()]
+    let legacy = DisplayPlaybackQueue(
+        displayID: "display-1",
+        displayName: "内置屏幕",
+        wallpaperIDs: wallpaperIDs,
+        intervalSeconds: 45,
+        transition: .zoom,
+        isEnabled: true,
+        currentIndex: 1
+    )
+    let legacyURL = fixture.library.appendingPathComponent("display-queues.json")
+    try encoder.encode([legacy]).write(to: legacyURL)
+
+    // A stale modern queues file with an empty bindings file looks decodable,
+    // but it carries none of the legacy display state.
+    let modernQueue = PlaybackQueue(name: "现代队列", wallpaperIDs: [])
+    try encoder.encode([PlaybackQueue.defaultQueue, modernQueue])
+        .write(to: fixture.library.appendingPathComponent("playback-queues.json"))
+    try encoder.encode([DisplayPlaybackBinding]())
+        .write(to: fixture.library.appendingPathComponent("display-playback-bindings.json"))
+
+    let store = WallpaperStore(libraryURL: fixture.library)
+    let queues = try store.playbackQueues()
+    let bindings = try store.displayPlaybackBindings()
+
+    try expect(bindings.map(\.displayID), equals: ["display-1"], "empty modern bindings must not retire legacy display state")
+    guard let binding = bindings.first else {
+        throw TestFailure(message: "re-migrated binding should exist")
+    }
+    let migratedQueue = queues.first(where: { $0.id == binding.activeQueueID })
+    try expect(migratedQueue?.isDefault, equals: false, "migrated binding should reference a non-default queue")
+    try expect(migratedQueue?.wallpaperIDs, equals: wallpaperIDs, "migrated queue should preserve legacy membership")
+    let state = binding.queueStates[binding.activeQueueID]
+    try expect(state?.currentIndex, equals: 1, "migrated binding should preserve progress")
+    try expect(state?.isEnabled, equals: true, "migrated binding should preserve enabled state")
+    let marker = fixture.library.appendingPathComponent("display-queues.migrated")
+    try expect(FileManager.default.fileExists(atPath: marker.path), "regenerated migration should commit")
+    try expect(FileManager.default.fileExists(atPath: legacyURL.path) == false, "legacy should be retired only after regeneration")
+}
+
 func testModernQueueValidationRequiresCrossReferences() throws {
     let fixture = try Fixture()
     try FileManager.default.createDirectory(at: fixture.library, withIntermediateDirectories: true)
@@ -2417,7 +3534,6 @@ func testWallpaperItemLegacyDecodeUsesSafeFallbacks() throws {
 func testDropURLCollectorPreservesOrderAndDrainsOnce() throws {
     let collector = DropURLCollector(providerCount: 3)
     let a = URL(fileURLWithPath: "/tmp/a.png")
-    let b = URL(fileURLWithPath: "/tmp/b.png")
     let c = URL(fileURLWithPath: "/tmp/c.png")
 
     // Out-of-order completion must still produce drag order.

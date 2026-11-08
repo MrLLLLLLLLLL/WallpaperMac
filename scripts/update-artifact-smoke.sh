@@ -1,19 +1,24 @@
 #!/bin/zsh
 set -euo pipefail
 
-# End-to-end smoke for the update verification contract against the real
-# GitHub release the app will see at runtime:
-#   1. Resolve latest release assets through the GitHub API.
-#   2. Parse SHA256SUMS.txt the same way UpdateArtifactVerifier does.
-#   3. Confirm a real artifact (when downloadable) matches its published hash.
-#   4. Confirm a corrupted copy no longer matches.
+# Production mode verifies the real release contract used by clients. An
+# explicit --diagnostic mode may inspect a local rebuild after a network
+# failure, but never reports that diagnostic as a passing production check.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STAGING="$(mktemp -d "${TMPDIR:-/tmp}/wallpapermac-update-smoke.XXXXXX")"
 trap 'rm -rf "$STAGING"' EXIT
 
+DIAGNOSTIC=0
+if [[ "${1:-}" == "--diagnostic" ]]; then
+    DIAGNOSTIC=1
+elif [[ $# -gt 0 ]]; then
+    echo "usage: $0 [--diagnostic]" >&2
+    exit 2
+fi
+
 REPO="MrLLLLLLLLLL/WallpaperMac"
-API="https://api.github.com/repos/$REPO/releases/latest"
+API="${WALLPAPERMAC_UPDATE_API_URL:-https://api.github.com/repos/$REPO/releases/latest}"
 
 echo "== Resolve latest release assets =="
 RELEASE_JSON="$STAGING/release.json"
@@ -22,23 +27,28 @@ curl --http1.1 -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
     "$API" -o "$RELEASE_JSON"
 
 read -r ZIP_URL SUMS_URL SIG_URL TAG < <(python3 - "$RELEASE_JSON" <<'PY'
-import json, sys
+import json, re, sys
 release = json.load(open(sys.argv[1]))
+tag = release.get("tag_name", "")
+version = tag[1:] if tag[:1] in ("v", "V") else tag
+if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+    raise SystemExit("release tag is not a major.minor.patch version")
 assets = {a["name"]: a["browser_download_url"] for a in release.get("assets", [])}
-zip_url = sums_url = sig_url = None
-for name, url in assets.items():
-    if name.startswith("WallpaperMac") and name.endswith("-macOS.zip"):
-        zip_url = url
-    elif name.startswith("WallpaperMac") and name.endswith("SHA256SUMS.txt"):
-        sums_url = url
-    elif name.startswith("WallpaperMac") and name.endswith("-macOS.zip.sig"):
-        sig_url = url
-print(zip_url or "-", sums_url or "-", sig_url or "-", release.get("tag_name", "-"))
+zip_name = f"WallpaperMac-v{version}-macOS.zip"
+sums_name = f"WallpaperMac-v{version}-SHA256SUMS.txt"
+sig_name = zip_name + ".sig"
+# Only the exact assets for this release tag are valid. Older assets in the
+# same release must not make this check pass for a version clients reject.
+print(assets.get(zip_name) or "-", assets.get(sums_name) or "-", assets.get(sig_name) or "-", tag or "-")
 PY
 )
 
 if [[ "$ZIP_URL" == "-" || "$SUMS_URL" == "-" ]]; then
     echo "ERROR: latest release is missing the zip or SHA256SUMS asset." >&2
+    exit 1
+fi
+if [[ "$SIG_URL" == "-" && "$DIAGNOSTIC" == 0 ]]; then
+    echo "ERROR: latest release is missing the required .zip.sig asset." >&2
     exit 1
 fi
 echo "tag=$TAG"
@@ -69,52 +79,75 @@ for line in sums_text.splitlines():
         break
 PY
 )"
-
-if [[ -z "$EXPECTED" ]]; then
+if [[ -z "$EXPECTED" && "$DIAGNOSTIC" == 0 ]]; then
     echo "ERROR: no checksum row for $ZIP_NAME" >&2
     exit 1
 fi
-echo "published checksum for $ZIP_NAME: $EXPECTED"
-echo "PASS: SHA256SUMS.txt parses and covers the release zip"
+if [[ -n "$EXPECTED" ]]; then
+    echo "published checksum for $ZIP_NAME: $EXPECTED"
+    echo "PASS: SHA256SUMS.txt parses and covers the release zip"
+else
+    echo "WARN: no checksum row for $ZIP_NAME; diagnostic mode cannot validate it."
+fi
 
 echo "== Download artifact and verify =="
 if curl --http1.1 -fL --retry 5 --retry-delay 3 --retry-all-errors \
     -H "User-Agent: WallpaperMac-smoke" "$ZIP_URL" -o "$STAGING/artifact.zip"; then
     ACTUAL="$(shasum -a 256 "$STAGING/artifact.zip" | awk '{print $1}')"
     echo "actual=$ACTUAL"
-    if [[ "$EXPECTED" != "$ACTUAL" ]]; then
-        echo "ERROR: downloaded artifact failed checksum verification." >&2
-        exit 1
+    if [[ -n "$EXPECTED" ]]; then
+        if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+            echo "ERROR: downloaded artifact failed checksum verification." >&2
+            exit 1
+        fi
+        echo "PASS: real release artifact matches its published checksum"
+    else
+        echo "WARN: downloaded artifact has no checksum row; diagnostic mode cannot validate its hash."
     fi
-    echo "PASS: real release artifact matches its published checksum"
 
-    if [[ "$SIG_URL" != "-" ]]; then
+    # Verify against the public key embedded in the shipping app, not a
+    # different local key file that could silently drift from it.
+    python3 - "$ROOT/Sources/WallpaperMacCore/Update/UpdateSignature.swift" "$STAGING/embedded.pub" <<'PY'
+import pathlib, re, sys
+source = pathlib.Path(sys.argv[1]).read_text()
+match = re.search(r'releasePublicKeyBase64\s*=\s*"([^"]+)"', source)
+if not match:
+    raise SystemExit('embedded release public key not found')
+pathlib.Path(sys.argv[2]).write_text(match.group(1) + '\n')
+PY
+    if [[ "$SIG_URL" == "-" ]]; then
+        echo "WARN: release has no .zip.sig asset; diagnostic mode only."
+    else
         curl --http1.1 -fsSL --retry 3 --retry-delay 2 -H "User-Agent: WallpaperMac-smoke" \
             "$SIG_URL" -o "$STAGING/artifact.zip.sig"
         if swift "$ROOT/scripts/update-signing-tool.swift" verify \
-            "$STAGING/artifact.zip" "$STAGING/artifact.zip.sig" "$ROOT/secrets/WallpaperMac.update.key.pub"; then
-            echo "PASS: release artifact signature verifies"
+            "$STAGING/artifact.zip" "$STAGING/artifact.zip.sig" "$STAGING/embedded.pub"; then
+            echo "PASS: release artifact signature verifies against the embedded public key"
         else
             echo "ERROR: release artifact signature failed verification." >&2
             exit 1
         fi
-    else
-        echo "WARN: release has no .zip.sig asset (legacy unsigned release)."
     fi
 
-    printf 'x' >> "$STAGING/artifact.zip"
-    TAMPERED="$(shasum -a 256 "$STAGING/artifact.zip" | awk '{print $1}')"
-    if [[ "$TAMPERED" == "$EXPECTED" ]]; then
-        echo "ERROR: tampered artifact unexpectedly matched the checksum." >&2
+    if [[ -n "$EXPECTED" ]]; then
+        printf 'x' >> "$STAGING/artifact.zip"
+        TAMPERED="$(shasum -a 256 "$STAGING/artifact.zip" | awk '{print $1}')"
+        if [[ "$TAMPERED" == "$EXPECTED" ]]; then
+            echo "ERROR: tampered artifact unexpectedly matched the checksum." >&2
+            exit 1
+        fi
+        echo "PASS: corrupted artifact no longer matches the checksum"
+    fi
+else
+    if [[ "$DIAGNOSTIC" == 0 ]]; then
+        echo "ERROR: release artifact download failed; production verification is not complete." >&2
         exit 1
     fi
-    echo "PASS: corrupted artifact no longer matches the checksum"
-else
-    echo "WARN: artifact download failed; falling back to local dist zip." >&2
+    echo "WARN: artifact download failed; entering explicit local diagnostic mode." >&2
     LOCAL_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
     LOCAL_ZIP="$ROOT/dist/WallpaperMac-v${LOCAL_VERSION}-macOS.zip"
     if [[ ! -f "$LOCAL_ZIP" ]]; then
-        echo "ERROR: no local artifact available for fallback verification." >&2
+        echo "ERROR: no local artifact available for diagnostic comparison." >&2
         exit 1
     fi
     LOCAL_NAME="${LOCAL_ZIP:t}"
@@ -138,17 +171,19 @@ for line in sums_text.splitlines():
 PY
     )"
     if [[ -z "$LOCAL_EXPECTED" ]]; then
-        echo "PASS: local artifact name is not part of the published release (expected for a local build)"
+        echo "WARN: local artifact name is not part of the published release."
     else
         LOCAL_ACTUAL="$(shasum -a 256 "$LOCAL_ZIP" | awk '{print $1}')"
-        if [[ "$LOCAL_EXPECTED" == "$LOCAL_ACTUAL" ]]; then
-            echo "PASS: local artifact matches the published checksum"
-        else
-            echo "PASS: local artifact differs from published release build (expected for a local rebuild)"
-            echo "  published=$LOCAL_EXPECTED"
-            echo "  local=$LOCAL_ACTUAL"
+        if [[ "$LOCAL_EXPECTED" != "$LOCAL_ACTUAL" ]]; then
+            echo "ERROR: local artifact differs from the published checksum." >&2
+            exit 1
         fi
+        echo "Diagnostic: local artifact matches the published checksum"
     fi
 fi
 
-echo "UPDATE_ARTIFACT_SMOKE_PASSED"
+if [[ "$DIAGNOSTIC" == 1 ]]; then
+    echo "UPDATE_ARTIFACT_SMOKE_DIAGNOSTIC_ONLY"
+else
+    echo "UPDATE_ARTIFACT_SMOKE_PASSED"
+fi

@@ -19,12 +19,26 @@ public struct WallpaperLibrarySnapshot: Sendable {
 public struct WallpaperImportCandidate: Identifiable, Sendable {
     public let url: URL
     public let type: WallpaperType?
+    /// Actual file or directory that will be copied/read, shown to the user
+    /// before import. For a single HTML file this is never its parent.
+    public let scopeURL: URL
+    public let fileCount: Int?
+    public let estimatedBytes: Int64?
 
     public var id: URL { url }
 
-    public init(url: URL, type: WallpaperType?) {
+    public init(
+        url: URL,
+        type: WallpaperType?,
+        scopeURL: URL? = nil,
+        fileCount: Int? = nil,
+        estimatedBytes: Int64? = nil
+    ) {
         self.url = url
         self.type = type
+        self.scopeURL = scopeURL ?? url
+        self.fileCount = fileCount
+        self.estimatedBytes = estimatedBytes
     }
 }
 
@@ -76,7 +90,14 @@ public actor WallpaperStoreWorker {
 
     public func inspectImportURLs(_ urls: [URL]) -> WallpaperImportInspection {
         let candidates = urls.map { url in
-            WallpaperImportCandidate(url: url, type: WallpaperType.detect(from: url))
+            let scope = importScope(for: url)
+            return WallpaperImportCandidate(
+                url: url,
+                type: WallpaperType.detect(from: url),
+                scopeURL: url,
+                fileCount: scope.count,
+                estimatedBytes: scope.bytes
+            )
         }
         let webDirectories = candidates.compactMap { candidate -> URL? in
             guard candidate.type == .web, candidate.url.isExistingDirectory else { return nil }
@@ -156,6 +177,17 @@ public actor WallpaperStoreWorker {
         try store.update(item: item)
     }
 
+    public func updateFitModeOverride(
+        id: UUID,
+        mode: WallpaperFitMode?
+    ) throws -> WallpaperItem {
+        try store.updateFitModeOverride(id: id, mode: mode)
+    }
+
+    public func touchLastUsed(id: UUID, date: Date = Date()) throws -> WallpaperItem {
+        try store.touchLastUsed(id: id, date: date)
+    }
+
     /// Field-level enrichment update: never accepts a full item array.
     public func updateMetadata(
         _ patches: [UUID: WallpaperStore.MetadataPatch]
@@ -182,5 +214,31 @@ public actor WallpaperStoreWorker {
         guard WallpaperType.detect(from: url) == .web else { return nil }
         let candidates = store.webEntryCandidates(at: url)
         return candidates.first(where: { $0.lastPathComponent.lowercased() == "index.html" }) ?? candidates.first
+    }
+
+    private func importScope(for url: URL) -> (count: Int, bytes: Int64) {
+        let fileManager = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            return (1, 0)
+        }
+        if !isDirectory.boolValue {
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+            return (1, size)
+        }
+        var count = 0
+        var bytes: Int64 = 0
+        guard let enumerator = fileManager.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
+            options: []
+        ) else { return (0, 0) }
+        for case let candidate as URL in enumerator {
+            guard let values = try? candidate.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey]),
+                  values.isDirectory != true else { continue }
+            count += 1
+            bytes += Int64(values.fileSize ?? 0)
+        }
+        return (count, bytes)
     }
 }

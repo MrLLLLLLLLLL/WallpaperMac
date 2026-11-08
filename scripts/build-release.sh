@@ -23,6 +23,7 @@ ZIP="$ROOT/dist/WallpaperMac-v${VERSION}-macOS.zip"
 find "$ROOT/dist" -maxdepth 1 -type f \( \
     -name 'WallpaperMac-v*-macOS.zip' -o \
     -name 'WallpaperMac-v*-macOS.zip.sig' -o \
+    -name 'WallpaperMac-v*-macOS.dmg' -o \
     -name 'WallpaperMac-v*-SHA256SUMS.txt' \
 \) -delete
 (cd "$ROOT/dist" && zip -r -X "$ZIP" WallpaperMac.app >/dev/null)
@@ -32,6 +33,10 @@ SHORT_VERSION="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$
 BUNDLE_VERSION="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$APP/Contents/Info.plist")"
 [[ "$SHORT_VERSION" == "$VERSION" ]] || { print -u2 "Release app version mismatch: $SHORT_VERSION != $VERSION"; exit 1; }
 [[ "$BUNDLE_VERSION" == "$VERSION" ]] || { print -u2 "Release build version mismatch: $BUNDLE_VERSION != $VERSION"; exit 1; }
+
+# Generate the DMG from the same frozen App snapshot as the ZIP. The DMG
+# helper deliberately does not rebuild the app.
+"$ROOT/scripts/build-dmg.sh"
 
 printf 'Release archive: %s\n' "$ZIP"
 printf 'SHA-256: '
@@ -45,6 +50,12 @@ SIGNING_KEY="${WALLPAPERMAC_UPDATE_SIGNING_KEY:-$ROOT/secrets/WallpaperMac.updat
 if [[ -f "$SIGNING_KEY" ]]; then
     rm -f "$ZIP.sig"
     swift "$ROOT/scripts/update-signing-tool.swift" sign "$ZIP" "$SIGNING_KEY"
+    PUBLIC_KEY="${WALLPAPERMAC_UPDATE_SIGNING_PUBLIC_KEY:-$ROOT/secrets/WallpaperMac.update.key.pub}"
+    if [[ ! -f "$PUBLIC_KEY" ]]; then
+        print -u2 "ERROR: public key not found at $PUBLIC_KEY; cannot verify final ZIP signature."
+        exit 1
+    fi
+    swift "$ROOT/scripts/update-signing-tool.swift" verify "$ZIP" "$ZIP.sig" "$PUBLIC_KEY"
     printf 'Signature: %s.sig\n' "$ZIP"
 elif [[ "${WALLPAPERMAC_ALLOW_UNSIGNED:-0}" == "1" ]]; then
     print -u2 "Warning: signing key not found; producing UNSIGNED dev package."
@@ -54,14 +65,19 @@ else
     exit 1
 fi
 
-# Publishable checksum manifest: one row per release artifact present in dist/.
+# Publishable checksum manifest: exactly the final ZIP and DMG, with paths
+# relative to dist/ so `shasum -c` can verify them from that directory.
 SUMS="$ROOT/dist/WallpaperMac-v${VERSION}-SHA256SUMS.txt"
-{
-    for artifact in "$ZIP" "$ROOT/dist/WallpaperMac-v${VERSION}-macOS.dmg"; do
-        if [[ -f "$artifact" ]]; then
-            shasum -a 256 "$artifact" | sed "s|${ROOT}/||"
-        fi
-    done
-} > "$SUMS"
+ZIP_NAME="${ZIP:t}"
+DMG_NAME="$ROOT/dist/WallpaperMac-v${VERSION}-macOS.dmg"
+[[ -f "$DMG_NAME" ]] || { print -u2 "ERROR: DMG was not generated."; exit 1; }
+(
+    cd "$ROOT/dist"
+    shasum -a 256 "$ZIP_NAME" "${DMG_NAME:t}"
+) > "$SUMS"
+(
+    cd "$ROOT/dist"
+    shasum -a 256 -c "${SUMS:t}"
+)
 printf 'Checksums: %s\n' "$SUMS"
 cat "$SUMS"

@@ -17,3 +17,4 @@
 | 2026-10-27 | [fix-review.md](2026-10-27/fix-review.md) | 修复方案评审与问题对照 |
 | 2026-11-06 | [project-report.md](2026-11-06/project-report.md) | 多显示器阶段 4 后的项目整体报告 |
 | 2026-11-07 | [project-review.md](2026-11-07/project-review.md) | 网页地址壁纸改动后的整体整理与验证报告 |
+| 2026-11-07 | [deep-audit-plan.md](2026-11-07/deep-audit-plan.md) | 四条关键链路深度检测、证据分级与分阶段修复规划 |

@@ -96,8 +96,8 @@ public struct WallpaperMetadata: Codable, Equatable, Sendable {
 
 public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
-        case id, name, type, sourceURL, playbackURL, entryURL, storageMode, thumbnailURL, metadata, availability
-        case createdAt, lastUsedAt, isFavorite, groupID
+        case id, name, type, sourceURL, playbackURL, entryURL, relativeEntryPath, storageMode, thumbnailURL, metadata, availability
+        case createdAt, lastUsedAt, isFavorite, groupID, fitModeOverride
     }
 
     public let id: UUID
@@ -107,7 +107,18 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
     /// Optional app-managed copy used when the source container needs a playback-only compatibility fix.
     public var playbackURL: URL?
     public var entryURL: URL?
+    /// Entry path relative to `sourceURL` for web projects whose source is a
+    /// directory. Persisted so relocation still knows the user's chosen entry
+    /// after a restart, when the original directory may no longer exist.
+    public var relativeEntryPath: String?
+    /// Optional per-wallpaper fit override; nil inherits the global policy.
+    public var fitModeOverride: WallpaperFitMode?
     public var storageMode: StorageMode
+
+    public func effectiveFitMode(global: WallpaperFitMode) -> WallpaperFitMode {
+        fitModeOverride ?? global
+    }
+
     public var thumbnailURL: URL?
     public var metadata: WallpaperMetadata?
     public var availability: WallpaperAvailability
@@ -124,6 +135,8 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
         sourceURL = try container.decode(URL.self, forKey: .sourceURL)
         playbackURL = try container.decodeIfPresent(URL.self, forKey: .playbackURL)
         entryURL = try container.decodeIfPresent(URL.self, forKey: .entryURL)
+        relativeEntryPath = try container.decodeIfPresent(String.self, forKey: .relativeEntryPath)
+        fitModeOverride = try container.decodeIfPresent(WallpaperFitMode.self, forKey: .fitModeOverride)
         storageMode = try container.decode(StorageMode.self, forKey: .storageMode)
         thumbnailURL = try container.decodeIfPresent(URL.self, forKey: .thumbnailURL)
         metadata = try container.decodeIfPresent(WallpaperMetadata.self, forKey: .metadata)
@@ -144,6 +157,8 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
         sourceURL: URL,
         playbackURL: URL? = nil,
         entryURL: URL? = nil,
+        relativeEntryPath: String? = nil,
+        fitModeOverride: WallpaperFitMode? = nil,
         storageMode: StorageMode,
         thumbnailURL: URL? = nil,
         metadata: WallpaperMetadata? = nil,
@@ -159,6 +174,8 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
         self.sourceURL = sourceURL
         self.playbackURL = playbackURL
         self.entryURL = entryURL
+        self.relativeEntryPath = relativeEntryPath
+        self.fitModeOverride = fitModeOverride
         self.storageMode = storageMode
         self.thumbnailURL = thumbnailURL
         self.metadata = metadata

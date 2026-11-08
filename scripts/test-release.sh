@@ -31,18 +31,44 @@ swift build -c release
 
 printf '%s\n' '== App and ZIP packaging =='
 ./scripts/build-release.sh
+./scripts/release-artifact-consistency-test.sh
+
+DMG="$ROOT/dist/WallpaperMac-v${VERSION}-macOS.dmg"
+SUMS="$ROOT/dist/WallpaperMac-v${VERSION}-SHA256SUMS.txt"
+PUBLIC_KEY="${WALLPAPERMAC_UPDATE_SIGNING_PUBLIC_KEY:-$ROOT/secrets/WallpaperMac.update.key.pub}"
+test -f "$DMG"
+test -f "$ZIP.sig"
+test -f "$SUMS"
+swift "$ROOT/scripts/update-signing-tool.swift" verify "$ZIP" "$ZIP.sig" "$PUBLIC_KEY"
+(cd "$ROOT/dist" && shasum -a 256 -c "${SUMS:t}")
 
 printf '%s\n' '== Player runtime matrix =='
 ./scripts/player-runtime-test.sh
+./scripts/wallpaper-fit-runtime-test.sh
 
 printf '%s\n' '== Video codec compatibility =='
 ./scripts/video-codec-runtime-test.sh
+
+printf '%s\n' '== Queue pause and system suspension =='
+./scripts/queue-pause-runtime-test.sh
+
+printf '%s\n' '== Decoder failure lifecycle =='
+./scripts/video-stream-failure-test.sh
+
+printf '%s\n' '== Unknown duration AVPlayer lifecycle =='
+./scripts/video-unknown-duration-runtime-test.sh
 
 printf '%s\n' '== Streaming memory regression =='
 ./scripts/video-stream-memory-regression.sh
 
 printf '%s\n' '== Web wallpaper interaction =='
 ./scripts/web-wallpaper-interaction-test.sh
+
+printf '%s\n' '== Web external navigation authorization =='
+./scripts/web-external-navigation-test.sh
+
+printf '%s\n' '== Web media pause and renderer recovery =='
+./scripts/web-lifecycle-runtime-test.sh
 
 printf '%s\n' '== App smoke test =='
 ./scripts/smoke-app.sh
@@ -69,6 +95,10 @@ BUNDLE_VERSION="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$APP/Conten
 [[ "$BUNDLE_VERSION" == "$VERSION" ]] || { print -u2 "CFBundleVersion mismatch: $BUNDLE_VERSION != $VERSION"; exit 1; }
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
 /usr/bin/file "$APP/Contents/MacOS/WallpaperMac"
+./scripts/update-atomic-swap-smoke.sh
+./scripts/update-health-handshake-smoke.sh
+./scripts/update-install-lock-smoke.sh
+./scripts/update-artifact-smoke-test.sh
 test -f "$ZIP"
 /usr/bin/unzip -t "$ZIP"
 

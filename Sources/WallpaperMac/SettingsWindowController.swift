@@ -86,12 +86,12 @@ private struct SettingsView: View {
                 Toggle("循环播放", isOn: $loops)
                 Toggle("使用电池时暂停动态壁纸", isOn: $pauseOnBattery)
                 Toggle("全屏应用时暂停动态壁纸", isOn: $pauseInFullScreen)
-                Picker("适配方式", selection: $fitMode) {
+                Picker("全局适配方式", selection: $fitMode) {
                     ForEach(WallpaperFitMode.allCases, id: \.self) { mode in
                         Text(mode.title).tag(mode.rawValue)
                     }
                 }
-                Text("填充屏幕会裁剪边缘；完整显示会保留原始比例。")
+                Text(fitModeDescription)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -373,6 +373,19 @@ private struct SettingsView: View {
         } catch {
             launchAtLogin = LoginItemService.isEnabled
             launchAtLoginError = "登录项设置失败：\(error.localizedDescription)"
+        }
+    }
+
+    private var fitModeDescription: String {
+        switch WallpaperFitMode(rawValue: fitMode) ?? .fill {
+        case .fill:
+            return "填充：保持比例并铺满屏幕，超出边缘的部分会裁剪。"
+        case .fit:
+            return "适应：保持比例并完整显示，空白区域保留背景色。"
+        case .stretch:
+            return "拉伸：分别调整宽度和高度，可能改变原始比例。"
+        case .tile:
+            return "平铺：按原始尺寸重复排列素材；仅适用于图片和视频，网页仍按视口排版。"
         }
     }
 

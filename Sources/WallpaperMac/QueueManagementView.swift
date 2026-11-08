@@ -8,25 +8,33 @@ struct QueueManagementView: View {
     @State private var queueToDelete: PlaybackQueue?
 
     var body: some View {
-        HStack(spacing: 0) {
-            queueList
-                .frame(width: 230)
-            Divider()
-            if let queue = selectedQueue {
-                queueDetail(queue)
-            } else {
-                VStack(spacing: 10) {
-                    Image(systemName: "list.bullet.rectangle")
-                        .font(.system(size: 34, weight: .light))
-                        .foregroundStyle(.secondary)
-                    Text("还没有播放队列")
-                        .font(.headline)
-                    Text("创建一个队列后，可以将图片、视频和网页壁纸加入其中。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        VStack(spacing: 0) {
+            if let error = model.wallpaperManager.queueLoadError {
+                queueLoadWarning(error)
+            } else if let error = model.wallpaperManager.queueSaveError {
+                queueSaveWarning(error)
             }
+            HStack(spacing: 0) {
+                queueList
+                    .frame(width: 230)
+                Divider()
+                if let queue = selectedQueue {
+                    queueDetail(queue)
+                } else {
+                    VStack(spacing: 10) {
+                        Image(systemName: "list.bullet.rectangle")
+                            .font(.system(size: 34, weight: .light))
+                            .foregroundStyle(.secondary)
+                        Text("还没有播放队列")
+                            .font(.headline)
+                        Text("创建一个队列后，可以将图片、视频和网页壁纸加入其中。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .disabled(model.wallpaperManager.isQueuePersistenceBlocked)
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
@@ -54,6 +62,53 @@ struct QueueManagementView: View {
         } message: {
             Text("队列中的壁纸记录不会被删除；正在使用该队列的显示器会切换到默认队列。")
         }
+    }
+
+    private func queueLoadWarning(_ error: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("播放队列文件无法加载")
+                    .font(.headline)
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("为避免覆盖原文件，队列修改暂不保存。修复或恢复文件后可重新加载。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("重新加载") {
+                if !model.wallpaperManager.retryLoadingQueues() {
+                    model.lastError = model.wallpaperManager.queueLoadError
+                }
+            }
+        }
+        .padding(12)
+        .background(Color.orange.opacity(0.12))
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
+    private func queueSaveWarning(_ error: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("播放队列保存失败")
+                    .font(.headline)
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("最近的队列修改可能没有写入磁盘，请检查磁盘空间或权限后重试。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(12)
+        .background(Color.orange.opacity(0.12))
+        .overlay(alignment: .bottom) { Divider() }
     }
 
     private var selectedQueue: PlaybackQueue? {

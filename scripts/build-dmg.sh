@@ -20,8 +20,19 @@ DMG="$ROOT/dist/WallpaperMac-v${VERSION}-macOS.dmg"
 STAGING="$ROOT/.build/dmg-staging"
 VOLUME_NAME="WallpaperMac $VERSION"
 
-# Always build the current signed app before creating the installer image.
-"$ROOT/scripts/package-release.sh"
+# Consume the already-packaged app; never rebuild it here. Otherwise the DMG
+# could come from a different generation than the signed ZIP.
+test -x "$APP/Contents/MacOS/WallpaperMac" || {
+    print -u2 "Missing packaged app. Run scripts/build-release.sh first."
+    exit 1
+}
+SHORT_VERSION="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist")"
+BUNDLE_VERSION="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$APP/Contents/Info.plist")"
+[[ "$SHORT_VERSION" == "$VERSION" && "$BUNDLE_VERSION" == "$VERSION" ]] || {
+    print -u2 "Packaged app version does not match VERSION: $VERSION"
+    exit 1
+}
+/usr/bin/codesign --verify --deep --strict "$APP"
 
 rm -rf "$STAGING"
 mkdir -p "$STAGING"

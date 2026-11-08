@@ -1,7 +1,6 @@
 import AVFoundation
 import CoreMedia
-import CoreVideo
-import Foundation
+import VideoToolbox
 import WallpaperMacCore
 
 /// Streams decoded video frames directly from ffmpeg into an
@@ -9,9 +8,16 @@ import WallpaperMacCore
 /// it is ready, so long videos cannot accumulate an unbounded frame queue.
 final class WallpaperVideoStreamController {
     let displayLayer = AVSampleBufferDisplayLayer()
+    private(set) var presentationLayer: CALayer
+    private var tileLayers: [CALayer] = []
 
     private let sourceURL: URL
+    private let streamArguments: [String]
     private let loops: Bool
+    private let originalSize: CGSize
+    private let contentScale: CGFloat
+    private var fitMode: WallpaperFitMode
+    private var currentFrame: CGRect
     private let onVideoPlaybackCompleted: (() -> Void)?
     private let onFrameProgress: (() -> Void)?
     private let frameRate: Int
@@ -28,31 +34,128 @@ final class WallpaperVideoStreamController {
     private var isRequestingFrames = false
     private var process: Process?
     private var outputHandle: FileHandle?
-    private var bufferedData = Data()
+    private var bufferedData: VideoFrameBuffer
+    private var generation = 0
+    private var terminationStatus: Int32?
+    private var completionDeliveredGeneration: Int?
+    private var emittedFrameCount = 0
     private var frameIndex: Int64 = 0
     private var formatDescription: CMVideoFormatDescription?
+    private var latestTileImage: CGImage?
 
     init(
         sourceURL: URL,
         isPlaying: Bool,
-        videoGravity: AVLayerVideoGravity,
         loops: Bool,
         frame: CGRect,
         onVideoPlaybackCompleted: (() -> Void)?,
-        onFrameProgress: (() -> Void)? = nil
+        onFrameProgress: (() -> Void)? = nil,
+        fitMode: WallpaperFitMode = .fill,
+        originalSize: CGSize? = nil,
+        contentScale: CGFloat = 1
     ) {
-        let plan = VideoCompatibilityStreamPlan(sourceURL: sourceURL)
+        let layoutSize = originalSize ?? CGSize(width: 1920, height: 1080)
+        // Keep the stream in the source's aspect ratio so tiled playback never
+        // embeds the letterbox of a fixed 16:9 canvas. Cap the long side to
+        // bound raw-frame bandwidth; the display layer scales for fill/fit.
+        let scale = min(1, min(1920 / layoutSize.width, 1080 / layoutSize.height))
+        let streamWidth = max(2, Int((layoutSize.width * scale).rounded()))
+        let streamHeight = max(2, Int((layoutSize.height * scale).rounded()))
+        let plan = VideoCompatibilityStreamPlan(
+            sourceURL: sourceURL,
+            width: streamWidth,
+            height: streamHeight
+        )
         self.sourceURL = sourceURL
+        self.streamArguments = plan.arguments
         self.isPlaying = isPlaying
         self.loops = loops
         self.onVideoPlaybackCompleted = onVideoPlaybackCompleted
         self.onFrameProgress = onFrameProgress
+        self.fitMode = fitMode
+        self.originalSize = originalSize ?? CGSize(width: plan.width, height: plan.height)
+        self.contentScale = max(1, contentScale)
+        self.currentFrame = frame
         self.frameRate = plan.frameRate
         self.width = plan.width
         self.height = plan.height
         self.frameSize = plan.width * plan.height * 3 / 2
+        self.bufferedData = VideoFrameBuffer(frameSize: plan.width * plan.height * 3 / 2)
         displayLayer.frame = frame
-        displayLayer.videoGravity = videoGravity
+        presentationLayer = WallpaperLayerLayout.make(
+            content: displayLayer,
+            originalSize: self.originalSize,
+            bounds: frame,
+            mode: fitMode,
+            contentScale: self.contentScale
+        )
+    }
+
+    private func rebuildPresentationLayer() {
+        let parent = presentationLayer.superlayer
+        presentationLayer.removeFromSuperlayer()
+        if fitMode == .tile {
+            presentationLayer = makeTiledPresentation()
+        } else {
+            tileLayers.forEach { $0.contents = nil; $0.removeFromSuperlayer() }
+            tileLayers.removeAll()
+            latestTileImage = nil
+            presentationLayer = WallpaperLayerLayout.make(
+                content: displayLayer,
+                originalSize: originalSize,
+                bounds: currentFrame,
+                mode: fitMode,
+                    contentScale: contentScale
+            )
+        }
+        parent?.addSublayer(presentationLayer)
+    }
+
+    private func makeTiledPresentation() -> CALayer {
+        tileLayers.forEach { $0.removeFromSuperlayer() }
+        tileLayers.removeAll()
+        guard let grid = WallpaperTileLayout.grid(
+            originalSize: originalSize,
+            bounds: currentFrame.size,
+            contentScale: contentScale
+        ) else {
+            return WallpaperLayerLayout.make(
+                content: displayLayer,
+                originalSize: originalSize,
+                bounds: currentFrame,
+                mode: .fill,
+                    contentScale: contentScale
+            )
+        }
+        let container = CALayer()
+        container.frame = currentFrame
+        container.masksToBounds = true
+        displayLayer.videoGravity = .resizeAspect
+        displayLayer.contentsScale = contentScale
+        for row in 0..<grid.rows {
+            for column in 0..<grid.columns {
+                let frame = CGRect(
+                    x: CGFloat(column) * grid.tileSize.width,
+                    y: CGFloat(row) * grid.tileSize.height,
+                    width: grid.tileSize.width,
+                    height: grid.tileSize.height
+                )
+                let layer: CALayer
+                if row == 0 && column == 0 {
+                    displayLayer.frame = frame
+                    layer = displayLayer
+                } else {
+                    layer = CALayer()
+                    layer.frame = frame
+                    layer.contentsGravity = .resizeAspect
+                    layer.contentsScale = contentScale
+                    layer.contents = latestTileImage
+                    tileLayers.append(layer)
+                }
+                container.addSublayer(layer)
+            }
+        }
+        return container
     }
 
     func start() {
@@ -60,11 +163,27 @@ final class WallpaperVideoStreamController {
     }
 
     func setFrame(_ frame: CGRect) {
-        displayLayer.frame = frame
+        guard currentFrame != frame else { return }
+        currentFrame = frame
+        stateLock.lock()
+        let tiled = fitMode == .tile
+        stateLock.unlock()
+        if tiled {
+            rebuildPresentationLayer()
+        } else {
+            presentationLayer.frame = frame
+        }
     }
 
-    func setVideoGravity(_ videoGravity: AVLayerVideoGravity) {
-        displayLayer.videoGravity = videoGravity
+    func setFitMode(_ fitMode: WallpaperFitMode) {
+        stateLock.lock()
+        guard self.fitMode != fitMode else {
+            stateLock.unlock()
+            return
+        }
+        self.fitMode = fitMode
+        stateLock.unlock()
+        rebuildPresentationLayer()
     }
 
     func setPlaying(_ isPlaying: Bool) {
@@ -86,14 +205,21 @@ final class WallpaperVideoStreamController {
 
     func teardown() {
         stateLock.lock()
+        guard !isTornDown else {
+            stateLock.unlock()
+            return
+        }
         isTornDown = true
         isPlaying = false
         isRequestingFrames = false
+        generation += 1
         let process = self.process
         let handle = self.outputHandle
+        let presentationLayer = self.presentationLayer
+        let tileLayers = self.tileLayers
         self.process = nil
         self.outputHandle = nil
-        bufferedData.removeAll(keepingCapacity: true)
+        bufferedData.removeAll()
         stateLock.unlock()
 
         // Order matters: terminate first so the pipe hits EOF and any blocked
@@ -109,22 +235,38 @@ final class WallpaperVideoStreamController {
             }
         }
         displayLayer.stopRequestingMediaData()
-        displayLayer.flushAndRemoveImage()
-        displayLayer.removeFromSuperlayer()
+        DispatchQueue.main.async { [weak self] in
+            tileLayers.forEach { $0.contents = nil; $0.removeFromSuperlayer() }
+            self?.latestTileImage = nil
+        }
+        frameQueue.async { [displayLayer, presentationLayer] in
+            presentationLayer.removeFromSuperlayer()
+            displayLayer.flushAndRemoveImage()
+            displayLayer.removeFromSuperlayer()
+        }
     }
 
-    private func startProcess() {
+    private func startProcess(requiresPlaying: Bool = false) {
+        stateLock.lock()
+        guard !isTornDown, (!requiresPlaying || isPlaying) else {
+            stateLock.unlock()
+            return
+        }
+        generation += 1
+        let generation = self.generation
+        terminationStatus = nil
+        stateLock.unlock()
+
         guard let executableURL = WallpaperVideoCompatibilityService.executableURL() else {
             NSLog("WallpaperMac streaming playback failed: ffmpeg unavailable for \(sourceURL.path)")
-            notifyPlaybackCompleted()
+            notifyPlaybackCompleted(generation: generation)
             return
         }
 
-        let plan = VideoCompatibilityStreamPlan(sourceURL: sourceURL)
         let process = Process()
         let pipe = Pipe()
         process.executableURL = executableURL
-        process.arguments = plan.arguments
+        process.arguments = streamArguments
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         process.terminationHandler = { [weak self] terminatedProcess in
@@ -132,14 +274,15 @@ final class WallpaperVideoStreamController {
         }
 
         stateLock.lock()
-        guard !isTornDown else {
+        guard !isTornDown, self.generation == generation else {
             stateLock.unlock()
-            notifyPlaybackCompleted()
+            process.terminationHandler = nil
             return
         }
         self.process = process
         self.outputHandle = pipe.fileHandleForReading
-        bufferedData.removeAll(keepingCapacity: true)
+        bufferedData.removeAll()
+        emittedFrameCount = 0
         // Keep `frameIndex` monotonic across loop restarts. AVSampleBufferDisplayLayer
         // drops sample buffers whose PTS falls behind its timebase, so resetting to 0
         // on every loop froze the video after the first playthrough.
@@ -150,25 +293,40 @@ final class WallpaperVideoStreamController {
         } catch {
             NSLog("WallpaperMac streaming playback failed to start ffmpeg: \(error.localizedDescription)")
             stateLock.lock()
+            guard self.generation == generation else {
+                stateLock.unlock()
+                return
+            }
             self.process = nil
             self.outputHandle = nil
             stateLock.unlock()
-            notifyPlaybackCompleted()
+            try? pipe.fileHandleForReading.close()
+            notifyPlaybackCompleted(generation: generation)
             return
         }
 
-        // Approach B: run() outside the lock, then re-validate ownership. A
-        // teardown between unlock and run would otherwise leave an orphan
-        // ffmpeg whose termination handler no longer belongs to us.
+        // run() outside the lock, then re-validate ownership. A very short
+        // process may already have exited: that is a drain, not an orphan.
         stateLock.lock()
-        let orphaned = self.process !== process || isTornDown
-        if orphaned {
-            self.process = nil
-            self.outputHandle = nil
-        }
+        let exitedBeforeReturn = self.process == nil && terminationStatus != nil && self.generation == generation
+        let orphaned = (self.process !== process && !exitedBeforeReturn)
+            || isTornDown
+            || self.generation != generation
+            || (requiresPlaying && !isPlaying)
         stateLock.unlock()
         if orphaned {
-            process.terminate()
+            process.terminationHandler = nil
+            if process.isRunning {
+                process.terminate()
+            }
+            // A short-lived exited process still needs its stdout drained.
+            // Only a replaced/failed launch closes its reader, and that close
+            // is serialized behind the current frameQueue read.
+            if !exitedBeforeReturn {
+                frameQueue.async {
+                    try? pipe.fileHandleForReading.close()
+                }
+            }
             return
         }
 
@@ -179,6 +337,12 @@ final class WallpaperVideoStreamController {
 
     private func startRequestingFrames() {
         stateLock.lock()
+        let needsCompletion = outputHandle == nil && terminationStatus != nil
+        if needsCompletion {
+            stateLock.unlock()
+            finishDrainingIfPossible()
+            return
+        }
         let shouldRequest = !isTornDown && isPlaying && !isRequestingFrames
         if shouldRequest {
             isRequestingFrames = true
@@ -196,6 +360,7 @@ final class WallpaperVideoStreamController {
             stateLock.lock()
             let cancelled = isTornDown
             let playing = isPlaying
+            let generation = self.generation
             stateLock.unlock()
             guard !cancelled else { return }
             guard playing else {
@@ -207,13 +372,18 @@ final class WallpaperVideoStreamController {
                 stopRequestingFrames()
                 return
             }
+            stateLock.lock()
+            let stillCurrent = generation == self.generation && isPlaying && !isTornDown
+            stateLock.unlock()
+            guard stillCurrent else { return }
             // Heartbeat: a frame arrived, so the pipeline is alive. Hop to the
             // main actor like notifyPlaybackCompleted — produceFrames runs on
             // frameQueue and must not touch WallpaperManager state directly.
-            notifyFrameProgress()
+            notifyFrameProgress(generation: generation)
             let presentationIndex = frameIndex
             frameIndex += 1
-            enqueue(frame, presentationIndex: presentationIndex)
+            emittedFrameCount += 1
+            enqueue(frame, presentationIndex: presentationIndex, generation: generation)
         }
     }
 
@@ -230,44 +400,104 @@ final class WallpaperVideoStreamController {
             stateLock.unlock()
             return
         }
+        // Only record the exit here. The process's stdout can still contain
+        // complete frames, so the serial frame queue must drain it before any
+        // buffer is cleared or a loop is restarted.
         self.process = nil
-        let handle = self.outputHandle
-        self.outputHandle = nil
-        bufferedData.removeAll(keepingCapacity: true)
-        isRequestingFrames = false
-        let cancelled = isTornDown
+        terminationStatus = terminatedProcess.terminationStatus
+        let generation = self.generation
         stateLock.unlock()
 
-        if let handle {
-            handle.readabilityHandler = nil
-            frameQueue.async {
-                try? handle.close()
-            }
+        frameQueue.async { [weak self] in
+            self?.drainAfterTermination(generation: generation)
         }
-        displayLayer.stopRequestingMediaData()
-        guard !cancelled else { return }
-        if loops {
-            startProcess()
+    }
+
+    private func drainAfterTermination(generation: Int) {
+        stateLock.lock()
+        let hasExited = terminationStatus != nil && self.generation == generation
+        let playing = isPlaying
+        let requesting = isRequestingFrames
+        stateLock.unlock()
+        guard hasExited, playing else { return }
+        if requesting {
+            produceFrames()
         } else {
-            notifyPlaybackCompleted()
+            startRequestingFrames()
         }
     }
 
-    private func notifyPlaybackCompleted() {
-        DispatchQueue.main.async { [weak self] in
-            self?.onVideoPlaybackCompleted?()
+    /// Called only on frameQueue after read() reaches EOF. Pausing leaves the
+    /// drained state in place so resume can finish it; no paused loop is ever
+    /// restarted in the background.
+    private func finishDrainingIfPossible(expectedGeneration: Int? = nil) {
+        stateLock.lock()
+        guard !isTornDown,
+              let status = terminationStatus,
+              expectedGeneration == nil || expectedGeneration == generation else {
+            stateLock.unlock()
+            return
+        }
+        guard isPlaying else {
+            stateLock.unlock()
+            stopRequestingFrames()
+            return
+        }
+        let generation = self.generation
+        let handle = outputHandle
+        let emittedFrames = emittedFrameCount
+        let hasIncompleteTail = !bufferedData.isEmpty
+        outputHandle = nil
+        bufferedData.removeAll()
+        stateLock.unlock()
+
+        stopRequestingFrames()
+        if let handle {
+            try? handle.close()
+        }
+        if VideoStreamExitPolicy.shouldRestartAfterDrain(
+            terminationStatus: status,
+            loops: loops,
+            emittedFrameCount: emittedFrames,
+            hasIncompleteTail: hasIncompleteTail
+        ) {
+            startProcess(requiresPlaying: true)
+        } else {
+            notifyPlaybackCompleted(generation: generation)
         }
     }
 
-    private func notifyFrameProgress() {
+    private func notifyPlaybackCompleted(generation: Int) {
         DispatchQueue.main.async { [weak self] in
-            self?.onFrameProgress?()
+            guard let self else { return }
+            self.stateLock.lock()
+            guard !self.isTornDown,
+                  self.generation == generation,
+                  self.completionDeliveredGeneration != generation else {
+                self.stateLock.unlock()
+                return
+            }
+            self.completionDeliveredGeneration = generation
+            self.stateLock.unlock()
+            self.onVideoPlaybackCompleted?()
+        }
+    }
+
+    private func notifyFrameProgress(generation: Int) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            let isCurrent = self.generation == generation && self.isPlaying && !self.isTornDown
+            self.stateLock.unlock()
+            guard isCurrent else { return }
+            self.onFrameProgress?()
         }
     }
 
     private func readFrame() -> Data? {
         stateLock.lock()
         let handle = outputHandle
+        let generation = self.generation
         stateLock.unlock()
         guard let handle else { return nil }
         while true {
@@ -278,30 +508,36 @@ final class WallpaperVideoStreamController {
             do {
                 let chunk = try handle.read(upToCount: needed) ?? Data()
                 if chunk.isEmpty {
+                    // EOF belongs to the frame queue: all complete frames read
+                    // so far are delivered before completion/looping.
+                    finishDrainingIfPossible(expectedGeneration: generation)
                     return nil
                 }
                 stateLock.lock()
                 bufferedData.append(chunk)
                 stateLock.unlock()
             } catch {
+                stateLock.lock()
+                if terminationStatus == nil {
+                    terminationStatus = -1
+                }
+                let failedProcess = process
+                process = nil
+                stateLock.unlock()
+                failedProcess?.terminate()
+                finishDrainingIfPossible(expectedGeneration: generation)
                 return nil
             }
         }
 
         stateLock.lock()
         defer { stateLock.unlock() }
-        // The buffer can be cleared by teardown()/processDidTerminate() between
-        // the loop exit above and this lock. Re-check before slicing so a
-        // partial buffer never reaches removeSubrange (which would trap).
-        guard bufferedData.count >= frameSize else { return nil }
-        let frame = Data(bufferedData.prefix(frameSize))
-        bufferedData.removeSubrange(0..<frameSize)
-        return frame
+        return bufferedData.nextFrame()
     }
 
-    private func enqueue(_ data: Data, presentationIndex: Int64) {
+    private func enqueue(_ data: Data, presentationIndex: Int64, generation: Int) {
         stateLock.lock()
-        let cancelled = isTornDown
+        let cancelled = isTornDown || self.generation != generation
         stateLock.unlock()
         guard !cancelled else { return }
 
@@ -368,7 +604,61 @@ final class WallpaperVideoStreamController {
             sampleBufferOut: &sampleBuffer
         )
         if let sampleBuffer {
+            stateLock.lock()
+            let shouldEnqueue = !isTornDown && self.generation == generation && isPlaying
+            let tiled = fitMode == .tile
+            stateLock.unlock()
+            guard shouldEnqueue else { return }
             displayLayer.enqueue(sampleBuffer)
+            guard tiled else { return }
+            guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+            var converted: CGImage?
+            VTCreateCGImageFromCVPixelBuffer(
+                pixelBuffer,
+                options: nil,
+                imageOut: &converted
+            )
+            // The decoder pads non-16:9 sources into this fixed canvas. Crop
+            // the padding before using the frame as a native-size tile.
+            let image = converted.map {
+                tileContentImage(
+                    from: $0,
+                    sourceSize: originalSize,
+                    outputSize: CGSize(width: width, height: height)
+                )
+            } ?? converted
+            guard let image else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.isTornDown, self.generation == generation else {
+                    return
+                }
+                self.latestTileImage = image
+                self.tileLayers.forEach { $0.contents = image }
+            }
         }
+    }
+
+    private func tileContentImage(
+        from image: CGImage,
+        sourceSize: CGSize,
+        outputSize: CGSize
+    ) -> CGImage {
+        guard sourceSize.width > 0, sourceSize.height > 0,
+              outputSize.width > 0, outputSize.height > 0 else {
+            return image
+        }
+        let scale = min(outputSize.width / sourceSize.width, outputSize.height / sourceSize.height)
+        let drawWidth = max(1, min(outputSize.width, round(sourceSize.width * scale)))
+        let drawHeight = max(1, min(outputSize.height, round(sourceSize.height * scale)))
+        if drawWidth >= outputSize.width && drawHeight >= outputSize.height {
+            return image
+        }
+        let rect = CGRect(
+            x: round((outputSize.width - drawWidth) / 2),
+            y: round((outputSize.height - drawHeight) / 2),
+            width: drawWidth,
+            height: drawHeight
+        )
+        return image.cropping(to: rect) ?? image
     }
 }

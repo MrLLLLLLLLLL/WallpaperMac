@@ -12,6 +12,14 @@ final class WallpaperManager: ObservableObject {
     @Published private(set) var displayQueues: [String: DisplayPlaybackQueue] = [:]
     @Published private(set) var playbackQueues: [PlaybackQueue] = []
     @Published private(set) var displayQueueBindings: [String: DisplayPlaybackBinding] = [:]
+    /// Non-nil when the persisted queue files could not be loaded. While set,
+    /// queue writes are blocked so the fallback state cannot overwrite the
+    /// user's only copy.
+    @Published private(set) var queueLoadError: String?
+    /// Non-nil when the last queue save failed (for example the disk is full).
+    /// This is separate from `queueLoadError`: the files are readable, but the
+    /// latest write did not reach them.
+    @Published private(set) var queueSaveError: String?
 
     /// Identity of one presentation of one wallpaper on one display.
     ///
@@ -32,6 +40,7 @@ final class WallpaperManager: ObservableObject {
     }
 
     private var currentSessions: [String: PlaybackSession] = [:]
+    private var sessionDurations: [String: Double] = [:]
 
     enum PlaybackState: Equatable {
         case staticImage
@@ -55,11 +64,15 @@ final class WallpaperManager: ObservableObject {
     private var assignments: [String: DisplayAssignment] = [:]
     private var queueTimers: [String: Timer] = [:]
     private var hardDeadlineTimers: [String: Timer] = [:]
+    private var queueTimerGenerations: [String: Int] = [:]
+    private var remainingQueueIntervals: [String: TimeInterval] = [:]
+    private var remainingHardDeadlines: [String: TimeInterval] = [:]
     private var connectedDisplays: [String: DisplayService.Display] = [:]
     private var queueItems: [UUID: WallpaperItem] = [:]
     private var queueLibrary: [UUID: PlaybackQueue] = [:]
     private var bindings: [String: DisplayPlaybackBinding] = [:]
     private weak var store: WallpaperStore?
+    private var persistenceGate = LibraryPersistenceGate()
     private var playbackPolicy = PlaybackPolicy()
     private var isSystemSuspended = false
     private var activityMonitor: SystemActivityMonitor?
@@ -95,10 +108,13 @@ final class WallpaperManager: ObservableObject {
     }
 
     func configure(store: WallpaperStore, policy: PlaybackPolicy = PlaybackPolicy()) {
-        queueTimers.values.forEach { $0.invalidate() }
-        queueTimers.removeAll()
+        for displayID in Set(queueTimers.keys).union(hardDeadlineTimers.keys) {
+            invalidateQueueTimers(for: displayID)
+        }
         controllers.values.forEach { $0.teardownAndClose() }
         controllers.removeAll()
+        currentSessions.removeAll()
+        sessionDurations.removeAll()
         self.store = store
         self.playbackPolicy = policy
         activityMonitor?.update(policy: policy)
@@ -110,8 +126,9 @@ final class WallpaperManager: ObservableObject {
         playbackPolicy = policy
         activityMonitor?.update(policy: policy)
         for (displayID, controller) in controllers {
+            let item = assignments[displayID]?.wallpaperID.flatMap { queueItems[$0] }
             controller.setMuted(policy.isMuted)
-            controller.setFitMode(policy.fitMode)
+            controller.setFitMode(item?.effectiveFitMode(global: policy.fitMode) ?? policy.fitMode)
             controller.setWebInteractionEnabled(policy.webWallpaperInteractionEnabled)
             controller.setSystemSuspended(isSystemSuspended, reloadWebContentOnResume: false)
             playbackStates[displayID] = controller.playbackState
@@ -128,6 +145,9 @@ final class WallpaperManager: ObservableObject {
             )
             playbackStates[displayID] = controller.playbackState
         }
+        for displayID in bindings.keys {
+            reconcileScheduling(for: displayID)
+        }
     }
 
     func apply(
@@ -140,11 +160,13 @@ final class WallpaperManager: ObservableObject {
     ) throws {
         playbackPolicy = policy
         connectedDisplays[display.id] = display
+        queueItems[item.id] = item
         if !preserveQueue {
             stopQueue(displayID: display.id, persist: true)
         }
         let session = PlaybackSession(itemID: item.id, displayID: display.id)
         currentSessions[display.id] = session
+        sessionDurations[display.id] = Self.validDuration(item.metadata?.durationSeconds)
         let replacement = try WallpaperWindowController(
             item: item,
             screen: display.screen,
@@ -155,7 +177,11 @@ final class WallpaperManager: ObservableObject {
             },
             onFrameProgress: { [weak self] in
                 self?.noteVideoFrameProgress(for: display.id, session: session)
-            }
+            },
+            onVideoDurationChanged: { [weak self] duration in
+                self?.videoDurationDidChange(for: display.id, session: session, duration: duration)
+            },
+            initialSystemSuspended: isSystemSuspended
         )
         replacement.setSystemSuspended(isSystemSuspended, reloadWebContentOnResume: false)
         let previous = controllers[display.id]
@@ -177,6 +203,8 @@ final class WallpaperManager: ObservableObject {
 
     func clear(displayID: String) {
         stopQueue(displayID: displayID, persist: true)
+        currentSessions.removeValue(forKey: displayID)
+        sessionDurations.removeValue(forKey: displayID)
         controllers.removeValue(forKey: displayID)?.teardownAndClose()
         assignments[displayID] = DisplayAssignment(
             id: displayID,
@@ -192,19 +220,22 @@ final class WallpaperManager: ObservableObject {
     }
 
     func clear(itemID: UUID) {
-        let displayIDs = assignments.values.filter { $0.wallpaperID == itemID }.map(\.id)
-        displayIDs.forEach { clear(displayID: $0) }
-        removeWallpaperIDsFromQueues([itemID])
+        removeWallpaperIDs([itemID])
     }
 
     func removeWallpaperIDs(_ itemIDs: Set<UUID>) {
         guard !itemIDs.isEmpty else { return }
-        let displayIDs = assignments.values.filter { assignment in
-            guard let wallpaperID = assignment.wallpaperID else { return false }
-            return itemIDs.contains(wallpaperID)
-        }.map(\.id)
-        displayIDs.forEach { clear(displayID: $0) }
-        removeWallpaperIDsFromQueues(itemIDs)
+        let displaysShowingRemovedItem = assignments.values.compactMap { assignment -> String? in
+            guard let wallpaperID = assignment.wallpaperID, itemIDs.contains(wallpaperID) else { return nil }
+            return assignment.id
+        }
+        // Remove queue memberships first and let still-enabled displays move to
+        // their successor. Only displays that lost their current item and were
+        // not restarted are cleared.
+        let restarted = removeWallpaperIDsFromQueues(itemIDs)
+        for displayID in displaysShowingRemovedItem where !restarted.contains(displayID) {
+            clear(displayID: displayID)
+        }
     }
 
     func clearAll() {
@@ -212,6 +243,8 @@ final class WallpaperManager: ObservableObject {
         queueTimers.removeAll()
         controllers.values.forEach { $0.teardownAndClose() }
         controllers.removeAll()
+        currentSessions.removeAll()
+        sessionDurations.removeAll()
         bindings = bindings.mapValues { binding in
             var binding = binding
             for queueID in binding.queueStates.keys {
@@ -242,15 +275,26 @@ final class WallpaperManager: ObservableObject {
 
     func reapply(to displays: [DisplayService.Display], policy: PlaybackPolicy, items: [WallpaperItem]) {
         playbackPolicy = policy
+        let previousDisplays = connectedDisplays
         connectedDisplays = UniquedDictionary.build(displays.map { ($0.id, $0) }, label: "connected displays")
         queueItems = UniquedDictionary.build(items.map { ($0.id, $0) }, label: "queue items")
         let connectedIDs = Set(displays.map(\.id))
-        for key in assignments.keys where !connectedIDs.contains(key) {
-            queueTimers[key]?.invalidate()
-            queueTimers.removeValue(forKey: key)
+        let potentiallyDisconnected = Set(previousDisplays.keys)
+            .union(assignments.keys)
+            .union(controllers.keys)
+            .union(bindings.keys)
+            .union(currentSessions.keys)
+            .union(queueTimers.keys)
+            .union(hardDeadlineTimers.keys)
+        for key in potentiallyDisconnected where !connectedIDs.contains(key) {
+            invalidateQueueTimers(for: key)
+            currentSessions.removeValue(forKey: key)
             controllers.removeValue(forKey: key)?.teardownAndClose()
-            assignments[key]?.isConnected = false
-            assignments[key]?.applicationState = .disconnected
+            sessionDurations.removeValue(forKey: key)
+            if assignments[key] != nil {
+                assignments[key]?.isConnected = false
+                assignments[key]?.applicationState = .disconnected
+            }
             appliedWallpaperIDs.removeValue(forKey: key)
             playbackStates.removeValue(forKey: key)
         }
@@ -271,21 +315,48 @@ final class WallpaperManager: ObservableObject {
                 )
                 bindings[display.id] = binding
             }
-            guard let binding = bindings[display.id],
-                  let queue = queueLibrary[binding.activeQueueID] else { continue }
-            let state = binding.state(for: queue.id)
-            if state.isEnabled && !queue.wallpaperIDs.isEmpty {
-                startQueue(queueID: queue.id, on: display, policy: policy, items: items, resetIndex: false)
-                continue
+            guard let binding = bindings[display.id] else { continue }
+            let queue = queueLibrary[binding.activeQueueID]
+            let state = queue.map { binding.state(for: $0.id) }
+            let hasEnabledQueue = state?.isEnabled == true && queue?.wallpaperIDs.isEmpty == false
+            let expectedItemID: UUID?
+            if hasEnabledQueue, let queue, let state {
+                expectedItemID = queue.wallpaperIDs[safe: state.currentIndex]
+            } else {
+                expectedItemID = assignments[display.id]?.wallpaperID
             }
-            guard let assignment = assignments[display.id],
-                  let wallpaperID = assignment.wallpaperID,
-                  let item = queueItems[wallpaperID],
-                  item.availability == .available else {
+            let currentItemMatches = expectedItemID != nil
+                && appliedWallpaperIDs[display.id] == expectedItemID
+                && currentSessions[display.id]?.itemID == expectedItemID
+            let expectedAvailable = expectedItemID.flatMap { queueItems[$0]?.availability == .available } ?? false
+            let geometryChanged = previousDisplays[display.id]?.screen.frame != display.screen.frame
+            let action = DisplayReconciler.action(
+                isConnected: true,
+                wasConnected: previousDisplays[display.id] != nil,
+                hasController: controllers[display.id] != nil && currentSessions[display.id] != nil,
+                geometryChanged: geometryChanged,
+                currentItemMatches: currentItemMatches,
+                expectedItemAvailable: expectedAvailable
+            )
+            switch action {
+            case .keep:
+                reconcileMissingTimerIfNeeded(for: display.id, state: state)
                 continue
-            }
-            if controllers[display.id] == nil || appliedWallpaperIDs[display.id] != item.id {
+            case .updateFrame:
+                controllers[display.id]?.updateFrame(for: display.screen)
+                reconcileMissingTimerIfNeeded(for: display.id, state: state)
+                continue
+            case .restore:
+                if hasEnabledQueue, let queue {
+                    startQueue(queueID: queue.id, on: display, policy: policy, items: items, resetIndex: false)
+                    continue
+                }
+                guard let wallpaperID = expectedItemID,
+                      let item = queueItems[wallpaperID],
+                      item.availability == .available else { continue }
                 try? apply(item: item, to: display, policy: policy, preserveQueue: true)
+            case .disconnect:
+                continue
             }
         }
         publishBindings()
@@ -294,8 +365,43 @@ final class WallpaperManager: ObservableObject {
         persistAssignments()
     }
 
+    private func reconcileMissingTimerIfNeeded(for displayID: String, state: DisplayQueueState?) {
+        guard let state, shouldScheduleQueue(for: displayID, state: state), queueTimers[displayID] == nil else {
+            return
+        }
+        reconcileScheduling(for: displayID)
+    }
+
     func restoreAssignments(to displays: [DisplayService.Display], policy: PlaybackPolicy, items: [WallpaperItem]) {
+        // A crash between committing the main index and cleaning queue
+        // references can leave IDs that no longer exist. The index is the
+        // authority for existence; prune those dangling IDs before replaying.
+        pruneDanglingQueueMembers(knownItemIDs: Set(items.map(\.id)))
         reapply(to: displays, policy: policy, items: items)
+    }
+
+    private func pruneDanglingQueueMembers(knownItemIDs: Set<UUID>) {
+        var changed = false
+        for (queueID, queue) in queueLibrary {
+            let dangling = Set(queue.wallpaperIDs).subtracting(knownItemIDs)
+            guard !dangling.isEmpty else { continue }
+            var updated = queue
+            updated.removeWallpaperIDs(dangling)
+            queueLibrary[queueID] = updated
+            changed = true
+            for displayID in bindings.keys {
+                guard var binding = bindings[displayID],
+                      var state = binding.queueStates[queueID] else { continue }
+                state.normalize(for: updated)
+                binding.queueStates[queueID] = state
+                bindings[displayID] = binding
+            }
+        }
+        guard changed else { return }
+        publishQueueLibrary()
+        publishBindings()
+        publishLegacyQueues()
+        persistQueues()
     }
 
     func queue(for displayID: String) -> DisplayPlaybackQueue? {
@@ -331,7 +437,8 @@ final class WallpaperManager: ObservableObject {
         transition: WallpaperTransitionEffect = .crossfade
     ) -> PlaybackQueue? {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
+        guard !persistenceGate.blocksPersistence,
+              !trimmed.isEmpty,
               !playbackQueues.contains(where: { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }) else { return nil }
         let queue = PlaybackQueue(
             name: trimmed,
@@ -349,6 +456,7 @@ final class WallpaperManager: ObservableObject {
 
     @discardableResult
     func updateQueue(_ queue: PlaybackQueue) -> Bool {
+        guard !persistenceGate.blocksPersistence else { return false }
         guard queueLibrary[queue.id] != nil else { return false }
         var normalized = queue
         normalized.normalize()
@@ -378,6 +486,7 @@ final class WallpaperManager: ObservableObject {
 
     @discardableResult
     func deleteQueue(id: UUID, policy: PlaybackPolicy? = nil, items: [WallpaperItem]? = nil) -> Bool {
+        guard !persistenceGate.blocksPersistence else { return false }
         guard let queue = queueLibrary[id], !queue.isDefault else { return false }
         let fallbackID = defaultQueueID
         queueLibrary.removeValue(forKey: id)
@@ -399,6 +508,7 @@ final class WallpaperManager: ObservableObject {
     }
 
     func addWallpaperIDs(_ itemIDs: [UUID], to queueID: UUID, items: [WallpaperItem]) {
+        guard !persistenceGate.blocksPersistence else { return }
         guard var queue = queueLibrary[queueID] else { return }
         let orderedIDs: [UUID]
         switch queue.sortMode {
@@ -428,6 +538,7 @@ final class WallpaperManager: ObservableObject {
     }
 
     func removeWallpaperIDs(_ itemIDs: Set<UUID>, from queueID: UUID) {
+        guard !persistenceGate.blocksPersistence else { return }
         guard var queue = queueLibrary[queueID] else { return }
         queue.removeWallpaperIDs(itemIDs)
         queueLibrary[queueID] = queue
@@ -448,6 +559,7 @@ final class WallpaperManager: ObservableObject {
         policy: PlaybackPolicy,
         items: [WallpaperItem]
     ) {
+        guard !persistenceGate.blocksPersistence else { return }
         guard queueLibrary[queueID] != nil else { return }
         var binding = bindings[display.id] ?? DisplayPlaybackBinding(displayID: display.id, displayName: display.name)
         binding.displayName = display.name
@@ -462,6 +574,7 @@ final class WallpaperManager: ObservableObject {
     }
 
     func saveQueue(_ queue: DisplayPlaybackQueue) {
+        guard !persistenceGate.blocksPersistence else { return }
         let queueID = bindings[queue.displayID]?.activeQueueID ?? UUID()
         let isNew = queueLibrary[queueID] == nil
         let namedQueue = PlaybackQueue(
@@ -530,20 +643,23 @@ final class WallpaperManager: ObservableObject {
         }
         let index = nextAvailableIndex(in: queue, state: state, preferCurrent: true)
         guard let index, let item = queueItems[queue.wallpaperIDs[index]] else { return }
+        let shouldPlay = state.isPlaying || !state.isEnabled
+        var presentationPolicy = policy
+        presentationPolicy.isPlaying = shouldPlay
         state.currentIndex = index
         state.isEnabled = true
-        state.isPlaying = true
+        state.isPlaying = shouldPlay
         binding.queueStates[queueID] = state
         bindings[display.id] = binding
         publishBindings()
         publishLegacyQueues()
         persistQueues()
-        queueTimers[display.id]?.invalidate()
+        invalidateQueueTimers(for: display.id)
         do {
             try apply(
                 item: item,
                 to: display,
-                policy: policy,
+                policy: presentationPolicy,
                 transition: effectiveTransition(queue: queue, state: state),
                 preserveQueue: true,
                 advanceAfterVideoCompletion: shouldAdvanceAfterVideoCompletion(queue: queue, item: item)
@@ -558,8 +674,7 @@ final class WallpaperManager: ObservableObject {
     }
 
     func stopQueue(displayID: String, persist: Bool = true) {
-        hardDeadlineTimers.removeValue(forKey: displayID)?.invalidate()
-        queueTimers.removeValue(forKey: displayID)?.invalidate()
+        invalidateQueueTimers(for: displayID)
         guard var binding = bindings[displayID] else { return }
         let queueID = binding.activeQueueID
         var state = binding.state(for: queueID)
@@ -585,20 +700,26 @@ final class WallpaperManager: ObservableObject {
     }
 
     func setPlaybackEnabledForAll(_ isPlaying: Bool) {
+        playbackPolicy.isPlaying = isPlaying
         for (displayID, controller) in controllers {
             controller.setPlaybackEnabled(isPlaying)
             playbackStates[displayID] = controller.playbackState
             guard var binding = bindings[displayID] else { continue }
             let queueID = binding.activeQueueID
             var state = binding.state(for: queueID)
+            // Pausing playback must not become a permanent queue stop. Keep
+            // the user's queue intent enabled and freeze/resume scheduling in
+            // one place below.
             state.isPlaying = isPlaying
-            state.isEnabled = isPlaying
             binding.queueStates[queueID] = state
             bindings[displayID] = binding
         }
         publishBindings()
         publishLegacyQueues()
         persistQueues()
+        for displayID in bindings.keys {
+            reconcileScheduling(for: displayID)
+        }
     }
 
     func setMutedForAll(_ isMuted: Bool) {
@@ -610,18 +731,22 @@ final class WallpaperManager: ObservableObject {
 
     func togglePlayback(for displayID: String) {
         guard let controller = controllers[displayID] else { return }
-        controller.togglePlayback()
-        playbackStates[displayID] = controller.playbackState
+        if case .staticImage = controller.playbackState { return }
         guard var binding = bindings[displayID] else { return }
         let queueID = binding.activeQueueID
         var state = binding.state(for: queueID)
-        state.isPlaying = controller.playbackState.isPlaying
-        state.isEnabled = controller.playbackState.isPlaying
+        // playbackState also contains system suspension. Toggle the saved user
+        // intent instead of reading the effective (possibly suspended) state.
+        state.isPlaying.toggle()
+        playbackPolicy.isPlaying = state.isPlaying
+        controller.setPlaybackEnabled(state.isPlaying)
+        playbackStates[displayID] = controller.playbackState
         binding.queueStates[queueID] = state
         bindings[displayID] = binding
         publishBindings()
         publishLegacyQueues()
         persistQueues()
+        reconcileScheduling(for: displayID)
     }
 
     func setMuted(_ muted: Bool, for displayID: String) {
@@ -635,6 +760,7 @@ final class WallpaperManager: ObservableObject {
         guard let display = NSScreen.screens.first(where: { self.displayID(for: $0) == displayID }) else { return }
         guard let store, let allItems = try? store.items(), let wallpaper = allItems.first(where: { $0.id == itemID }) else { return }
         playbackPolicy = policy
+        queueItems[wallpaper.id] = wallpaper
         let activeQueue = bindings[displayID].flatMap { queueLibrary[$0.activeQueueID] }
         let advanceAfterVideoCompletion = activeQueue?.usesCompletionAdvance(for: wallpaper.type) == true
         do {
@@ -642,6 +768,7 @@ final class WallpaperManager: ObservableObject {
             // controller; timers are rescheduled for the new playback below.
             let session = PlaybackSession(itemID: wallpaper.id, displayID: displayID)
             currentSessions[displayID] = session
+            sessionDurations[displayID] = Self.validDuration(wallpaper.metadata?.durationSeconds)
             let replacement = try WallpaperWindowController(
                 item: wallpaper,
                 screen: display,
@@ -652,33 +779,20 @@ final class WallpaperManager: ObservableObject {
                 },
                 onFrameProgress: { [weak self] in
                     self?.noteVideoFrameProgress(for: displayID, session: session)
-                }
+                },
+                onVideoDurationChanged: { [weak self] duration in
+                    self?.videoDurationDidChange(for: displayID, session: session, duration: duration)
+                },
+                initialSystemSuspended: isSystemSuspended
             )
             replacement.setSystemSuspended(isSystemSuspended, reloadWebContentOnResume: false)
             controllers[displayID]?.teardownAndClose()
             controllers[displayID] = replacement
             playbackStates[displayID] = replacement.playbackState
             replacement.window?.orderFrontRegardless()
-            // Reload replaces the player entirely: drop the old timer and
-            // re-arm it for the queue/state/item combination that is live now.
-            queueTimers[displayID]?.invalidate()
-            queueTimers.removeValue(forKey: displayID)
-            if let binding = bindings[displayID],
-               let queue = queueLibrary[binding.activeQueueID],
-               let state = binding.queueStates[queue.id],
-               state.isEnabled {
-                if advanceAfterVideoCompletion {
-                    let watchdog = queue.stallWatchdogInterval(
-                        forVideoWithDurationSeconds: wallpaper.metadata?.durationSeconds
-                    )
-                    scheduleQueueTimer(for: displayID, interval: watchdog)
-                } else {
-                    scheduleQueueTimer(
-                        for: displayID,
-                        interval: effectiveInterval(queue: queue, state: state, itemID: wallpaper.id)
-                    )
-                }
-            }
+            // Reload replaces the player entirely. Reconcile all timers for
+            // the live queue state instead of arming a paused queue.
+            reconcileScheduling(for: displayID)
         } catch {
             return
         }
@@ -709,13 +823,22 @@ final class WallpaperManager: ObservableObject {
             bindings = [:]
             displayQueueBindings = [:]
             displayQueues = [:]
+            persistenceGate.recordSuccessfulLoad()
+            queueLoadError = nil
+            queueSaveError = nil
             return
         }
-        let loadedQueues = (try? store.playbackQueues()) ?? [.defaultQueue]
-        playbackQueues = loadedQueues
-        queueLibrary = UniquedDictionary.build(loadedQueues.map { ($0.id, $0) }, label: "playback queues")
-        let loadedBindings = (try? store.displayPlaybackBindings()) ?? []
-        bindings = UniquedDictionary.build(loadedBindings.map { ($0.displayID, $0) }, label: "display bindings")
+        let loadResult = store.loadPlaybackQueueConfiguration()
+        if let loadError = loadResult.loadError {
+            persistenceGate.recordLoadFailure(loadError)
+        } else {
+            persistenceGate.recordSuccessfulLoad()
+        }
+        queueLoadError = persistenceGate.loadError
+        queueSaveError = nil
+        playbackQueues = loadResult.queues
+        queueLibrary = UniquedDictionary.build(loadResult.queues.map { ($0.id, $0) }, label: "playback queues")
+        bindings = UniquedDictionary.build(loadResult.bindings.map { ($0.displayID, $0) }, label: "display bindings")
         for displayID in bindings.keys {
             guard var binding = bindings[displayID], queueLibrary[binding.activeQueueID] == nil else { continue }
             binding.activeQueueID = defaultQueueID
@@ -727,6 +850,17 @@ final class WallpaperManager: ObservableObject {
         publishBindings()
         publishQueueLibrary()
         publishLegacyQueues()
+    }
+
+    /// True while a corrupt queue/bindings file keeps queue writes disabled.
+    var isQueuePersistenceBlocked: Bool { persistenceGate.blocksPersistence }
+
+    /// Re-reads the queue files after the user repairs/restores them.
+    /// Returns true when persistence is available again.
+    @discardableResult
+    func retryLoadingQueues() -> Bool {
+        loadQueues()
+        return !persistenceGate.blocksPersistence
     }
 
     private func publishQueueLibrary() {
@@ -752,24 +886,47 @@ final class WallpaperManager: ObservableObject {
         try? store.save(displayAssignments: displayAssignments)
     }
 
-    private func removeWallpaperIDsFromQueues(_ itemIDs: Set<UUID>) {
-        guard !itemIDs.isEmpty else { return }
-        var restart: [(String, UUID)] = []
+    @discardableResult
+    private func removeWallpaperIDsFromQueues(_ itemIDs: Set<UUID>) -> Set<String> {
+        guard !itemIDs.isEmpty else { return [] }
+        var restart: [(displayID: String, queueID: UUID, removedItemID: UUID?)] = []
         for (queueID, value) in queueLibrary {
             var queue = value
             let wasChanged = queue.wallpaperIDs.contains(where: itemIDs.contains)
             guard wasChanged else { continue }
+
+            // Capture each display's current item before membership changes.
+            var currentItems: [String: UUID] = [:]
+            for displayID in bindings.keys {
+                guard let binding = bindings[displayID], binding.activeQueueID == queueID else { continue }
+                let state = binding.state(for: queueID)
+                if queue.wallpaperIDs.indices.contains(state.currentIndex) {
+                    currentItems[displayID] = queue.wallpaperIDs[state.currentIndex]
+                }
+            }
+
             queue.removeWallpaperIDs(itemIDs)
             queueLibrary[queueID] = queue
             for displayID in bindings.keys {
                 guard var binding = bindings[displayID], binding.activeQueueID == queueID else { continue }
                 var state = binding.state(for: queueID)
                 let wasEnabled = state.isEnabled
+                let currentItemID = currentItems[displayID]
+                let currentRemoved = currentItemID.map { itemIDs.contains($0) } ?? false
+                let fallbackIndex = state.currentIndex
                 state.normalize(for: queue)
+                // Keep the same item when it is still present. If it was
+                // removed, fall back to its old position (the successor, or
+                // the previous item at the end) and restart below.
+                state.currentIndex = PlaybackIndexReconciler.reconciledIndex(
+                    currentItemID: currentRemoved ? nil : currentItemID,
+                    fallbackIndex: fallbackIndex,
+                    remainingIDs: queue.wallpaperIDs
+                )
                 binding.queueStates[queueID] = state
                 bindings[displayID] = binding
-                if wasEnabled {
-                    restart.append((displayID, queueID))
+                if wasEnabled && currentRemoved {
+                    restart.append((displayID, queueID, currentItemID))
                 }
             }
         }
@@ -777,14 +934,24 @@ final class WallpaperManager: ObservableObject {
         publishBindings()
         publishLegacyQueues()
         persistQueues()
-        for (displayID, queueID) in restart {
-            guard let display = connectedDisplays[displayID], let items = queueItems.isEmpty ? nil : Array(queueItems.values) else { continue }
+        var restarted: Set<String> = []
+        for (displayID, queueID, removedItemID) in restart {
+            guard let display = connectedDisplays[displayID],
+                  let items = queueItems.isEmpty ? nil : Array(queueItems.values) else { continue }
             if queueLibrary[queueID]?.wallpaperIDs.isEmpty == true {
+                guard let defaultQueue = queueLibrary[defaultQueueID], !defaultQueue.wallpaperIDs.isEmpty else { continue }
                 setActiveQueue(defaultQueueID, for: display, policy: playbackPolicy, items: items)
             } else {
                 startQueue(queueID: queueID, on: display, policy: playbackPolicy, items: items, resetIndex: false)
             }
+            // Only consider the display handled when a different item is
+            // actually on screen; otherwise the old controller still shows the
+            // deleted wallpaper and must be cleared below.
+            if let applied = appliedWallpaperIDs[displayID], applied != removedItemID {
+                restarted.insert(displayID)
+            }
         }
+        return restarted
     }
 
     private func publishLegacyQueues() {
@@ -807,9 +974,22 @@ final class WallpaperManager: ObservableObject {
     }
 
     private func persistQueues() {
+        guard !persistenceGate.blocksPersistence else {
+            // Loading failed: the in-memory state is a fallback, never the
+            // user's data. Keep the original files untouched until a reload
+            // succeeds.
+            return
+        }
         guard let store else { return }
-        try? store.save(playbackQueues: playbackQueues)
-        try? store.save(displayPlaybackBindings: Array(bindings.values))
+        do {
+            try store.save(
+                playbackQueues: playbackQueues,
+                displayPlaybackBindings: Array(bindings.values)
+            )
+            queueSaveError = nil
+        } catch {
+            queueSaveError = "保存播放队列失败：\(error.localizedDescription)"
+        }
     }
 
     private func effectiveInterval(queue: PlaybackQueue, state: DisplayQueueState, itemID: UUID) -> Double {
@@ -833,7 +1013,7 @@ final class WallpaperManager: ObservableObject {
         for displayID in Array(bindings.keys) {
             guard var binding = bindings[displayID],
                   binding.invalidateActiveQueue(ifMatching: queueID) else { continue }
-            queueTimers.removeValue(forKey: displayID)?.invalidate()
+            invalidateQueueTimers(for: displayID)
             bindings[displayID] = binding
             changed = true
         }
@@ -852,26 +1032,109 @@ final class WallpaperManager: ObservableObject {
         for displayID: String,
         queue: PlaybackQueue,
         state: DisplayQueueState,
-        item: WallpaperItem
+        item: WallpaperItem,
+        resumeFromSnapshot: Bool = false
     ) {
+        guard shouldScheduleQueue(for: displayID, state: state) else {
+            freezeQueueTimers(for: displayID)
+            return
+        }
         if shouldAdvanceAfterVideoCompletion(queue: queue, item: item) {
             // Still arm a watchdog: video-completion queues rely solely on the
             // player callback, so a failed start or hung decode would stall
             // the queue forever with no timer to recover. The frame heartbeat
             // re-arms this while the pipeline is alive.
-            let watchdog = queue.stallWatchdogInterval(forVideoWithDurationSeconds: item.metadata?.durationSeconds)
+            let fullWatchdog = queue.stallWatchdogInterval(
+                forVideoWithDurationSeconds: durationForCurrentSession(displayID: displayID, itemID: item.id)
+            )
+            let watchdog = PlaybackDeadlineMath.interval(
+                full: fullWatchdog,
+                remaining: remainingQueueIntervals[displayID],
+                resume: resumeFromSnapshot
+            )
+            let deadline = PlaybackDeadlineMath.interval(
+                full: queue.hardDeadlineInterval,
+                remaining: remainingHardDeadlines[displayID],
+                resume: resumeFromSnapshot
+            )
             scheduleQueueTimer(for: displayID, interval: watchdog)
-            // Absolute ceiling the heartbeat cannot extend.
-            hardDeadlineTimers[displayID]?.invalidate()
-            let deadline = queue.hardDeadlineInterval
-            hardDeadlineTimers[displayID] = Timer.scheduledTimer(withTimeInterval: deadline, repeats: false) { [weak self] _ in
+            // Absolute ceiling the heartbeat cannot extend. Both callbacks
+            // carry the same scheduling generation as the watchdog.
+            let generation = queueTimerGenerations[displayID] ?? 0
+            hardDeadlineTimers[displayID] = Timer.scheduledTimer(withTimeInterval: max(1, deadline), repeats: false) { [weak self] _ in
                 Task { @MainActor [weak self] in
-                    self?.advanceQueue(for: displayID)
+                    self?.advanceQueue(for: displayID, generation: generation)
                 }
             }
         } else {
-            hardDeadlineTimers.removeValue(forKey: displayID)?.invalidate()
-            scheduleQueueTimer(for: displayID, interval: effectiveInterval(queue: queue, state: state, itemID: item.id))
+            let fullInterval = effectiveInterval(queue: queue, state: state, itemID: item.id)
+            let interval = PlaybackDeadlineMath.interval(
+                full: fullInterval,
+                remaining: remainingQueueIntervals[displayID],
+                resume: resumeFromSnapshot
+            )
+            scheduleQueueTimer(for: displayID, interval: interval)
+        }
+    }
+
+    private func videoDurationDidChange(for displayID: String, session: PlaybackSession, duration: Double?) {
+        guard currentSessions[displayID] == session else { return }
+        updateDuration(for: session.itemID, duration: duration)
+    }
+
+    private static func validDuration(_ value: Double?) -> Double? {
+        guard let value, value.isFinite, value > 0 else { return nil }
+        return value
+    }
+
+    private func durationForCurrentSession(displayID: String, itemID: UUID) -> Double? {
+        if let duration = sessionDurations[displayID] { return duration }
+        return Self.validDuration(queueItems[itemID]?.metadata?.durationSeconds)
+    }
+
+    /// Applies a persisted fit-mode change without replacing the active player
+    /// or resetting its queue session.
+    func updateFitMode(for item: WallpaperItem) {
+        queueItems[item.id] = item
+        let mode = item.effectiveFitMode(global: playbackPolicy.fitMode)
+        for (displayID, assignment) in assignments where assignment.wallpaperID == item.id {
+            controllers[displayID]?.setFitMode(mode)
+        }
+    }
+
+    /// Updates the in-memory duration for the current player without doing a
+    /// second persistence write. Metadata enrichment also calls this for items
+    /// that are already on screen.
+    func updateDuration(for itemID: UUID, duration: Double?) {
+        guard var item = queueItems[itemID] else { return }
+        if item.metadata == nil {
+            item.metadata = WallpaperMetadata(durationSeconds: duration)
+        } else {
+            item.metadata?.durationSeconds = duration
+        }
+        queueItems[itemID] = item
+        let normalized = Self.validDuration(duration)
+        for (displayID, session) in currentSessions where session.itemID == itemID {
+            // A later unavailable duration must not clear a known valid one.
+            if normalized == nil && sessionDurations[displayID] != nil { continue }
+            // Repeated ready/enrichment values are not a heartbeat and must
+            // not extend the watchdog. Only a changed valid duration corrects
+            // the current session's stall timer.
+            guard sessionDurations[displayID] != normalized else { continue }
+            sessionDurations[displayID] = normalized
+            guard let binding = bindings[displayID],
+                  let queue = queueLibrary[binding.activeQueueID],
+                  queue.usesCompletionAdvance(for: .video) else { continue }
+            let stall = queue.stallWatchdogInterval(
+                forVideoWithDurationSeconds: durationForCurrentSession(displayID: displayID, itemID: itemID)
+            )
+            if let timer = queueTimers[displayID], timer.isValid {
+                timer.fireDate = Date().addingTimeInterval(stall)
+            } else if remainingQueueIntervals[displayID] != nil {
+                // Paused: update only the saved stall snapshot. Do not create
+                // a timer or touch the hard deadline/generation.
+                remainingQueueIntervals[displayID] = stall
+            }
         }
     }
 
@@ -887,14 +1150,19 @@ final class WallpaperManager: ObservableObject {
               let queue = queueLibrary[binding.activeQueueID],
               let state = binding.queueStates[queue.id],
               state.isEnabled,
+              state.isPlaying,
+              !isSystemSuspended,
               queue.advanceMode == .videoCompletion else { return }
         let itemID = queue.wallpaperIDs[safe: state.currentIndex]
-        let duration = itemID.flatMap { queueItems[$0]?.metadata?.durationSeconds }
+        guard itemID == session.itemID else { return }
+        let duration = itemID.flatMap { durationForCurrentSession(displayID: displayID, itemID: $0) }
         let stallWindow = queue.stallWatchdogInterval(forVideoWithDurationSeconds: duration)
         if let timer = queueTimers[displayID], timer.isValid {
             timer.fireDate = Date().addingTimeInterval(stallWindow)
         } else {
-            scheduleQueueTimer(for: displayID, interval: stallWindow)
+            // Recreate both watchdog and hard deadline when a resume/reload
+            // invalidated them; a heartbeat alone must not lose the ceiling.
+            reconcileScheduling(for: displayID)
         }
     }
 
@@ -907,6 +1175,8 @@ final class WallpaperManager: ObservableObject {
               let queue = queueLibrary[binding.activeQueueID],
               let state = binding.queueStates[queue.id],
               state.isEnabled,
+              state.isPlaying,
+              !isSystemSuspended,
               queue.advanceMode == .videoCompletion,
               let itemID = queue.wallpaperIDs[safe: state.currentIndex],
               itemID == session.itemID,
@@ -916,22 +1186,84 @@ final class WallpaperManager: ObservableObject {
     }
 
     private func scheduleQueueTimer(for displayID: String, interval: Double) {
-        queueTimers[displayID]?.invalidate()
+        invalidateQueueTimers(for: displayID)
+        let generation = queueTimerGenerations[displayID] ?? 0
         queueTimers[displayID] = Timer.scheduledTimer(withTimeInterval: max(1, interval), repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.advanceQueue(for: displayID)
+                self?.advanceQueue(for: displayID, generation: generation)
             }
         }
     }
 
-    private func advanceQueue(for displayID: String) {
+    private func invalidateQueueTimers(for displayID: String) {
+        queueTimerGenerations[displayID] = (queueTimerGenerations[displayID] ?? 0) + 1
+        queueTimers.removeValue(forKey: displayID)?.invalidate()
+        hardDeadlineTimers.removeValue(forKey: displayID)?.invalidate()
+        remainingQueueIntervals.removeValue(forKey: displayID)
+        remainingHardDeadlines.removeValue(forKey: displayID)
+    }
+
+    private func freezeQueueTimers(for displayID: String) {
+        // Preserve the first pause's deadlines. Repeated pause notifications
+        // must not overwrite the remaining time or extend it again.
+        if remainingQueueIntervals[displayID] == nil, let timer = queueTimers[displayID] {
+            remainingQueueIntervals[displayID] = PlaybackDeadlineMath.remaining(fireDate: timer.fireDate, now: Date())
+        }
+        if remainingHardDeadlines[displayID] == nil, let timer = hardDeadlineTimers[displayID] {
+            remainingHardDeadlines[displayID] = PlaybackDeadlineMath.remaining(fireDate: timer.fireDate, now: Date())
+        }
+        queueTimerGenerations[displayID] = (queueTimerGenerations[displayID] ?? 0) + 1
+        queueTimers.removeValue(forKey: displayID)?.invalidate()
+        hardDeadlineTimers.removeValue(forKey: displayID)?.invalidate()
+    }
+
+    private func shouldScheduleQueue(for displayID: String, state: DisplayQueueState) -> Bool {
+        PlaybackSchedulingState(
+            isQueueEnabled: state.isEnabled,
+            isPlaybackWanted: state.isPlaying,
+            isSystemSuspended: isSystemSuspended,
+            isDisplayConnected: connectedDisplays[displayID] != nil
+        ).shouldSchedule
+    }
+
+    private func reconcileScheduling(for displayID: String) {
+        guard let binding = bindings[displayID],
+              let queue = queueLibrary[binding.activeQueueID],
+              let state = binding.queueStates[queue.id],
+              queue.wallpaperIDs.indices.contains(state.currentIndex),
+              let item = queueItems[queue.wallpaperIDs[state.currentIndex]] else {
+            invalidateQueueTimers(for: displayID)
+            return
+        }
+        let resumeFromSnapshot = remainingQueueIntervals[displayID] != nil || remainingHardDeadlines[displayID] != nil
+        scheduleQueueTimerIfNeeded(
+            for: displayID,
+            queue: queue,
+            state: state,
+            item: item,
+            resumeFromSnapshot: resumeFromSnapshot
+        )
+    }
+
+    private func advanceQueue(for displayID: String, generation: Int? = nil) {
+        if let generation, generation != queueTimerGenerations[displayID] { return }
         guard let binding = bindings[displayID],
               let queue = queueLibrary[binding.activeQueueID],
               let display = connectedDisplays[displayID] else {
-            stopQueue(displayID: displayID)
+            // A missing display is not a user stop. Preserve queue intent and
+            // do not let a stale deadline persistently disable reconnection.
+            invalidateQueueTimers(for: displayID)
+            currentSessions.removeValue(forKey: displayID)
+            sessionDurations.removeValue(forKey: displayID)
             return
         }
         let state = binding.state(for: queue.id)
+        guard shouldScheduleQueue(for: displayID, state: state) else {
+            // A pause is not a stop: preserve the queue's enabled intent and
+            // remaining deadlines, then let resume reconcile its timers.
+            freezeQueueTimers(for: displayID)
+            return
+        }
         guard state.isEnabled, let next = nextQueueIndex(queue: queue, state: state) else {
             stopQueue(displayID: displayID)
             return
@@ -950,10 +1282,12 @@ final class WallpaperManager: ObservableObject {
         publishLegacyQueues()
         persistQueues()
         do {
+            var advancePolicy = playbackPolicy
+            advancePolicy.isPlaying = nextState.isPlaying
             try apply(
                 item: item,
                 to: display,
-                policy: playbackPolicy,
+                policy: advancePolicy,
                 transition: effectiveTransition(queue: queue, state: nextState),
                 preserveQueue: true,
                 advanceAfterVideoCompletion: shouldAdvanceAfterVideoCompletion(queue: queue, item: item)
@@ -1089,7 +1423,9 @@ private final class WallpaperWindowController: NSWindowController {
         policy: PlaybackPolicy,
         advanceAfterVideoCompletion: Bool = false,
         onVideoPlaybackCompleted: (() -> Void)? = nil,
-        onFrameProgress: (() -> Void)? = nil
+        onFrameProgress: (() -> Void)? = nil,
+        onVideoDurationChanged: ((Double?) -> Void)? = nil,
+        initialSystemSuspended: Bool = false
     ) throws {
         isWebWallpaper = item.type == .web
         let window = WallpaperWindow(
@@ -1102,6 +1438,8 @@ private final class WallpaperWindowController: NSWindowController {
             loops: policy.loops && !advanceAfterVideoCompletion,
             onVideoPlaybackCompleted: onVideoPlaybackCompleted,
             onFrameProgress: onFrameProgress,
+            onVideoDurationChanged: onVideoDurationChanged,
+            initialSystemSuspended: initialSystemSuspended,
             frame: NSRect(origin: .zero, size: screen.frame.size)
         )
         wallpaperContentView = contentView
@@ -1127,6 +1465,7 @@ private final class WallpaperWindowController: NSWindowController {
 
     func setWebInteractionEnabled(_ enabled: Bool) {
         (window as? WallpaperWindow)?.setAllowsMouseEvents(isWebWallpaper && enabled)
+        wallpaperContentView.setWebInteractionEnabled(enabled)
     }
 
     func setSystemSuspended(_ suspended: Bool, reloadWebContentOnResume: Bool) {
@@ -1134,6 +1473,14 @@ private final class WallpaperWindowController: NSWindowController {
             suspended,
             reloadWebContentOnResume: reloadWebContentOnResume
         )
+    }
+
+    /// Geometry-only updates keep the existing controller, player and queue
+    /// session alive instead of restarting playback at zero.
+    func updateFrame(for screen: NSScreen) {
+        window?.setFrame(screen.frame, display: true)
+        wallpaperContentView.frame = NSRect(origin: .zero, size: screen.frame.size)
+        wallpaperContentView.needsLayout = true
     }
 
     /// Explicitly releases the resources owned by a wallpaper window before it
@@ -1205,17 +1552,33 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
     /// The user's requested playback state. System suspension never changes this value.
     private var isPlaying: Bool
     private var isSystemSuspended = false
+    private var webInteractionEnabled: Bool
+    private let reloadWebContentOnResume: Bool
+    private var navigationAuthorizer = ExternalNavigationAuthorizer()
     private var isMuted: Bool
     private var fitMode: WallpaperFitMode
     private let loops: Bool
     private let onVideoPlaybackCompleted: (() -> Void)?
     private let onFrameProgress: (() -> Void)?
+    private let onVideoDurationChanged: ((Double?) -> Void)?
     private var imageLayer: CALayer?
+    private var imageContentLayer: CALayer?
     private var player: AVPlayer?
     private var playerLayer: AVPlayerLayer?
+    private var playerPresentationLayer: CALayer?
+    private var playerTileSize: CGSize?
+    private var lastPresentationBounds: CGSize?
+    private var videoNaturalSize: CGSize?
+    private var progressObserver: Any?
+    private var progressTracker = VideoPlaybackProgressTracker()
     private var streamingController: WallpaperVideoStreamController?
     private var webView: WKWebView?
     private var webErrorLabel: NSTextField?
+    private var webRecoveryState = WebContentRecoveryState()
+    private var webRecoveryWorkItem: DispatchWorkItem?
+    private var webLoadTimeoutWorkItem: DispatchWorkItem?
+    private var webHealthyWorkItem: DispatchWorkItem?
+    private var webRecoveryGeneration = 0
     private var loopObserver: NSObjectProtocol?
     private var compatibilityTask: Task<Void, Never>?
     private var isTornDown = false
@@ -1237,15 +1600,21 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
         loops: Bool,
         onVideoPlaybackCompleted: (() -> Void)?,
         onFrameProgress: (() -> Void)? = nil,
+        onVideoDurationChanged: ((Double?) -> Void)? = nil,
+        initialSystemSuspended: Bool = false,
         frame: NSRect
     ) throws {
         self.item = item
         self.isPlaying = policy.isPlaying
+        self.webInteractionEnabled = policy.webWallpaperInteractionEnabled
+        self.reloadWebContentOnResume = policy.reloadWebContentOnResume
         self.isMuted = policy.isMuted
-        self.fitMode = policy.fitMode
+        self.fitMode = item.effectiveFitMode(global: policy.fitMode)
         self.loops = loops
         self.onVideoPlaybackCompleted = onVideoPlaybackCompleted
         self.onFrameProgress = onFrameProgress
+        self.onVideoDurationChanged = onVideoDurationChanged
+        self.isSystemSuspended = initialSystemSuspended
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
@@ -1268,6 +1637,8 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
     /// ffmpeg, AVPlayer). Does not touch AppKit layer/view hierarchy.
     private func releasePlaybackResources() {
         isPlaying = false
+        navigationAuthorizer.cancel()
+        webView?.evaluateJavaScript(WebMouseEventScript.clearMouseState(), completionHandler: nil)
 
         if let loopObserver {
             NotificationCenter.default.removeObserver(loopObserver)
@@ -1275,6 +1646,17 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
         }
         compatibilityTask?.cancel()
         compatibilityTask = nil
+        webRecoveryGeneration += 1
+        webRecoveryWorkItem?.cancel()
+        webLoadTimeoutWorkItem?.cancel()
+        webHealthyWorkItem?.cancel()
+        webRecoveryWorkItem = nil
+        webLoadTimeoutWorkItem = nil
+        webHealthyWorkItem = nil
+        if let progressObserver {
+            player?.removeTimeObserver(progressObserver)
+            self.progressObserver = nil
+        }
         streamingController?.teardown()
         streamingController = nil
 
@@ -1286,12 +1668,17 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
 
     /// AppKit hierarchy removal — main thread only.
     private func removeInterfaceViews() {
+        playerPresentationLayer?.removeFromSuperlayer()
+        playerPresentationLayer = nil
+        playerTileSize = nil
+        videoNaturalSize = nil
         playerLayer?.removeFromSuperlayer()
         imageLayer?.removeFromSuperlayer()
         layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
         layer?.contents = nil
         playerLayer = nil
         imageLayer = nil
+        imageContentLayer = nil
 
         webView?.stopLoading()
         webView?.navigationDelegate = nil
@@ -1343,19 +1730,106 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
         }
     }
 
+    private var isWebMouseDragCancelled = false
+    private var webMouseDownLocation: NSPoint?
+
+    private func cancelWebMouseGesture() {
+        isWebMouseDragCancelled = true
+        webMouseDownLocation = nil
+        navigationAuthorizer.cancel()
+        webView?.evaluateJavaScript(WebMouseEventScript.clearMouseState(), completionHandler: nil)
+    }
+
     private func dispatchWebMouseEvent(_ event: NSEvent, phase: WebMouseEventPhase) {
         guard let webView else { return }
+        let disallowedModifiers: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
+        if !event.modifierFlags.intersection(disallowedModifiers).isEmpty {
+            cancelWebMouseGesture()
+            return
+        }
+        if phase == .mouseDown {
+            isWebMouseDragCancelled = false
+        }
         let localPoint = convert(event.locationInWindow, from: nil)
+        if phase == .mouseDown {
+            webMouseDownLocation = localPoint
+        }
+        let outside = localPoint.x < 0 || localPoint.x > bounds.width || localPoint.y < 0 || localPoint.y > bounds.height
+        if outside || (phase == .mouseUp && isWebMouseDragCancelled) {
+            cancelWebMouseGesture()
+            isWebMouseDragCancelled = false
+            return
+        }
         let x = max(0, min(bounds.width, localPoint.x))
         let y = max(0, min(bounds.height, bounds.height - localPoint.y))
-        let script = WebMouseEventScript.source(x: x, y: y, phase: phase)
-        webView.evaluateJavaScript(script, completionHandler: nil)
+        if phase == .mouseUp {
+            // First evaluate the real activation target without clicking. The
+            // host authorizes only that exact target, then activates it once.
+            let evaluate = WebMouseEventScript.evaluateMouseUp(x: x, y: y)
+            let gestureTime = ProcessInfo.processInfo.systemUptime
+            webView.evaluateJavaScript(evaluate) { [weak self, weak webView] result, _ in
+                guard let self, let webView, !self.isTornDown, self.webView === webView,
+                      let payload = result as? [String: Any],
+                      let shouldActivate = payload["activate"] as? Bool else { return }
+                guard shouldActivate,
+                      self.webInteractionEnabled,
+                      self.isPlaying,
+                      !self.isSystemSuspended else {
+                    self.navigationAuthorizer.cancel()
+                    webView.evaluateJavaScript(WebMouseEventScript.clearMouseState(), completionHandler: nil)
+                    return
+                }
+                let urlString = payload["url"] as? String ?? ""
+                if !urlString.isEmpty {
+                    guard let url = URL(string: urlString), WebWallpaperURL.isValid(url) else {
+                        self.navigationAuthorizer.cancel()
+                        webView.evaluateJavaScript(WebMouseEventScript.clearMouseState(), completionHandler: nil)
+                        return
+                    }
+                    self.navigationAuthorizer.prepare(
+                        url: url,
+                        now: gestureTime,
+                        interactionEnabled: self.webInteractionEnabled,
+                        isPlaying: self.isPlaying,
+                        isSystemSuspended: self.isSystemSuspended
+                    )
+                }
+                webView.evaluateJavaScript(WebMouseEventScript.activateMouseUp(), completionHandler: nil)
+            }
+        } else {
+            let script = WebMouseEventScript.source(x: x, y: y, phase: phase)
+            webView.evaluateJavaScript(script, completionHandler: nil)
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard item.type == .web, let start = webMouseDownLocation else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        let outside = point.x < 0 || point.x > bounds.width || point.y < 0 || point.y > bounds.height
+        // AppKit can send a drag event for a sub-pixel movement. Preserve the
+        // script's 6px tolerance; only a real drag or leaving the view cancels.
+        if outside || hypot(point.x - start.x, point.y - start.y) > 6 {
+            cancelWebMouseGesture()
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard item.type == .web else { return }
+        cancelWebMouseGesture()
     }
 
     override func layout() {
         super.layout()
+        let sizeChanged = lastPresentationBounds != bounds.size
+        lastPresentationBounds = bounds.size
+        if sizeChanged, fitMode == .tile {
+            // Replicator grids freeze their column/row counts. Rebuild only
+            // the presentation layers when the viewport changes.
+            if imageContentLayer != nil { rebuildImagePresentation() }
+            if playerLayer != nil { rebuildPlayerPresentation() }
+        }
         imageLayer?.frame = bounds
-        playerLayer?.frame = bounds
+        playerPresentationLayer?.frame = bounds
         streamingController?.setFrame(bounds)
         webView?.frame = bounds
         webErrorLabel?.frame = NSRect(
@@ -1381,55 +1855,31 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
     func setFitMode(_ fitMode: WallpaperFitMode) {
         guard !isTornDown, self.fitMode != fitMode else { return }
         self.fitMode = fitMode
-        imageLayer?.contentsGravity = imageContentsGravity
-        playerLayer?.videoGravity = videoGravity
-        streamingController?.setVideoGravity(videoGravity)
+        rebuildImagePresentation()
+        rebuildPlayerPresentation()
+        streamingController?.setFitMode(fitMode)
+    }
+
+    func setWebInteractionEnabled(_ enabled: Bool) {
+        webInteractionEnabled = enabled
+        if !enabled {
+            navigationAuthorizer.cancel()
+            webView?.evaluateJavaScript(WebMouseEventScript.clearMouseState(), completionHandler: nil)
+        }
     }
 
     func setSystemSuspended(_ suspended: Bool, reloadWebContentOnResume: Bool) {
         guard !isTornDown else { return }
-        let wasSuspended = isSystemSuspended
         isSystemSuspended = suspended
-        if wasSuspended && !suspended && reloadWebContentOnResume && item.type == .web {
-            webView?.reload()
-            return
-        }
         applyPlaybackState()
-    }
-
-    private var imageContentsGravity: CALayerContentsGravity {
-        isPortraitAsset || fitMode == .fit ? .resizeAspect : .resizeAspectFill
-    }
-
-    private var videoGravity: AVLayerVideoGravity {
-        isPortraitAsset || fitMode == .fit ? .resizeAspect : .resizeAspectFill
-    }
-
-    /// Memoized per content view: gravity recomputes on every layout pass.
-    private lazy var cachedIsPortraitAsset: Bool = resolveIsPortraitAsset()
-
-    private var isPortraitAsset: Bool {
-        cachedIsPortraitAsset
-    }
-
-    private func resolveIsPortraitAsset() -> Bool {
-        if let width = item.metadata?.pixelWidth,
-           let height = item.metadata?.pixelHeight,
-           width > 0,
-           height > 0 {
-            return height > width
-        }
-        if let thumbnailURL = item.thumbnailURL, thumbnailURL.isFileURL {
-            return ThumbnailCache.shared.isPortrait(at: thumbnailURL)
-        }
-        if item.type == .image, item.sourceURL.isFileURL {
-            return ThumbnailCache.shared.isPortrait(at: item.sourceURL)
-        }
-        return false
     }
 
     private func applyPlaybackState() {
         let shouldPlay = isPlaying && !isSystemSuspended
+        if !shouldPlay {
+            progressTracker.resetClock()
+            navigationAuthorizer.cancel()
+        }
         switch item.type {
         case .image:
             break
@@ -1442,8 +1892,51 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
                 player?.pause()
             }
         case .web:
+            if !shouldPlay {
+                webRecoveryGeneration += 1
+                webRecoveryWorkItem?.cancel()
+                webRecoveryWorkItem = nil
+                webLoadTimeoutWorkItem?.cancel()
+                webLoadTimeoutWorkItem = nil
+                webHealthyWorkItem?.cancel()
+                webHealthyWorkItem = nil
+            }
+            if !shouldPlay && reloadWebContentOnResume {
+                // When reload-on-resume is allowed, fully release the renderer
+                // so timers, CSS animation and network work stop as well.
+                destroyWebContent()
+                return
+            }
+            if shouldPlay && webView == nil && reloadWebContentOnResume {
+                configureWebPlayback()
+            }
+            // Public WebKit API: unlike a one-time DOM pause(), this also
+            // blocks later play() calls and newly inserted media.
+            webView?.setAllMediaPlaybackSuspended(!shouldPlay, completionHandler: nil)
             evaluateMediaScript(shouldPlay ? "play" : "pause")
+            if shouldPlay, webErrorLabel?.isHidden == false {
+                scheduleWebRecovery()
+            }
         }
+    }
+
+    private func destroyWebContent() {
+        navigationAuthorizer.cancel()
+        webRecoveryGeneration += 1
+        webRecoveryWorkItem?.cancel()
+        webRecoveryWorkItem = nil
+        webLoadTimeoutWorkItem?.cancel()
+        webLoadTimeoutWorkItem = nil
+        webHealthyWorkItem?.cancel()
+        webHealthyWorkItem = nil
+        webView?.evaluateJavaScript(WebMouseEventScript.clearMouseState(), completionHandler: nil)
+        webView?.stopLoading()
+        webView?.navigationDelegate = nil
+        webView?.uiDelegate = nil
+        webView?.removeFromSuperview()
+        webView = nil
+        webErrorLabel?.removeFromSuperview()
+        webErrorLabel = nil
     }
 
     func setMuted(_ muted: Bool) {
@@ -1464,47 +1957,116 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
                 throw WallpaperContentError.cannotLoadResource(item.sourceURL)
             }
             let imageLayer = CALayer()
-            imageLayer.frame = bounds
             imageLayer.contents = cgImage
-            imageLayer.contentsGravity = imageContentsGravity
             imageLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
             imageLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-            layer?.addSublayer(imageLayer)
-            self.imageLayer = imageLayer
+            imageContentLayer = imageLayer
+            rebuildImagePresentation()
         case .video:
             configureVideoPlayback(at: item.playbackURL ?? item.sourceURL)
         case .web:
-            let configuration = WKWebViewConfiguration()
-            configuration.mediaTypesRequiringUserActionForPlayback = []
-            let webView = WKWebView(frame: bounds, configuration: configuration)
-            webView.autoresizingMask = [.width, .height]
-            webView.allowsBackForwardNavigationGestures = false
-            webView.navigationDelegate = self
-            webView.uiDelegate = self
-            webView.setValue(false, forKey: "drawsBackground")
-            let entryURL = item.entryURL ?? item.sourceURL
-            if entryURL.isFileURL {
-                let readRoot = item.sourceURL.isExistingDirectory
-                    ? item.sourceURL
-                    : item.sourceURL.deletingLastPathComponent()
-                webView.loadFileURL(entryURL, allowingReadAccessTo: readRoot)
-            } else if WebWallpaperURL.isValid(entryURL) {
-                webView.load(URLRequest(url: entryURL))
-            } else {
-                throw WallpaperContentError.cannotLoadResource(entryURL)
-            }
-            addSubview(webView)
-            self.webView = webView
-            let errorLabel = NSTextField(wrappingLabelWithString: "网页加载失败，请检查网络后重新加载。")
-            errorLabel.alignment = .center
-            errorLabel.textColor = .white
-            errorLabel.backgroundColor = NSColor.black.withAlphaComponent(0.72)
-            errorLabel.drawsBackground = true
-            errorLabel.isBezeled = false
-            errorLabel.isHidden = true
-            addSubview(errorLabel)
-            self.webErrorLabel = errorLabel
+            configureWebPlayback()
         }
+    }
+
+    private var displayContentScale: CGFloat {
+        window?.screen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
+    }
+
+    private func rebuildImagePresentation() {
+        guard let content = imageContentLayer else { return }
+        imageLayer?.removeFromSuperlayer()
+        let originalSize: CGSize
+        if let contents = content.contents {
+            // The image branch always stores a CGImage in contents.
+            let image = contents as! CGImage
+            originalSize = CGSize(width: image.width, height: image.height)
+        } else {
+            originalSize = bounds.size
+        }
+        imageLayer = WallpaperLayerLayout.make(
+            content: content,
+            originalSize: originalSize,
+            bounds: bounds,
+            mode: fitMode,
+            contentScale: displayContentScale
+        )
+        if let imageLayer {
+            layer?.addSublayer(imageLayer)
+        }
+    }
+
+    private func rebuildPlayerPresentation() {
+        guard let content = playerLayer else { return }
+        playerPresentationLayer?.removeFromSuperlayer()
+        let originalSize = currentMediaSize
+        playerTileSize = originalSize
+        playerPresentationLayer = WallpaperLayerLayout.make(
+            content: content,
+            originalSize: originalSize,
+            bounds: bounds,
+            mode: fitMode,
+            contentScale: displayContentScale
+        )
+        if let playerPresentationLayer {
+            layer?.addSublayer(playerPresentationLayer)
+        }
+    }
+
+    private var knownMediaSize: CGSize? {
+        if let videoNaturalSize, videoNaturalSize.width > 0, videoNaturalSize.height > 0 {
+            return videoNaturalSize
+        }
+        if let width = item.metadata?.pixelWidth,
+           let height = item.metadata?.pixelHeight,
+           width > 0, height > 0 {
+            return CGSize(width: width, height: height)
+        }
+        if let size = player?.currentItem?.presentationSize,
+           size.width > 0, size.height > 0 {
+            return CGSize(width: size.width, height: size.height)
+        }
+        return nil
+    }
+
+    private var currentMediaSize: CGSize {
+        knownMediaSize ?? bounds.size
+    }
+
+    private func configureWebPlayback() {
+        guard webView == nil else { return }
+        let configuration = WKWebViewConfiguration()
+        configuration.mediaTypesRequiringUserActionForPlayback = []
+        let webView = WKWebView(frame: bounds, configuration: configuration)
+        webView.autoresizingMask = [.width, .height]
+        webView.allowsBackForwardNavigationGestures = false
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        webView.setValue(false, forKey: "drawsBackground")
+        let entryURL = item.entryURL ?? item.sourceURL
+        if entryURL.isFileURL {
+            // A single file is authorized only for itself. A directory
+            // project is authorized for the directory explicitly imported.
+            let readRoot = item.sourceURL
+            webView.loadFileURL(entryURL, allowingReadAccessTo: readRoot)
+        } else if WebWallpaperURL.isValid(entryURL) {
+            webView.load(URLRequest(url: entryURL))
+        } else {
+            return
+        }
+        addSubview(webView)
+        self.webView = webView
+        let errorLabel = NSTextField(wrappingLabelWithString: "网页加载失败，请检查网络后重新加载。")
+        errorLabel.alignment = .center
+        errorLabel.textColor = .white
+        errorLabel.backgroundColor = NSColor.black.withAlphaComponent(0.72)
+        errorLabel.drawsBackground = true
+        errorLabel.isBezeled = false
+        errorLabel.isHidden = true
+        addSubview(errorLabel)
+        self.webErrorLabel = errorLabel
+        applyPlaybackState()
+        startWebLoadWatchdog()
     }
 
     private func configureVideoPlayback(at sourceURL: URL) {
@@ -1513,6 +2075,21 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
             do {
                 let asset = AVURLAsset(url: sourceURL)
                 let isPlayable = try await asset.load(.isPlayable)
+                let tracks = try await asset.loadTracks(withMediaType: .video)
+                var displaySize: CGSize?
+                if let track = tracks.first {
+                    let naturalSize = try await track.load(.naturalSize)
+                    let transform = try await track.load(.preferredTransform)
+                    let displayRect = CGRect(origin: .zero, size: naturalSize).applying(transform).standardized
+                    displaySize = CGSize(width: abs(displayRect.width), height: abs(displayRect.height))
+                }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.videoNaturalSize = displaySize
+                    if self.fitMode == .tile {
+                        self.rebuildPlayerPresentation()
+                    }
+                }
                 let codec = try await videoCodec(for: asset)
                 guard !Task.isCancelled else { return }
                 guard VideoPlaybackCompatibility.requiresConversion(
@@ -1546,14 +2123,18 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
         let controller = WallpaperVideoStreamController(
             sourceURL: sourceURL,
             isPlaying: isPlaying && !isSystemSuspended,
-            videoGravity: videoGravity,
             loops: loops,
             frame: bounds,
             onVideoPlaybackCompleted: onVideoPlaybackCompleted,
-            onFrameProgress: onFrameProgress
+            onFrameProgress: onFrameProgress,
+            fitMode: fitMode,
+            // Never use the viewport as ffmpeg's source aspect ratio: padding
+            // would become permanent black bars inside every decoded frame.
+            originalSize: knownMediaSize,
+            contentScale: displayContentScale
         )
         streamingController = controller
-        layer?.addSublayer(controller.displayLayer)
+        layer?.addSublayer(controller.presentationLayer)
         controller.start()
     }
 
@@ -1563,14 +2144,15 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
         player.automaticallyWaitsToMinimizeStalling = true
         player.currentItem?.preferredForwardBufferDuration = VideoPlaybackCompatibility.preferredForwardBufferSeconds
         let playerLayer = AVPlayerLayer(player: player)
-        playerLayer.videoGravity = videoGravity
         // The player is installed after asynchronous codec inspection, so the
         // view may already have completed its initial layout pass.
         playerLayer.frame = bounds
-        layer?.addSublayer(playerLayer)
-        needsLayout = true
+        // Install the shared player layer, then choose its presentation without
+        // creating a second player for tiled mode.
         self.player = player
         self.playerLayer = playerLayer
+        rebuildPlayerPresentation()
+        needsLayout = true
         loopObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: player.currentItem,
@@ -1582,6 +2164,7 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
                 // seek can leave the player waiting forever on some files.
                 player?.seek(to: .zero) { finished in
                     guard finished, let player else { return }
+                    self.progressTracker.resetClock()
                     if self.isPlaying && !self.isSystemSuspended { player.play() }
                 }
             } else {
@@ -1589,6 +2172,37 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
             }
         }
         player.isMuted = isMuted
+        progressObserver = player.addPeriodicTimeObserver(
+            forInterval: CMTime(value: 1, timescale: 2),
+            queue: .main
+        ) { [weak self, weak player] time in
+            guard let self, !self.isTornDown else { return }
+            guard self.isPlaying && !self.isSystemSuspended,
+                  player?.timeControlStatus == .playing,
+                  player?.currentItem?.status == .readyToPlay else {
+                // Paused, buffering and waiting time is not playback progress.
+                self.progressTracker.resetClock()
+                return
+            }
+            let duration = player?.currentItem?.duration.seconds
+            if self.fitMode == .tile, let size = player?.currentItem?.presentationSize,
+               size.width > 0, size.height > 0 {
+                let desired = self.currentMediaSize
+                if desired != self.playerTileSize {
+                    self.rebuildPlayerPresentation()
+                }
+            }
+            let progress = self.progressTracker.sample(
+                currentTime: time.seconds,
+                duration: duration
+            )
+            if progress.durationChanged {
+                self.onVideoDurationChanged?(progress.durationSeconds)
+            }
+            if progress.advanced {
+                self.onFrameProgress?()
+            }
+        }
         if isPlaying && !isSystemSuspended { player.play() }
     }
 
@@ -1613,12 +2227,75 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
         webView?.evaluateJavaScript(script, completionHandler: nil)
     }
 
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        webErrorLabel?.isHidden = true
-        setMuted(isMuted)
-        if isPlaying && !isSystemSuspended {
-            evaluateMediaScript("play")
+    private func setWebError(_ message: String?) {
+        webErrorLabel?.stringValue = message ?? ""
+        webErrorLabel?.isHidden = message == nil
+    }
+
+    private func startWebLoadWatchdog() {
+        webLoadTimeoutWorkItem?.cancel()
+        guard let webView else { return }
+        let work = DispatchWorkItem { [weak self, weak webView] in
+            guard let self, let webView, !self.isTornDown, self.webView === webView else { return }
+            self.setWebError("网页加载超时，正在尝试恢复…")
+            self.scheduleWebRecovery()
         }
+        webLoadTimeoutWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
+    }
+
+    private func scheduleWebRecovery() {
+        webHealthyWorkItem?.cancel()
+        webHealthyWorkItem = nil
+        webLoadTimeoutWorkItem?.cancel()
+        guard webRecoveryWorkItem == nil, webView != nil else { return }
+        guard let delay = webRecoveryState.nextDelay(
+            isPlaying: isPlaying,
+            isSystemSuspended: isSystemSuspended
+        ) else {
+            if webRecoveryState.isExhausted {
+                setWebError("网页加载失败，请手动重新加载。")
+            }
+            return
+        }
+        webRecoveryGeneration += 1
+        let generation = webRecoveryGeneration
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  !self.isTornDown,
+                  self.webRecoveryGeneration == generation,
+                  self.isPlaying,
+                  !self.isSystemSuspended else { return }
+            self.webRecoveryWorkItem = nil
+            self.webView?.reload()
+            self.startWebLoadWatchdog()
+        }
+        webRecoveryWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func markWebHealthy() {
+        webRecoveryGeneration += 1
+        setWebError(nil)
+        webLoadTimeoutWorkItem?.cancel()
+        webRecoveryWorkItem?.cancel()
+        webRecoveryWorkItem = nil
+        webHealthyWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.webRecoveryState.markHealthy()
+        }
+        webHealthyWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: work)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        navigationAuthorizer.cancel()
+        webView.evaluateJavaScript(WebMouseEventScript.clearMouseState(), completionHandler: nil)
+        markWebHealthy()
+        setMuted(isMuted)
+        // Always re-apply the current state, including a pause that happened
+        // before or during navigation.
+        applyPlaybackState()
     }
 
     func webView(
@@ -1646,17 +2323,52 @@ private final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDele
     ) -> WKWebView? {
         guard navigationAction.navigationType == .linkActivated,
               let url = navigationAction.request.url,
-              WebWallpaperURL.isValid(url) else {
+              WebWallpaperURL.isValid(url),
+              navigationAuthorizer.consume(
+                url: url,
+                now: ProcessInfo.processInfo.systemUptime,
+                interactionEnabled: webInteractionEnabled,
+                isPlaying: isPlaying,
+                isSystemSuspended: isSystemSuspended
+              ) else {
             return nil
         }
-        NSWorkspace.shared.open(url)
+        openExternalURL(url)
         return nil
     }
 
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        guard (error as NSError).code != NSURLErrorCancelled else { return }
-        webErrorLabel?.isHidden = false
+    private func openExternalURL(_ url: URL) {
+        // Runtime tests can record the opener without launching a browser.
+        // Normal production always uses NSWorkspace.
+        guard let logPath = ProcessInfo.processInfo.environment["WALLPAPERMAC_EXTERNAL_OPEN_LOG"] else {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        let line = url.absoluteString + "\n"
+        if let handle = FileHandle(forWritingAtPath: logPath) {
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+            try? handle.close()
+        } else {
+            try? Data(line.utf8).write(to: URL(fileURLWithPath: logPath))
+        }
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        guard !isTornDown else { return }
+        setWebError("网页渲染进程已终止，正在尝试恢复…")
+        scheduleWebRecovery()
+    }
+
+    private func webNavigationDidFail(_ error: Error) {
+        guard !isTornDown, (error as NSError).code != NSURLErrorCancelled else { return }
+        setWebError("网页加载失败，正在尝试恢复…")
         NSLog("WallpaperMac web wallpaper failed to load: \(error.localizedDescription)")
+        scheduleWebRecovery()
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        webNavigationDidFail(error)
     }
 
     func webView(
