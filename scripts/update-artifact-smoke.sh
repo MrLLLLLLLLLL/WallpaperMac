@@ -22,7 +22,8 @@ API="${WALLPAPERMAC_UPDATE_API_URL:-https://api.github.com/repos/$REPO/releases/
 
 echo "== Resolve latest release assets =="
 RELEASE_JSON="$STAGING/release.json"
-curl --http1.1 -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+curl --http1.1 -fsSL --connect-timeout 15 --max-time 120 \
+    --retry 5 --retry-delay 2 --retry-all-errors \
     -H "Accept: application/vnd.github+json" -H "User-Agent: WallpaperMac-smoke" \
     "$API" -o "$RELEASE_JSON"
 
@@ -56,7 +57,8 @@ echo "zip=$ZIP_URL"
 echo "sig=$SIG_URL"
 
 echo "== Download checksum manifest =="
-curl --http1.1 -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+curl --http1.1 -fsSL --connect-timeout 15 --max-time 120 \
+    --retry 5 --retry-delay 2 --retry-all-errors \
     -H "User-Agent: WallpaperMac-smoke" "$SUMS_URL" -o "$STAGING/SHA256SUMS.txt"
 
 ZIP_NAME="${ZIP_URL:t}"
@@ -91,7 +93,13 @@ else
 fi
 
 echo "== Download artifact and verify =="
-if curl --http1.1 -fL --retry 5 --retry-delay 3 --retry-all-errors \
+# Bounded so a stalled transfer (seen on flaky links) fails over to the local
+# artifact check instead of hanging the smoke run forever. Attempts resume
+# from the partial file, and a transfer under 4 KB/s for a minute counts as
+# stalled; together these let a slow-but-alive link finish across retries.
+if curl --http1.1 -fL -C - --connect-timeout 15 --max-time 300 \
+    --speed-limit 4096 --speed-time 60 \
+    --retry 2 --retry-delay 3 --retry-all-errors \
     -H "User-Agent: WallpaperMac-smoke" "$ZIP_URL" -o "$STAGING/artifact.zip"; then
     ACTUAL="$(shasum -a 256 "$STAGING/artifact.zip" | awk '{print $1}')"
     echo "actual=$ACTUAL"
@@ -118,7 +126,8 @@ PY
     if [[ "$SIG_URL" == "-" ]]; then
         echo "WARN: release has no .zip.sig asset; diagnostic mode only."
     else
-        curl --http1.1 -fsSL --retry 3 --retry-delay 2 -H "User-Agent: WallpaperMac-smoke" \
+        curl --http1.1 -fsSL --connect-timeout 15 --max-time 120 \
+            --retry 3 --retry-delay 2 -H "User-Agent: WallpaperMac-smoke" \
             "$SIG_URL" -o "$STAGING/artifact.zip.sig"
         if swift "$ROOT/scripts/update-signing-tool.swift" verify \
             "$STAGING/artifact.zip" "$STAGING/artifact.zip.sig" "$STAGING/embedded.pub"; then
