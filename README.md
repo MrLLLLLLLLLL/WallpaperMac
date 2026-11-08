@@ -4,7 +4,7 @@
 
 WallpaperMac 是一款使用 **SwiftUI + AppKit** 构建的原生 macOS 壁纸管理工具。它将本地图片、视频、本地 HTML 项目和 HTTP/HTTPS 网页网址统一纳入壁纸库，支持多显示器独立分配、播放队列、分组、菜单栏控制和可迁移的壁纸库存储位置。
 
-当前已发布版本：**0.2.9** · 下一版本开发内容归入 **0.2.10** · 目标平台：**macOS 13+** · 构建方式：**Swift Package Manager**
+当前已发布版本：**0.2.10** · 下一版本开发内容归入 **0.2.11** · 目标平台：**macOS 13+** · 构建方式：**Swift Package Manager**
 
 App 内置兼容视频转换工具，用于播放 AV1 等 macOS AVFoundation 不直接支持的编码。
 

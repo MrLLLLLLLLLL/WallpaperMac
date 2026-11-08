@@ -109,6 +109,15 @@ final class UpdateService: ObservableObject {
     }
 
     private func startInstall(_ update: AvailableUpdate) {
+        // A process can outlive the bundle it was launched from (for example
+        // after installing the DMG over a running copy). Compare against the
+        // version on disk before downloading or replacing anything, so a
+        // stale in-memory version cannot trigger a same-version swap.
+        if let diskVersion = UpdateInstaller.installedVersion(at: Bundle.main.bundleURL),
+           !UpdateInstaller.shouldInstall(updateVersion: update.version, installedVersion: diskVersion) {
+            phase = .upToDate(diskVersion)
+            return
+        }
         phase = .downloading(update, nil)
 
         let stagingDirectory = FileManager.default.temporaryDirectory

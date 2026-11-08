@@ -79,6 +79,10 @@ final class WallpaperManager: ObservableObject {
     private var persistenceGate = LibraryPersistenceGate()
     private var playbackPolicy = PlaybackPolicy()
     private var showsHiddenWallpapers = false
+    /// Playback intent captured when a hidden wallpaper forced a presentation
+    /// to suspend. Unlocking restores only displays that were actually playing,
+    /// so a manual pause is not turned into autoplay.
+    private var hiddenSuspendedPlayback: [String: Bool] = [:]
     private var isSystemSuspended = false
     private var activityMonitor: SystemActivityMonitor?
     private var screenChangeObserver: NSObjectProtocol?
@@ -125,6 +129,7 @@ final class WallpaperManager: ObservableObject {
         unmatchedLegacyAssignments = []
         unmatchedLegacyBindings = []
         showsHiddenWallpapers = false
+        hiddenSuspendedPlayback.removeAll()
         self.store = store
         self.playbackPolicy = policy
         activityMonitor?.update(policy: policy)
@@ -230,6 +235,7 @@ final class WallpaperManager: ObservableObject {
         publishDisplayAssignments()
         appliedWallpaperIDs.removeValue(forKey: displayID)
         playbackStates.removeValue(forKey: displayID)
+        hiddenSuspendedPlayback.removeValue(forKey: displayID)
         persistAssignments()
     }
 
@@ -252,7 +258,22 @@ final class WallpaperManager: ObservableObject {
         showsHiddenWallpapers = shows
         queueItems = UniquedDictionary.build(items.map { ($0.id, $0) }, label: "queue items")
         if shows {
+            for (displayID, wasPlaying) in hiddenSuspendedPlayback where wasPlaying {
+                guard var binding = bindings[displayID] else { continue }
+                let queueID = binding.activeQueueID
+                var state = binding.state(for: queueID)
+                guard state.isEnabled else { continue }
+                state.isPlaying = true
+                binding.queueStates[queueID] = state
+                bindings[displayID] = binding
+            }
             reapply(to: currentDisplays(), policy: policy, items: items)
+            for (displayID, wasPlaying) in hiddenSuspendedPlayback where wasPlaying {
+                guard let controller = controllers[displayID] else { continue }
+                controller.setPlaybackEnabled(true)
+                playbackStates[displayID] = controller.playbackState
+            }
+            hiddenSuspendedPlayback.removeAll()
         } else {
             for display in connectedDisplays.values {
                 hideHiddenPresentationIfNeeded(displayID: display.id)
@@ -300,6 +321,7 @@ final class WallpaperManager: ObservableObject {
                     return
                 }
             }
+            hiddenSuspendedPlayback[displayID] = state.isEnabled && state.isPlaying
             state.isPlaying = false
             updated.queueStates[queue.id] = state
             bindings[displayID] = updated
@@ -313,6 +335,11 @@ final class WallpaperManager: ObservableObject {
     /// Tears down a display's presentation while keeping its assignment for a
     /// later unlock. Unlike `clear(displayID:)`, the wallpaperID is retained.
     private func suspendPresentation(displayID: String) {
+        if hiddenSuspendedPlayback[displayID] == nil {
+            hiddenSuspendedPlayback[displayID] = controllers[displayID]?.playbackState.isPlaying
+                ?? playbackStates[displayID]?.isPlaying
+                ?? false
+        }
         invalidateQueueTimers(for: displayID)
         currentSessions.removeValue(forKey: displayID)
         sessionDurations.removeValue(forKey: displayID)
@@ -352,6 +379,7 @@ final class WallpaperManager: ObservableObject {
         controllers.removeAll()
         currentSessions.removeAll()
         sessionDurations.removeAll()
+        hiddenSuspendedPlayback.removeAll()
         bindings = bindings.mapValues { binding in
             var binding = binding
             for queueID in binding.queueStates.keys {
@@ -412,6 +440,7 @@ final class WallpaperManager: ObservableObject {
             appliedWallpaperIDs.removeValue(forKey: key)
             playbackStates.removeValue(forKey: key)
             connectedIdentities.removeValue(forKey: key)
+            hiddenSuspendedPlayback.removeValue(forKey: key)
         }
         publishDisplayAssignments()
 
@@ -767,6 +796,7 @@ final class WallpaperManager: ObservableObject {
                 // A locked hidden-only queue keeps its enabled intent so it can
                 // resume after unlocking, but it must not leave a hidden
                 // wallpaper on screen.
+                hiddenSuspendedPlayback[display.id] = state.isEnabled && state.isPlaying
                 state.isPlaying = false
                 binding.queueStates[queueID] = state
                 bindings[display.id] = binding
@@ -1612,6 +1642,7 @@ final class WallpaperManager: ObservableObject {
             if hasHiddenMembers {
                 // Do not destroy the queue's enabled intent just because every
                 // remaining member is hidden while the switch is locked.
+                hiddenSuspendedPlayback[displayID] = state.isEnabled && state.isPlaying
                 var pausedState = state
                 pausedState.isPlaying = false
                 var updatedBinding = binding

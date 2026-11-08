@@ -73,6 +73,35 @@ public enum UpdateInstaller {
         }
     }
 
+    /// Reads the version from the app bundle on disk. `Bundle.main` may still
+    /// hold the version of a process that was launched before the bundle was
+    /// replaced, so the installer must not trust the in-memory copy alone.
+    public static func installedVersion(at appURL: URL) -> String? {
+        let plistURL = appURL.appendingPathComponent("Contents/Info.plist")
+        guard let data = try? Data(contentsOf: plistURL),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data,
+                  options: [],
+                  format: nil
+              ) as? [String: Any],
+              let version = plist["CFBundleShortVersionString"] as? String else {
+            return nil
+        }
+        let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Whether an update still needs to be installed. A running process may
+    /// report an older version than the bundle that is already on disk.
+    public static func shouldInstall(updateVersion: String, installedVersion: String?) -> Bool {
+        guard let installedVersion,
+              let installed = SemVer(string: installedVersion),
+              let target = SemVer(string: updateVersion) else {
+            return true
+        }
+        return installed < target
+    }
+
     /// Extracts the release zip and confirms the payload is a WallpaperMac
     /// bundle carrying the version we expect to install.
     public static func prepare(
@@ -244,6 +273,25 @@ public enum UpdateInstaller {
         SWAPPED=0
         SWAP_STARTED=0
 
+        # Keep the detached installer diagnosable even though the app launches
+        # it with no console attached. A successful install removes staging;
+        # a failed one leaves this log beside the generated script.
+        mkdir -p "$STAGING_DIR"
+        LOG_FILE="$STAGING_DIR/install.log"
+        exec >>"$LOG_FILE" 2>&1
+        echo "== WallpaperMac install started: $(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+        launch_app() {
+            local app="$1"
+            local executable
+            executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist" 2>/dev/null || true)"
+            if [[ -n "$executable" && -x "$app/Contents/MacOS/$executable" ]]; then
+                "$app/Contents/MacOS/$executable" >/dev/null 2>&1 &
+                return 0
+            fi
+            "$OPEN" "$app" || true
+        }
+
         restore_previous() {
             if (( SWAPPED == 1 )) && [[ -d "$BACKUP_APP" ]]; then
                 ROLLBACK_SWAPPER="${WALLPAPERMAC_UPDATE_SWAPPER:-$BACKUP_APP/Contents/MacOS/WallpaperMac}"
@@ -251,7 +299,7 @@ public enum UpdateInstaller {
                     echo "rollback swap failed; preserving the backup for manual recovery" >&2
                     return 1
                 fi
-                "$OPEN" "$TARGET_APP" || true
+                launch_app "$TARGET_APP"
                 SWAPPED=0
             fi
         }
@@ -337,39 +385,66 @@ public enum UpdateInstaller {
 
         HEALTH_TOKEN="$(/usr/bin/uuidgen)"
         HEALTH_ACK="$STAGING_DIR/update-health-$HEALTH_TOKEN"
-        HEALTH_WAIT_STEPS="${WALLPAPERMAC_HEALTH_WAIT_STEPS:-50}"
-        if "$OPEN" -n "$TARGET_APP" --args \
-            --update-health-token "$HEALTH_TOKEN" \
-            --update-health-file "$HEALTH_ACK"; then
-            HEALTHY=0
-            for (( HEALTH_STEP=0; HEALTH_STEP < HEALTH_WAIT_STEPS; HEALTH_STEP++ )); do
+        HEALTH_WAIT_STEPS="${WALLPAPERMAC_HEALTH_WAIT_STEPS:-150}"
+        HEALTHY=0
+        DIRECT_PID=""
+        TARGET_EXECUTABLE="$TARGET_APP/Contents/MacOS/$EXECUTABLE_NAME"
+
+        wait_for_health() {
+            local steps="$1"
+            local step
+            for (( step=0; step < steps; step++ )); do
                 if [[ -f "$HEALTH_ACK" ]] \
                     && /usr/bin/grep -q "^token=$HEALTH_TOKEN$" "$HEALTH_ACK" \
                     && /usr/bin/grep -Eq '^pid=[0-9]+$' "$HEALTH_ACK"; then
                     if [[ -z "$EXPECTED_VERSION" ]] || /usr/bin/grep -q "^version=$EXPECTED_VERSION$" "$HEALTH_ACK"; then
                         HEALTHY=1
-                        break
+                        return 0
                     fi
                 fi
                 sleep 0.2
             done
-            if (( HEALTHY == 1 )); then
-                # Clean staging only after the new instance has completed its
-                # critical initialization and acknowledged this exact install.
-                rm -rf "$STAGING_DIR" || true
-                exit 0
-            fi
-            # Do not kill an unrelated existing instance. Only a process still
-            # carrying this install's token is a failed new launch.
-            # Match the executable path and token as literal strings. Paths
-            # containing regex characters must still be cleaned up correctly.
-            TARGET_APP_FOR_CLEANUP="$TARGET_APP/Contents/MacOS/WallpaperMac"
-            export TARGET_APP_FOR_CLEANUP HEALTH_TOKEN
-            NEW_PID="$(ps -axo pid,command | /usr/bin/awk 'index($0, ENVIRON["TARGET_APP_FOR_CLEANUP"]) && index($0, ENVIRON["HEALTH_TOKEN"]) { print $1; exit }' | head -1 || true)"
-            [[ -z "$NEW_PID" ]] || kill "$NEW_PID" 2>/dev/null || true
-            fail "replacement did not become healthy"
+            return 1
+        }
+
+        # Launch the executable directly first. This guarantees the health
+        # arguments reach the new process; `open` can activate an existing
+        # instance or race with the freshly swapped bundle and drop them.
+        if [[ -n "$EXECUTABLE_NAME" && -x "$TARGET_EXECUTABLE" ]]; then
+            echo "launching replacement executable directly"
+            "$TARGET_EXECUTABLE" --update-health-token "$HEALTH_TOKEN" \
+                --update-health-file "$HEALTH_ACK" >/dev/null 2>&1 &
+            DIRECT_PID=$!
+            wait_for_health "$HEALTH_WAIT_STEPS" || true
         fi
-        fail "replacement failed to launch"
+
+        if (( HEALTHY == 0 )); then
+            [[ -z "$DIRECT_PID" ]] || kill "$DIRECT_PID" 2>/dev/null || true
+            echo "direct launch did not acknowledge; retrying through open"
+            if "$OPEN" -n "$TARGET_APP" --args \
+                --update-health-token "$HEALTH_TOKEN" \
+                --update-health-file "$HEALTH_ACK"; then
+                wait_for_health "$HEALTH_WAIT_STEPS" || true
+            fi
+        fi
+
+        if (( HEALTHY == 1 )); then
+            # Clean staging only after the new instance has completed its
+            # critical initialization and acknowledged this exact install.
+            echo "replacement acknowledged health token"
+            rm -rf "$STAGING_DIR" || true
+            exit 0
+        fi
+        # Do not kill an unrelated existing instance. Only a process still
+        # carrying this install's token is a failed new launch.
+        # Match the executable path and token as literal strings. Paths
+        # containing regex characters must still be cleaned up correctly.
+        TARGET_APP_FOR_CLEANUP="$TARGET_EXECUTABLE"
+        export TARGET_APP_FOR_CLEANUP HEALTH_TOKEN
+        NEW_PID="$(ps -axo pid,command | /usr/bin/awk 'index($0, ENVIRON["TARGET_APP_FOR_CLEANUP"]) && index($0, ENVIRON["HEALTH_TOKEN"]) { print $1; exit }' | head -1 || true)"
+        [[ -z "$NEW_PID" ]] || kill "$NEW_PID" 2>/dev/null || true
+        [[ -z "$DIRECT_PID" ]] || kill "$DIRECT_PID" 2>/dev/null || true
+        fail "replacement did not become healthy"
         """
     }
 

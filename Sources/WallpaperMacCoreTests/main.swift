@@ -918,6 +918,9 @@ let tests: [(String, () throws -> Void)] = [
     ("validated sibling installs successfully", testUpdateSuccessfulInstallUsesValidatedSibling),
     ("wrong pending version aborts before swap", testUpdateRejectsWrongPendingVersionBeforeSwap),
     ("atomic swap keeps a complete app at target", testAtomicSwapKeepsCompleteAppAtTarget),
+    ("reads installed version from the app on disk", testInstalledVersionReadsBundlePlist),
+    ("skips installing a version already on disk", testUpdateVersionGuardUsesDiskVersion),
+    ("launches the replacement directly when open drops arguments", testInstallScriptUsesDirectLaunch),
     ("open without health confirmation rolls back", testUpdateOpenWithoutHealthConfirmationRollsBack),
     ("rollback failure preserves the complete old backup", testUpdateRollbackFailurePreservesBackupAndDoesNotOpenBrokenTarget),
     ("health acknowledgement matches the install token", testUpdateHealthHandshakeWritesMatchingTokenAtomically),
@@ -2235,7 +2238,7 @@ private func makeUpdateScriptFixture(expectedVersion: String = "9.9.9") throws -
     )
 }
 
-private func runUpdateScript(_ fixture: UpdateScriptFixture, ditto: String, openStatus: Int32, healthAck: Bool = true, installLock: UpdateInstallLock? = nil, failRollback: Bool = false) throws -> Int32 {
+private func runUpdateScript(_ fixture: UpdateScriptFixture, ditto: String, openStatus: Int32, healthAck: Bool = true, healthWaitSteps: Int = 2, installLock: UpdateInstallLock? = nil, failRollback: Bool = false) throws -> Int32 {
     let fakeOpen = fixture.root.appendingPathComponent("fake-open.sh")
     let script = """
     #!/bin/zsh
@@ -2305,7 +2308,7 @@ private func runUpdateScript(_ fixture: UpdateScriptFixture, ditto: String, open
         "WALLPAPERMAC_XATTR": "/usr/bin/xattr",
         "WALLPAPERMAC_CODESIGN": "/usr/bin/true",
         "WALLPAPERMAC_UPDATE_SWAPPER": fakeSwapper.path,
-        "WALLPAPERMAC_HEALTH_WAIT_STEPS": "2",
+        "WALLPAPERMAC_HEALTH_WAIT_STEPS": String(healthWaitSteps),
         "WALLPAPERMAC_HEALTH_ACK": healthAck ? "1" : "0",
         "WALLPAPERMAC_HEALTH_VERSION": "9.9.9",
         "WALLPAPERMAC_FAIL_ROLLBACK": failRollback ? "1" : "0",
@@ -4136,4 +4139,66 @@ func testWallpaperVisibilityFiltersQueues() throws {
         equals: true,
         "a hidden item is eligible after unlocking"
     )
+}
+
+func testInstalledVersionReadsBundlePlist() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WallpaperMacInstalledVersionTests", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let app = root.appendingPathComponent("WallpaperMac.app")
+    try writeMiniApp(at: app, version: "0.2.9", marker: "installed")
+    try expect(
+        UpdateInstaller.installedVersion(at: app),
+        equals: "0.2.9",
+        "the updater must read the version from the on-disk bundle"
+    )
+}
+
+func testUpdateVersionGuardUsesDiskVersion() throws {
+    try expect(
+        !UpdateInstaller.shouldInstall(updateVersion: "0.2.9", installedVersion: "0.2.9"),
+        "an on-disk version equal to the update must not be replaced"
+    )
+    try expect(
+        !UpdateInstaller.shouldInstall(updateVersion: "0.2.9", installedVersion: "0.3.0"),
+        "a newer on-disk version must not be downgraded"
+    )
+    try expect(
+        UpdateInstaller.shouldInstall(updateVersion: "0.2.9", installedVersion: "0.2.8"),
+        "an older on-disk version should update"
+    )
+    try expect(
+        UpdateInstaller.shouldInstall(updateVersion: "0.2.9", installedVersion: nil),
+        "an unreadable version should still allow the update"
+    )
+}
+
+func testInstallScriptUsesDirectLaunch() throws {
+    let fixture = try makeUpdateScriptFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let executable = fixture.sourceApp.appendingPathComponent("Contents/MacOS/WallpaperMac")
+    let healthScript = """
+    #!/bin/zsh
+    TOKEN=""
+    ACK=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --update-health-token) TOKEN="$2"; shift 2 ;;
+            --update-health-file) ACK="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    if [[ -n "$TOKEN" && -n "$ACK" ]]; then
+        printf 'token=%s\\npid=%s\\nversion=9.9.9\\n' "$TOKEN" "$$" > "$ACK"
+    fi
+    exit 0
+    """
+    try healthScript.write(to: executable, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+    // open fails; only the direct executable launch can provide the health ack.
+    let status = try runUpdateScript(fixture, ditto: "/usr/bin/ditto", openStatus: 1, healthWaitSteps: 20)
+    try expect(status, equals: 0, "the direct launch should satisfy the health handshake")
+    try expect(!FileManager.default.fileExists(atPath: fixture.staging.path), "a direct healthy launch should clean staging")
 }
