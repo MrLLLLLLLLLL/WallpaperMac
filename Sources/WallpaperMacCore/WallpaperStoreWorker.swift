@@ -188,6 +188,18 @@ public actor WallpaperStoreWorker {
         try store.touchLastUsed(id: id, date: date)
     }
 
+    public func updateHidden(id: UUID, isHidden: Bool) throws -> WallpaperItem {
+        try store.updateHidden(id: id, isHidden: isHidden)
+    }
+
+    public func hiddenWallpaperLock() throws -> HiddenWallpaperLock? {
+        try store.hiddenWallpaperLock()
+    }
+
+    public func save(hiddenWallpaperLock: HiddenWallpaperLock) throws {
+        try store.save(hiddenWallpaperLock: hiddenWallpaperLock)
+    }
+
     /// Field-level enrichment update: never accepts a full item array.
     public func updateMetadata(
         _ patches: [UUID: WallpaperStore.MetadataPatch]

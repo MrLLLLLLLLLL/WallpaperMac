@@ -45,6 +45,7 @@ swift "$ROOT/scripts/update-signing-tool.swift" verify "$ZIP" "$ZIP.sig" "$PUBLI
 printf '%s\n' '== Player runtime matrix =='
 ./scripts/player-runtime-test.sh
 ./scripts/wallpaper-fit-runtime-test.sh
+./scripts/hidden-wallpapers-runtime-test.sh
 
 printf '%s\n' '== Video codec compatibility =='
 ./scripts/video-codec-runtime-test.sh

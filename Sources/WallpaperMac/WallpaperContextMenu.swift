@@ -66,6 +66,17 @@ struct WallpaperContextMenu: View {
             model.toggleFavorites(for: actionIDs)
         }
 
+        let selectedItems = model.wallpapers.filter { actionIDs.contains($0.id) }
+        if !selectedItems.isEmpty && selectedItems.allSatisfy(\.isHidden) {
+            Button("取消隐藏壁纸") {
+                model.setHidden(false, for: actionIDs)
+            }
+        } else {
+            Button("隐藏壁纸") {
+                model.setHidden(true, for: actionIDs)
+            }
+        }
+
         if !isBatch {
             Button(item.sourceURL.isFileURL ? "在 Finder 中显示" : "在浏览器中打开") { model.showInFinder(item) }
         }

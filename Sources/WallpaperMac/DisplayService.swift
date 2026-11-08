@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import CoreGraphics
+import WallpaperMacCore
 
 @MainActor
 final class DisplayService: ObservableObject {
@@ -8,6 +9,7 @@ final class DisplayService: ObservableObject {
         let id: String
         let name: String
         let screen: NSScreen
+        let identity: DisplayIdentity
     }
 
     @Published private(set) var displays: [Display] = []
@@ -29,9 +31,13 @@ final class DisplayService: ObservableObject {
 
     func refresh() {
         displays = NSScreen.screens.enumerated().map { index, screen in
-            let displayNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
-            let id = displayNumber.map { "display-\($0.uint32Value)" } ?? "display-\(index)"
-            return Display(id: id, name: screen.localizedName.isEmpty ? "显示器 \(index + 1)" : screen.localizedName, screen: screen)
+            let identity = DisplayIdentityProvider.identity(for: screen)
+            let name = screen.localizedName.isEmpty ? "显示器 \(index + 1)" : screen.localizedName
+            return Display(id: identity.profileID, name: name, screen: screen, identity: identity)
         }
+    }
+
+    func currentIdentities() -> [DisplayIdentity] {
+        NSScreen.screens.map(DisplayIdentityProvider.identity(for:))
     }
 }

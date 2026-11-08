@@ -4,7 +4,7 @@
 
 WallpaperMac 是一款使用 **SwiftUI + AppKit** 构建的原生 macOS 壁纸管理工具。它将本地图片、视频、本地 HTML 项目和 HTTP/HTTPS 网页网址统一纳入壁纸库，支持多显示器独立分配、播放队列、分组、菜单栏控制和可迁移的壁纸库存储位置。
 
-当前已发布版本：**0.2.8** · 下一版本开发内容归入 **0.2.9** · 目标平台：**macOS 13+** · 构建方式：**Swift Package Manager**
+当前已发布版本：**0.2.9** · 下一版本开发内容归入 **0.2.10** · 目标平台：**macOS 13+** · 构建方式：**Swift Package Manager**
 
 App 内置兼容视频转换工具，用于播放 AV1 等 macOS AVFoundation 不直接支持的编码。
 
@@ -25,6 +25,7 @@ App 内置兼容视频转换工具，用于播放 AV1 等 macOS AVFoundation 不
 | 队列与分组 | 多个命名队列、默认队列保护、每显示器独立活动队列、顺序/随机、循环/播放一次、默认与单项时长、转场、视频结束后切换下一项。 |
 | 播放器 | 图片窗口、`AVPlayer` 视频窗口、`WKWebView` 本地或在线网页窗口；视频和网页默认静音，支持播放、暂停、静音、循环与网页重新加载。 |
 | 菜单栏 | 常驻 WallpaperMac 图标，可打开窗口、暂停/恢复动态壁纸、静音/取消静音、打开壁纸库、打开设置或退出应用。 |
+| 隐藏壁纸 | 可为任意壁纸设置隐藏标记；关闭“显示隐藏”开关后，隐藏项不会出现在主库、分组、检查器或队列中，混合队列播放时自动跳过。首次隐藏需设置密码，密码验证信息随壁纸库保存；每次启动开关默认关闭。隐藏仅影响应用内显示，不加密文件。 |
 | 性能 | 壁纸库和分组以每页 20 项递增加载；扫描、导入、删除与分组持久化在后台串行执行，避免主界面因文件 I/O 卡顿；队列切换释放前一播放器资源，降低长期切换时内存持续增长的风险。 |
 | 设置与系统策略 | 可配置壁纸库路径、默认导入方式、静音/循环、全局适配方式（默认填充）、单壁纸适配覆盖、电池与全屏优化、登录时启动和快捷键状态；“关于 WallpaperMac”显示当前版本与构建号。 |
 
@@ -101,8 +102,10 @@ wallpapers.json                    # 壁纸项目与元数据
 playback-queues.json               # 命名队列与队列播放策略
 display-playback-bindings.json     # 每显示器活动队列、进度与播放状态
 display-assignments.json           # 显示器壁纸分配
+display-profiles.json              # 稳定显示器档案（UUID、分配、队列与离线记录）
 wallpaper-groups.json              # 分组
 display-queues.json                # 旧版本队列数据的迁移来源
+hidden-wallpapers-lock.json        # 隐藏壁纸密码验证信息（不含明文密码）
 Assets/                            # “复制到应用库”的资源副本
 Thumbnails/                        # 生成的缩略图
 ```
@@ -188,6 +191,9 @@ Templates/SimpleWebWallpaper/
 
 # 校验图片、H.264 与 AV1 的平铺、填充及单壁纸适配覆盖（默认优先选择竖屏，需要真实桌面）
 ./scripts/wallpaper-fit-runtime-test.sh
+
+# 校验关闭开关时混合队列会跳过隐藏壁纸，全隐藏队列不会上屏
+./scripts/hidden-wallpapers-runtime-test.sh
 
 # 运行核心领域与存储回归测试
 swift run WallpaperMacCoreTests

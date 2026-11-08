@@ -121,6 +121,10 @@ final class LibraryViewModel: ObservableObject {
     @Published private(set) var pendingWebEntryCandidates: [URL] = []
     @Published private(set) var isImportInspectionInProgress = false
     @Published var importSummary: ImportSummary?
+    @Published var showsHiddenWallpapers = false
+    @Published private(set) var hiddenPasswordIsSet = false
+    @Published var hiddenAuthRequest: HiddenWallpaperAuthRequest?
+    @Published var hiddenAuthError: String?
 
     private(set) var store: WallpaperStore
     private var storeWorker: WallpaperStoreWorker
@@ -163,6 +167,7 @@ final class LibraryViewModel: ObservableObject {
         }
         store = WallpaperStore(libraryURL: resolvedURL)
         storeWorker = WallpaperStoreWorker(libraryURL: resolvedURL)
+        hiddenPasswordIsSet = (try? store.hiddenWallpaperLock()) != nil
         storageMode = StorageMode(rawValue: defaults.string(forKey: SettingsKey.storageMode) ?? "") ?? .managedCopy
         playbackPolicy = PlaybackPolicy(
             isMuted: defaults.object(forKey: SettingsKey.muted) as? Bool ?? true,
@@ -252,8 +257,14 @@ final class LibraryViewModel: ObservableObject {
     }
 
     var selectedWallpaper: WallpaperItem? {
-        guard let selectedWallpaperID else { return nil }
-        return wallpapers.first { $0.id == selectedWallpaperID }
+        guard let selectedWallpaperID,
+              let item = wallpapers.first(where: { $0.id == selectedWallpaperID }) else { return nil }
+        if item.isHidden && !showsHiddenWallpapers { return nil }
+        return item
+    }
+
+    func isWallpaperVisible(_ item: WallpaperItem) -> Bool {
+        showsHiddenWallpapers || !item.isHidden
     }
 
     var displayRows: [DisplayRow] {
@@ -282,6 +293,7 @@ final class LibraryViewModel: ObservableObject {
 
     var filteredWallpapers: [WallpaperItem] {
         let filtered = wallpapers.filter { item in
+            let matchesHidden = showsHiddenWallpapers || !item.isHidden
             let matchesSearch = searchText.isEmpty || item.name.localizedCaseInsensitiveContains(searchText)
             let matchesType = selectedType == nil || item.type == selectedType
             let isApplied = wallpaperManager.appliedWallpaperIDs.values.contains(item.id)
@@ -313,7 +325,7 @@ final class LibraryViewModel: ObservableObject {
             case .favorites:
                 matchesDestination = item.isFavorite
             }
-            return matchesSearch && matchesType && matchesStatus && matchesDestination
+            return matchesHidden && matchesSearch && matchesType && matchesStatus && matchesDestination
         }
         return filtered.sorted { lhs, rhs in
             switch sortOrder {
@@ -378,6 +390,16 @@ final class LibraryViewModel: ObservableObject {
         let validIDs = Set(wallpapers.map(\.id))
         selectedWallpaperIDs = selectedWallpaperIDs.intersection(validIDs)
         if let selectedWallpaperID, !validIDs.contains(selectedWallpaperID) {
+            self.selectedWallpaperID = nil
+        }
+        pruneHiddenSelection()
+    }
+
+    private func pruneHiddenSelection() {
+        guard !showsHiddenWallpapers else { return }
+        let hiddenIDs = Set(wallpapers.filter(\.isHidden).map(\.id))
+        selectedWallpaperIDs.subtract(hiddenIDs)
+        if let selectedWallpaperID, hiddenIDs.contains(selectedWallpaperID) {
             self.selectedWallpaperID = nil
         }
     }
@@ -797,8 +819,13 @@ final class LibraryViewModel: ObservableObject {
         toastMessage = nil
         activeToastID = nil
         lastError = nil
+        showsHiddenWallpapers = false
+        hiddenPasswordIsSet = false
+        hiddenAuthRequest = nil
+        hiddenAuthError = nil
         store = WallpaperStore(libraryURL: libraryURL)
         storeWorker = WallpaperStoreWorker(libraryURL: libraryURL)
+        hiddenPasswordIsSet = (try? store.hiddenWallpaperLock()) != nil
         UserDefaults.standard.set(libraryURL.path, forKey: SettingsKey.libraryPath)
         wallpaperManager.configure(store: store, policy: playbackPolicy)
         reload(afterLoad: restoreWallpaperAssignments)
@@ -848,6 +875,163 @@ final class LibraryViewModel: ObservableObject {
                 guard let self, self.isCurrentLibrarySession(session) else { return }
                 self.lastError = error.localizedDescription
             }
+        }
+    }
+
+    // MARK: - Hidden wallpapers
+
+    func requestSetShowsHiddenWallpapers(_ enabled: Bool) {
+        guard enabled != showsHiddenWallpapers else { return }
+        if !enabled {
+            lockHiddenWallpapers()
+            return
+        }
+        hiddenPasswordIsSet = (try? store.hiddenWallpaperLock()) != nil
+        presentHiddenAuth(
+            mode: hiddenPasswordIsSet ? .unlock : .setPassword,
+            purpose: .enableVisibility
+        )
+    }
+
+    func setHidden(_ isHidden: Bool, for ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        if isHidden {
+            guard showsHiddenWallpapers else {
+                hiddenPasswordIsSet = (try? store.hiddenWallpaperLock()) != nil
+                presentHiddenAuth(
+                    mode: hiddenPasswordIsSet ? .unlock : .setPassword,
+                    purpose: .hide(ids)
+                )
+                return
+            }
+        } else {
+            // Hidden items are not reachable unless hidden mode is unlocked.
+            guard showsHiddenWallpapers else { return }
+        }
+        persistHidden(isHidden, for: ids)
+    }
+
+    func cancelHiddenAuth() {
+        hiddenAuthRequest = nil
+        hiddenAuthError = nil
+    }
+
+    func submitHiddenPassword(_ password: String, confirmation: String?) {
+        guard let request = hiddenAuthRequest else { return }
+        hiddenAuthError = nil
+        switch request.mode {
+        case .setPassword:
+            guard confirmation == password else {
+                hiddenAuthError = "两次输入的密码不一致。"
+                return
+            }
+            guard HiddenWallpaperLock.isValidPassword(password) else {
+                hiddenAuthError = "密码至少需要 \(HiddenWallpaperLock.minimumPasswordLength) 个字符。"
+                return
+            }
+            let worker = storeWorker
+            Task { [weak self] in
+                let lock = await Task.detached(priority: .userInitiated) {
+                    HiddenWallpaperLock.make(password: password)
+                }.value
+                guard let self else { return }
+                guard let lock else {
+                    self.hiddenAuthError = "无法生成密码校验信息。"
+                    return
+                }
+                do {
+                    try await worker.save(hiddenWallpaperLock: lock)
+                } catch {
+                    self.hiddenAuthError = "无法保存密码：\(error.localizedDescription)"
+                    return
+                }
+                guard self.hiddenAuthRequest?.id == request.id else { return }
+                self.hiddenPasswordIsSet = true
+                self.finishHiddenAuth(request)
+            }
+        case .unlock:
+            guard let lock = (try? store.hiddenWallpaperLock()) ?? nil else {
+                hiddenAuthError = "未找到密码配置。"
+                return
+            }
+            Task { [weak self] in
+                let verified = await Task.detached(priority: .userInitiated) {
+                    lock.verify(password: password)
+                }.value
+                guard let self, self.hiddenAuthRequest?.id == request.id else { return }
+                guard verified else {
+                    try? await Task.sleep(nanoseconds: 350_000_000)
+                    if self.hiddenAuthRequest?.id == request.id {
+                        self.hiddenAuthError = "密码不正确。"
+                    }
+                    return
+                }
+                self.finishHiddenAuth(request)
+            }
+        }
+    }
+
+    private func presentHiddenAuth(
+        mode: HiddenWallpaperAuthRequest.Mode,
+        purpose: HiddenWallpaperAuthRequest.Purpose
+    ) {
+        hiddenAuthError = nil
+        hiddenAuthRequest = HiddenWallpaperAuthRequest(mode: mode, purpose: purpose)
+    }
+
+    private func finishHiddenAuth(_ request: HiddenWallpaperAuthRequest) {
+        hiddenAuthRequest = nil
+        hiddenAuthError = nil
+        switch request.purpose {
+        case .enableVisibility:
+            showsHiddenWallpapers = true
+            wallpaperManager.setShowsHiddenWallpapers(true, policy: playbackPolicy, items: wallpapers)
+            refreshVisibleWallpapers()
+        case .hide(let ids):
+            persistHidden(true, for: ids)
+        }
+    }
+
+    private func lockHiddenWallpapers() {
+        showsHiddenWallpapers = false
+        hiddenAuthRequest = nil
+        hiddenAuthError = nil
+        wallpaperManager.setShowsHiddenWallpapers(false, policy: playbackPolicy, items: wallpapers)
+        pruneHiddenSelection()
+        refreshVisibleWallpapers()
+    }
+
+    private func persistHidden(_ isHidden: Bool, for ids: Set<UUID>) {
+        let worker = storeWorker
+        let session = librarySessionID
+        Task { [weak self] in
+            var updated: [WallpaperItem] = []
+            do {
+                for id in ids {
+                    updated.append(try await worker.updateHidden(id: id, isHidden: isHidden))
+                }
+            } catch {
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.lastError = error.localizedDescription
+                return
+            }
+            guard let self, self.isCurrentLibrarySession(session) else { return }
+            for item in updated {
+                if let index = self.wallpapers.firstIndex(where: { $0.id == item.id }) {
+                    self.wallpapers[index] = item
+                }
+            }
+            self.wallpaperManager.updateHiddenState(for: updated)
+            self.refreshVisibleWallpapers()
+            if !self.showsHiddenWallpapers {
+                self.wallpaperManager.setShowsHiddenWallpapers(
+                    false,
+                    policy: self.playbackPolicy,
+                    items: self.wallpapers
+                )
+                self.pruneHiddenSelection()
+            }
+            self.showToast(isHidden ? "已隐藏 \(updated.count) 项" : "已取消隐藏 \(updated.count) 项")
         }
     }
 
@@ -1199,6 +1383,9 @@ struct MainView: View {
             QueueManagementView(model: model)
                 .frame(minWidth: 760, minHeight: 560)
         }
+        .sheet(item: $model.hiddenAuthRequest) { request in
+            HiddenWallpaperAuthSheet(model: model, request: request)
+        }
         .confirmationDialog("删除壁纸记录？", isPresented: $model.isDeleteConfirmationPresented, titleVisibility: .visible) {
             Button("删除", role: .destructive) {
                 model.removeWallpapers(ids: model.pendingDeleteIDs)
@@ -1491,9 +1678,20 @@ private struct QueueEditorView: View {
         wallpaperIDs.compactMap { id in model.wallpapers.first(where: { $0.id == id }) }
     }
 
+    private var hasHiddenMembers: Bool {
+        guard !model.showsHiddenWallpapers else { return false }
+        return queueItems.contains(where: \.isHidden)
+    }
+
+    private var displayedQueueItems: [WallpaperItem] {
+        queueItems.filter { model.isWallpaperVisible($0) }
+    }
+
     private var availableItems: [WallpaperItem] {
         model.wallpapers.filter { item in
-            item.availability == .available && !wallpaperIDs.contains(item.id)
+            model.isWallpaperVisible(item)
+                && item.availability == .available
+                && !wallpaperIDs.contains(item.id)
         }
     }
 
@@ -1521,15 +1719,21 @@ private struct QueueEditorView: View {
                         Spacer()
                     }
 
-                    if queueItems.isEmpty {
-                        Text("队列为空，请添加至少一项可用壁纸。")
+                    if hasHiddenMembers {
+                        Label("队列包含隐藏壁纸，解锁后可编辑成员；播放时会自动跳过。", systemImage: "eye.slash")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+
+                    if displayedQueueItems.isEmpty {
+                        Text(hasHiddenMembers ? "当前没有可显示的队列成员。" : "队列为空，请添加至少一项可用壁纸。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.vertical, 8)
                     } else {
                         List {
-                            ForEach(Array(queueItems.enumerated()), id: \.element.id) { index, item in
+                            ForEach(Array(displayedQueueItems.enumerated()), id: \.element.id) { index, item in
                                 HStack(spacing: 8) {
                                     Image(systemName: iconName(for: item))
                                         .foregroundStyle(.secondary)
@@ -1542,7 +1746,7 @@ private struct QueueEditorView: View {
                                         Image(systemName: "chevron.up")
                                     }
                                     .buttonStyle(.borderless)
-                                    .disabled(index == 0)
+                                    .disabled(hasHiddenMembers || index == 0)
                                     .help("上移")
                                     Button {
                                         swapQueueItems(at: index, with: index + 1)
@@ -1550,7 +1754,7 @@ private struct QueueEditorView: View {
                                         Image(systemName: "chevron.down")
                                     }
                                     .buttonStyle(.borderless)
-                                    .disabled(index == queueItems.count - 1)
+                                    .disabled(hasHiddenMembers || index == displayedQueueItems.count - 1)
                                     .help("下移")
                                     Button {
                                         wallpaperIDs.removeAll { $0 == item.id }
@@ -1558,10 +1762,12 @@ private struct QueueEditorView: View {
                                         Image(systemName: "minus.circle")
                                     }
                                     .buttonStyle(.borderless)
+                                    .disabled(hasHiddenMembers)
                                     .help("移出队列")
                                 }
                             }
                             .onMove { offsets, destination in
+                                guard !hasHiddenMembers else { return }
                                 moveQueueItems(from: offsets, to: destination)
                             }
                         }
@@ -1584,6 +1790,7 @@ private struct QueueEditorView: View {
                     } label: {
                         Label("添加壁纸", systemImage: "plus")
                     }
+                    .disabled(hasHiddenMembers)
                 }
                 .padding(.vertical, 4)
             }
@@ -1715,7 +1922,7 @@ private struct SidebarView: View {
                             title: group.name,
                             icon: "folder",
                             isSelected: model.destination == .group(group.id),
-                            subtitle: "\(model.wallpapers.filter { $0.groupID == group.id }.count) 项"
+                            subtitle: "\(model.wallpapers.filter { $0.groupID == group.id && model.isWallpaperVisible($0) }.count) 项"
                         ) {
                             model.destination = .group(group.id)
                         }
@@ -1860,7 +2067,7 @@ private struct LibraryContentView: View {
                 } else {
                     TextField("搜索壁纸", text: $model.searchText)
                         .textFieldStyle(.roundedBorder)
-                        .frame(width: 190)
+                        .frame(width: 170)
                     Menu {
                         Picker("类型", selection: $model.selectedType) {
                             Text("全部类型").tag(nil as WallpaperType?)
@@ -1900,10 +2107,26 @@ private struct LibraryContentView: View {
                     .accessibilityLabel("视图")
                     .frame(width: 76)
                     .help("切换网格或列表")
+                    HStack(spacing: 6) {
+                        Image(systemName: model.showsHiddenWallpapers ? "eye" : "eye.slash")
+                            .foregroundStyle(model.showsHiddenWallpapers ? Color.accentColor : .secondary)
+                            .frame(width: 16)
+                        Toggle("显示隐藏壁纸", isOn: Binding(
+                            get: { model.showsHiddenWallpapers },
+                            set: { model.requestSetShowsHiddenWallpapers($0) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                    }
+                    .fixedSize()
+                    .help("隐藏壁纸默认不显示；打开需要密码")
+                    .accessibilityLabel("显示隐藏壁纸")
                     Button { model.isSelectionMode = true } label: {
                         Label("批量管理", systemImage: "checklist")
                     }
                     .buttonStyle(.borderless)
+                    .fixedSize()
                     Menu {
                         Button("导入文件或文件夹") { model.importWallpapers() }
                         Button("导入网址") { model.isWebURLImportPresented = true }
@@ -2145,6 +2368,10 @@ private struct WallpaperListRow: View {
                     if !appliedDisplays.isEmpty {
                         Text(appliedDisplays.joined(separator: "、")).foregroundStyle(.green).lineLimit(1)
                     }
+                    if item.isHidden {
+                        Label("已隐藏", systemImage: "eye.slash")
+                            .foregroundStyle(.orange)
+                    }
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -2225,6 +2452,10 @@ private struct WallpaperCard: View {
                 Image(systemName: iconName)
                 Text(typeName)
                 Spacer()
+                if item.isHidden {
+                    Label("已隐藏", systemImage: "eye.slash")
+                        .foregroundStyle(.orange)
+                }
                 if item.availability != .available {
                     Text(availabilityLabel(item.availability)).foregroundStyle(.red)
                 } else if !appliedDisplays.isEmpty {
@@ -2734,6 +2965,10 @@ private struct InspectorView: View {
                                     InspectorRow(title: "时长", value: durationText(item.metadata?.durationSeconds))
                                 }
                                 InspectorRow(
+                                    title: "可见性",
+                                    value: item.isHidden ? "已隐藏" : "正常"
+                                )
+                                InspectorRow(
                                     title: item.sourceURL.isFileURL ? "路径" : "网址",
                                     value: item.sourceURL.isFileURL ? item.sourceURL.path : item.sourceURL.absoluteString
                                 )
@@ -2755,6 +2990,10 @@ private struct InspectorView: View {
                                     }
                                 }
                                 HStack {
+                                    Button(item.isHidden ? "取消隐藏壁纸" : "隐藏壁纸") {
+                                        model.setHidden(!item.isHidden, for: [item.id])
+                                    }
+                                    .buttonStyle(.bordered)
                                     Spacer()
                                     Button("移除记录", role: .destructive) {
                                         showingRemoveConfirmation = true

@@ -138,7 +138,7 @@ struct QueueManagementView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(queue.name)
                                 .lineLimit(1)
-                            Text("\(queue.wallpaperIDs.count) 项")
+                            Text("\(visibleWallpaperCount(queue)) 项")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -311,24 +311,37 @@ struct QueueManagementView: View {
     }
 
     private func wallpaperItems(_ queue: PlaybackQueue) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let hasHiddenMembers = !model.showsHiddenWallpapers && queue.wallpaperIDs.contains { id in
+            model.wallpapers.first(where: { $0.id == id })?.isHidden == true
+        }
+        let visibleEntries = queue.wallpaperIDs.enumerated().filter { _, id in
+            guard let item = model.wallpapers.first(where: { $0.id == id }) else { return true }
+            return model.isWallpaperVisible(item)
+        }
+        return VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("队列内容").font(.headline)
                 Spacer()
-                Text("\(queue.wallpaperIDs.count) 项")
+                Text("\(visibleEntries.count) 项")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if queue.wallpaperIDs.isEmpty {
-                Text("队列为空。可以在壁纸卡片上右键，选择“添加到播放队列”。")
+            if hasHiddenMembers {
+                Label("队列包含隐藏壁纸，解锁后可编辑成员；播放时会自动跳过。", systemImage: "eye.slash")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if visibleEntries.isEmpty {
+                Text(hasHiddenMembers ? "当前没有可显示的队列成员。" : "队列为空。可以在壁纸卡片上右键，选择“添加到播放队列”。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 8)
             } else {
-                ForEach(Array(queue.wallpaperIDs.enumerated()), id: \.element) { index, id in
+                ForEach(Array(visibleEntries.enumerated()), id: \.offset) { displayIndex, entry in
+                    let id = entry.element
                     if let item = model.wallpapers.first(where: { $0.id == id }) {
                         HStack(spacing: 10) {
-                            Text("\(index + 1)")
+                            Text("\(displayIndex + 1)")
                                 .font(.caption.monospacedDigit())
                                 .foregroundStyle(.secondary)
                                 .frame(width: 24)
@@ -347,6 +360,7 @@ struct QueueManagementView: View {
                             ), format: .number)
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 78)
+                            .disabled(hasHiddenMembers)
                             Text("秒")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -356,6 +370,7 @@ struct QueueManagementView: View {
                                 Image(systemName: "minus.circle")
                             }
                             .buttonStyle(.borderless)
+                            .disabled(hasHiddenMembers)
                             .help("从队列移除")
                         }
                         .padding(.vertical, 4)
@@ -365,7 +380,8 @@ struct QueueManagementView: View {
                     }
                 }
                 .onMove { source, destination in
-                    guard let current = model.queueLibrary.first(where: { $0.id == queue.id }) else { return }
+                    guard !hasHiddenMembers,
+                          let current = model.queueLibrary.first(where: { $0.id == queue.id }) else { return }
                     let sourceIndex = source.first ?? 0
                     model.moveWallpaper(in: current, from: sourceIndex, to: destination)
                 }
@@ -373,6 +389,17 @@ struct QueueManagementView: View {
         }
         .padding(16)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.42), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func visibleWallpaperCount(_ queue: PlaybackQueue) -> Int {
+        guard !model.showsHiddenWallpapers else { return queue.wallpaperIDs.count }
+        return queue.wallpaperIDs.reduce(into: 0) { count, id in
+            guard let item = model.wallpapers.first(where: { $0.id == id }) else {
+                count += 1
+                return
+            }
+            if model.isWallpaperVisible(item) { count += 1 }
+        }
     }
 
     private func update(_ queue: PlaybackQueue, _ change: (inout PlaybackQueue) -> Void) {

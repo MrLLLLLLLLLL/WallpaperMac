@@ -83,6 +83,14 @@ public final class WallpaperStore {
         libraryURL.appendingPathComponent("display-playback-bindings.json")
     }
 
+    private var displayProfilesURL: URL {
+        libraryURL.appendingPathComponent("display-profiles.json")
+    }
+
+    private var hiddenWallpaperLockURL: URL {
+        libraryURL.appendingPathComponent("hidden-wallpapers-lock.json")
+    }
+
     private var migrationPlanURL: URL {
         libraryURL.appendingPathComponent("display-queue-migration-plan.json")
     }
@@ -613,6 +621,38 @@ public final class WallpaperStore {
         return currentItems[index]
     }
 
+    /// Field-level hidden flag update. Keeping this separate from a full item
+    /// snapshot prevents concurrent metadata/favorite edits from being lost.
+    @discardableResult
+    public func updateHidden(id: UUID, isHidden: Bool) throws -> WallpaperItem {
+        var currentItems = try items()
+        guard let index = currentItems.firstIndex(where: { $0.id == id }) else {
+            throw WallpaperStoreError.itemNotFound(id)
+        }
+        guard currentItems[index].isHidden != isHidden else {
+            return currentItems[index]
+        }
+        currentItems[index].isHidden = isHidden
+        try save(currentItems)
+        return currentItems[index]
+    }
+
+    public func hiddenWallpaperLock() throws -> HiddenWallpaperLock? {
+        guard fileManager.fileExists(atPath: hiddenWallpaperLockURL.path) else { return nil }
+        let data = try Data(contentsOf: hiddenWallpaperLockURL)
+        return try decoder.decode(HiddenWallpaperLock.self, from: data)
+    }
+
+    public func save(hiddenWallpaperLock: HiddenWallpaperLock) throws {
+        try ensureLibraryDirectories()
+        let data = try encoder.encode(hiddenWallpaperLock)
+        try data.write(to: hiddenWallpaperLockURL, options: .atomic)
+        try? fileManager.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: hiddenWallpaperLockURL.path
+        )
+    }
+
     /// Patches only enrichment fields for several items in one read-modify-write.
     ///
     /// Callers must not hand over a full item array: the array is often a stale
@@ -879,6 +919,20 @@ public final class WallpaperStore {
         try ensureLibraryDirectories()
         let data = try encoder.encode(displayAssignments)
         try data.write(to: assignmentsURL, options: .atomic)
+    }
+
+    /// Stable display profiles. A missing file means the library has not been
+    /// migrated yet; the caller should run the legacy migrator.
+    public func displayProfilesDocument() throws -> DisplayProfileDocument? {
+        guard fileManager.fileExists(atPath: displayProfilesURL.path) else { return nil }
+        let data = try Data(contentsOf: displayProfilesURL)
+        return try decoder.decode(DisplayProfileDocument.self, from: data)
+    }
+
+    public func save(displayProfilesDocument: DisplayProfileDocument) throws {
+        try ensureLibraryDirectories()
+        let data = try encoder.encode(displayProfilesDocument)
+        try data.write(to: displayProfilesURL, options: .atomic)
     }
 
     private func availability(for item: WallpaperItem) -> WallpaperAvailability {

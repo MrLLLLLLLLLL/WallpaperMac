@@ -97,7 +97,7 @@ public struct WallpaperMetadata: Codable, Equatable, Sendable {
 public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case id, name, type, sourceURL, playbackURL, entryURL, relativeEntryPath, storageMode, thumbnailURL, metadata, availability
-        case createdAt, lastUsedAt, isFavorite, groupID, fitModeOverride
+        case createdAt, lastUsedAt, isFavorite, groupID, fitModeOverride, isHidden
     }
 
     public let id: UUID
@@ -113,6 +113,9 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
     public var relativeEntryPath: String?
     /// Optional per-wallpaper fit override; nil inherits the global policy.
     public var fitModeOverride: WallpaperFitMode?
+    /// Conceals the wallpaper from the library and queue while the hidden
+    /// wallpapers switch is locked. The file itself is not encrypted.
+    public var isHidden: Bool
     public var storageMode: StorageMode
 
     public func effectiveFitMode(global: WallpaperFitMode) -> WallpaperFitMode {
@@ -137,6 +140,7 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
         entryURL = try container.decodeIfPresent(URL.self, forKey: .entryURL)
         relativeEntryPath = try container.decodeIfPresent(String.self, forKey: .relativeEntryPath)
         fitModeOverride = try container.decodeIfPresent(WallpaperFitMode.self, forKey: .fitModeOverride)
+        isHidden = try container.decodeIfPresent(Bool.self, forKey: .isHidden) ?? false
         storageMode = try container.decode(StorageMode.self, forKey: .storageMode)
         thumbnailURL = try container.decodeIfPresent(URL.self, forKey: .thumbnailURL)
         metadata = try container.decodeIfPresent(WallpaperMetadata.self, forKey: .metadata)
@@ -159,6 +163,7 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
         entryURL: URL? = nil,
         relativeEntryPath: String? = nil,
         fitModeOverride: WallpaperFitMode? = nil,
+        isHidden: Bool = false,
         storageMode: StorageMode,
         thumbnailURL: URL? = nil,
         metadata: WallpaperMetadata? = nil,
@@ -176,6 +181,7 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
         self.entryURL = entryURL
         self.relativeEntryPath = relativeEntryPath
         self.fitModeOverride = fitModeOverride
+        self.isHidden = isHidden
         self.storageMode = storageMode
         self.thumbnailURL = thumbnailURL
         self.metadata = metadata

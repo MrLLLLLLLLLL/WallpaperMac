@@ -68,12 +68,17 @@ final class WallpaperManager: ObservableObject {
     private var remainingQueueIntervals: [String: TimeInterval] = [:]
     private var remainingHardDeadlines: [String: TimeInterval] = [:]
     private var connectedDisplays: [String: DisplayService.Display] = [:]
+    private var connectedIdentities: [String: DisplayIdentity] = [:]
+    private var displayProfiles: [String: DisplayProfile] = [:]
+    private var unmatchedLegacyAssignments: [DisplayAssignment] = []
+    private var unmatchedLegacyBindings: [DisplayPlaybackBinding] = []
     private var queueItems: [UUID: WallpaperItem] = [:]
     private var queueLibrary: [UUID: PlaybackQueue] = [:]
     private var bindings: [String: DisplayPlaybackBinding] = [:]
     private weak var store: WallpaperStore?
     private var persistenceGate = LibraryPersistenceGate()
     private var playbackPolicy = PlaybackPolicy()
+    private var showsHiddenWallpapers = false
     private var isSystemSuspended = false
     private var activityMonitor: SystemActivityMonitor?
     private var screenChangeObserver: NSObjectProtocol?
@@ -115,11 +120,16 @@ final class WallpaperManager: ObservableObject {
         controllers.removeAll()
         currentSessions.removeAll()
         sessionDurations.removeAll()
+        displayProfiles = [:]
+        connectedIdentities = [:]
+        unmatchedLegacyAssignments = []
+        unmatchedLegacyBindings = []
+        showsHiddenWallpapers = false
         self.store = store
         self.playbackPolicy = policy
         activityMonitor?.update(policy: policy)
-        loadAssignments()
         loadQueues()
+        loadAssignments()
     }
 
     func update(policy: PlaybackPolicy) {
@@ -160,6 +170,10 @@ final class WallpaperManager: ObservableObject {
     ) throws {
         playbackPolicy = policy
         connectedDisplays[display.id] = display
+        connectedIdentities[display.id] = display.identity
+        if displayProfiles[display.id] == nil {
+            mergeProfiles(for: [display])
+        }
         queueItems[item.id] = item
         if !preserveQueue {
             stopQueue(displayID: display.id, persist: true)
@@ -216,6 +230,99 @@ final class WallpaperManager: ObservableObject {
         publishDisplayAssignments()
         appliedWallpaperIDs.removeValue(forKey: displayID)
         playbackStates.removeValue(forKey: displayID)
+        persistAssignments()
+    }
+
+    /// Refreshes the manager's item cache after a field-level hidden update.
+    func updateHiddenState(for items: [WallpaperItem]) {
+        for item in items {
+            queueItems[item.id] = item
+        }
+    }
+
+    /// Applies the hidden-wallpaper switch. Locking immediately removes hidden
+    /// wallpapers from screens; unlocking lets the normal restore path bring
+    /// back still-assigned hidden items and hidden queue members.
+    func setShowsHiddenWallpapers(
+        _ shows: Bool,
+        policy: PlaybackPolicy,
+        items: [WallpaperItem]
+    ) {
+        playbackPolicy = policy
+        showsHiddenWallpapers = shows
+        queueItems = UniquedDictionary.build(items.map { ($0.id, $0) }, label: "queue items")
+        if shows {
+            reapply(to: currentDisplays(), policy: policy, items: items)
+        } else {
+            for display in connectedDisplays.values {
+                hideHiddenPresentationIfNeeded(displayID: display.id)
+            }
+            for displayID in bindings.keys {
+                reconcileScheduling(for: displayID)
+            }
+        }
+    }
+
+    private func hideHiddenPresentationIfNeeded(displayID: String) {
+        guard let itemID = assignments[displayID]?.wallpaperID,
+              let item = queueItems[itemID],
+              item.isHidden else { return }
+        guard let display = connectedDisplays[displayID] else {
+            suspendPresentation(displayID: displayID)
+            return
+        }
+        if let binding = bindings[displayID],
+           let queue = queueLibrary[binding.activeQueueID] {
+            var updated = binding
+            var state = updated.state(for: queue.id)
+            if let next = nextQueueIndex(queue: queue, state: state),
+               let nextItem = queueItems[queue.wallpaperIDs[next]] {
+                state.currentIndex = next
+                state.isPlaying = state.isEnabled && state.isPlaying
+                updated.queueStates[queue.id] = state
+                bindings[displayID] = updated
+                publishBindings()
+                publishLegacyQueues()
+                persistQueues()
+                invalidateQueueTimers(for: displayID)
+                var presentationPolicy = playbackPolicy
+                presentationPolicy.isPlaying = state.isEnabled && state.isPlaying
+                do {
+                    try apply(
+                        item: nextItem,
+                        to: display,
+                        policy: presentationPolicy,
+                        preserveQueue: true
+                    )
+                    return
+                } catch {
+                    suspendPresentation(displayID: displayID)
+                    return
+                }
+            }
+            state.isPlaying = false
+            updated.queueStates[queue.id] = state
+            bindings[displayID] = updated
+            publishBindings()
+            publishLegacyQueues()
+            persistQueues()
+        }
+        suspendPresentation(displayID: displayID)
+    }
+
+    /// Tears down a display's presentation while keeping its assignment for a
+    /// later unlock. Unlike `clear(displayID:)`, the wallpaperID is retained.
+    private func suspendPresentation(displayID: String) {
+        invalidateQueueTimers(for: displayID)
+        currentSessions.removeValue(forKey: displayID)
+        sessionDurations.removeValue(forKey: displayID)
+        controllers.removeValue(forKey: displayID)?.teardownAndClose()
+        appliedWallpaperIDs.removeValue(forKey: displayID)
+        playbackStates.removeValue(forKey: displayID)
+        if assignments[displayID] != nil {
+            assignments[displayID]?.applicationState = .idle
+        }
+        publishDisplayAssignments()
         persistAssignments()
     }
 
@@ -277,6 +384,13 @@ final class WallpaperManager: ObservableObject {
         playbackPolicy = policy
         let previousDisplays = connectedDisplays
         connectedDisplays = UniquedDictionary.build(displays.map { ($0.id, $0) }, label: "connected displays")
+        connectedIdentities = UniquedDictionary.build(
+            displays.map { ($0.id, $0.identity) },
+            label: "connected identities"
+        )
+        if displays.contains(where: { displayProfiles[$0.id] == nil }) {
+            mergeProfiles(for: displays)
+        }
         queueItems = UniquedDictionary.build(items.map { ($0.id, $0) }, label: "queue items")
         let connectedIDs = Set(displays.map(\.id))
         let potentiallyDisconnected = Set(previousDisplays.keys)
@@ -297,6 +411,7 @@ final class WallpaperManager: ObservableObject {
             }
             appliedWallpaperIDs.removeValue(forKey: key)
             playbackStates.removeValue(forKey: key)
+            connectedIdentities.removeValue(forKey: key)
         }
         publishDisplayAssignments()
 
@@ -328,7 +443,10 @@ final class WallpaperManager: ObservableObject {
             let currentItemMatches = expectedItemID != nil
                 && appliedWallpaperIDs[display.id] == expectedItemID
                 && currentSessions[display.id]?.itemID == expectedItemID
-            let expectedAvailable = expectedItemID.flatMap { queueItems[$0]?.availability == .available } ?? false
+            let expectedAvailable = WallpaperVisibility.isEligible(
+                expectedItemID.flatMap { queueItems[$0] },
+                showsHidden: showsHiddenWallpapers
+            )
             let geometryChanged = previousDisplays[display.id]?.screen.frame != display.screen.frame
             let action = DisplayReconciler.action(
                 isConnected: true,
@@ -353,7 +471,17 @@ final class WallpaperManager: ObservableObject {
                 }
                 guard let wallpaperID = expectedItemID,
                       let item = queueItems[wallpaperID],
-                      item.availability == .available else { continue }
+                      WallpaperVisibility.isEligible(item, showsHidden: showsHiddenWallpapers) else {
+                    if let wallpaperID = expectedItemID,
+                       let item = queueItems[wallpaperID],
+                       item.isHidden,
+                       !showsHiddenWallpapers {
+                        // Keep the assignment for a later unlock, but do not
+                        // present a stale "applied" state while locked.
+                        assignments[display.id]?.applicationState = .idle
+                    }
+                    continue
+                }
                 try? apply(item: item, to: display, policy: policy, preserveQueue: true)
             case .disconnect:
                 continue
@@ -629,8 +757,25 @@ final class WallpaperManager: ObservableObject {
         binding.activeQueueID = queueID
         var state = binding.state(for: queueID)
         if resetIndex { state.currentIndex = 0 }
-        let availableIDs = queue.wallpaperIDs.filter { queueItems[$0]?.availability == .available }
+        let availableIDs = queue.wallpaperIDs.filter {
+            WallpaperVisibility.isEligible(queueItems[$0], showsHidden: showsHiddenWallpapers)
+        }
         guard !availableIDs.isEmpty else {
+            let hasHiddenMembers = !showsHiddenWallpapers
+                && queue.wallpaperIDs.contains { queueItems[$0]?.isHidden == true }
+            if hasHiddenMembers {
+                // A locked hidden-only queue keeps its enabled intent so it can
+                // resume after unlocking, but it must not leave a hidden
+                // wallpaper on screen.
+                state.isPlaying = false
+                binding.queueStates[queueID] = state
+                bindings[display.id] = binding
+                publishBindings()
+                publishLegacyQueues()
+                persistQueues()
+                suspendPresentation(displayID: display.id)
+                return
+            }
             state.isEnabled = false
             state.isPlaying = false
             state.currentIndex = 0
@@ -799,14 +944,19 @@ final class WallpaperManager: ObservableObject {
     }
 
     private func loadAssignments() {
-        guard let store, let saved = try? store.displayAssignments() else {
-            assignments = [:]
-            publishDisplayAssignments()
-            appliedWallpaperIDs.removeAll()
-            playbackStates.removeAll()
-            return
+        var loaded: [String: DisplayAssignment] = [:]
+        for profile in displayProfiles.values {
+            guard let assignment = profile.assignment else { continue }
+            let isConnected = connectedIdentities[profile.profileID] != nil
+            loaded[profile.profileID] = DisplayAssignment(
+                id: profile.profileID,
+                displayName: profile.displayName,
+                isConnected: isConnected,
+                wallpaperID: assignment.wallpaperID,
+                applicationState: isConnected ? assignment.applicationState : .disconnected
+            )
         }
-        assignments = UniquedDictionary.build(saved.map { ($0.id, $0) }, label: "display assignments")
+        assignments = loaded
         publishDisplayAssignments()
         appliedWallpaperIDs.removeAll()
         playbackStates.removeAll()
@@ -838,7 +988,19 @@ final class WallpaperManager: ObservableObject {
         queueSaveError = nil
         playbackQueues = loadResult.queues
         queueLibrary = UniquedDictionary.build(loadResult.queues.map { ($0.id, $0) }, label: "playback queues")
-        bindings = UniquedDictionary.build(loadResult.bindings.map { ($0.displayID, $0) }, label: "display bindings")
+        prepareDisplayProfiles(
+            legacyBindings: loadResult.loadError == nil ? loadResult.bindings : nil
+        )
+        let profileBindings = displayProfiles.values.compactMap { profile -> DisplayPlaybackBinding? in
+            guard let binding = profile.binding else { return nil }
+            return DisplayPlaybackBinding(
+                displayID: profile.profileID,
+                displayName: profile.displayName,
+                activeQueueID: binding.activeQueueID,
+                queueStates: binding.queueStates
+            )
+        }
+        bindings = UniquedDictionary.build(profileBindings.map { ($0.displayID, $0) }, label: "display bindings")
         for displayID in bindings.keys {
             guard var binding = bindings[displayID], queueLibrary[binding.activeQueueID] == nil else { continue }
             binding.activeQueueID = defaultQueueID
@@ -850,6 +1012,175 @@ final class WallpaperManager: ObservableObject {
         publishBindings()
         publishQueueLibrary()
         publishLegacyQueues()
+    }
+
+    /// Creates or refreshes stable display profiles before assignments and
+    /// bindings are loaded. Runtime `CGDirectDisplayID` values are never used
+    /// as persisted keys.
+    private func prepareDisplayProfiles(legacyBindings: [DisplayPlaybackBinding]? = nil) {
+        guard let store else {
+            displayProfiles = [:]
+            unmatchedLegacyAssignments = []
+            unmatchedLegacyBindings = []
+            connectedIdentities = [:]
+            return
+        }
+        let displays = currentDisplays()
+        connectedIdentities = UniquedDictionary.build(
+            displays.map { ($0.id, $0.identity) },
+            label: "connected identities"
+        )
+        let now = Date()
+        let existing = (try? store.displayProfilesDocument()) ?? nil
+
+        if let document = existing {
+            // Import legacy files only when they are newer than the profile
+            // document (for example edits made by a 0.2.8 build). The migrator
+            // additionally requires the display name to match, so a swapped
+            // runtime ID cannot hijack another display's queue.
+            let profilesModified = displayFileModificationDate("display-profiles.json")
+            let importAssignments = Self.isNewer(
+                displayFileModificationDate("display-assignments.json"),
+                than: profilesModified
+            )
+            let importBindings = Self.isNewer(
+                displayFileModificationDate("display-playback-bindings.json"),
+                than: profilesModified
+            )
+            let merged = DisplayProfileMigrator.merge(
+                document: document,
+                identities: displays.map(\.identity),
+                legacyAssignments: (try? store.displayAssignments()) ?? [],
+                legacyBindings: legacyBindings ?? [],
+                overwriteAssignments: importAssignments,
+                overwriteBindings: importBindings,
+                now: now
+            )
+            applyDisplayProfileDocument(merged)
+            saveProfiles(store: store)
+        } else {
+            let migration = DisplayProfileMigrator.migrate(
+                legacyAssignments: (try? store.displayAssignments()) ?? [],
+                legacyBindings: legacyBindings ?? [],
+                identities: displays.map(\.identity),
+                now: now
+            )
+            applyDisplayProfileDocument(migration.document)
+            saveProfiles(store: store)
+        }
+    }
+
+    private func applyDisplayProfileDocument(_ document: DisplayProfileDocument) {
+        displayProfiles = UniquedDictionary.build(
+            document.profiles.map { ($0.profileID, $0) },
+            label: "display profiles"
+        )
+        unmatchedLegacyAssignments = document.unmatchedLegacyAssignments
+        unmatchedLegacyBindings = document.unmatchedLegacyBindings
+    }
+
+    /// Adds profiles for displays that appeared after launch and lets a
+    /// reconnecting display claim its preserved legacy records.
+    private func mergeProfiles(for displays: [DisplayService.Display]) {
+        guard let store else { return }
+        let document = DisplayProfileDocument(
+            profiles: Array(displayProfiles.values),
+            unmatchedLegacyAssignments: unmatchedLegacyAssignments,
+            unmatchedLegacyBindings: unmatchedLegacyBindings
+        )
+        let merged = DisplayProfileMigrator.merge(
+            document: document,
+            identities: displays.map(\.identity),
+            now: Date()
+        )
+        applyDisplayProfileDocument(merged)
+        saveProfiles(store: store)
+    }
+
+    private func displayFileModificationDate(_ name: String) -> Date? {
+        guard let store else { return nil }
+        let url = store.libraryURL.appendingPathComponent(name)
+        return (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    }
+
+    private static func isNewer(_ date: Date?, than reference: Date?) -> Bool {
+        guard let date else { return false }
+        guard let reference else { return true }
+        return date > reference
+    }
+
+    private func syncProfilesFromRuntime() {
+        for (displayID, assignment) in assignments {
+            guard var profile = displayProfiles[displayID] else { continue }
+            profile.assignment = assignment
+            displayProfiles[displayID] = profile
+        }
+        for (displayID, binding) in bindings {
+            guard var profile = displayProfiles[displayID] else { continue }
+            profile.binding = binding
+            displayProfiles[displayID] = profile
+        }
+        for (displayID, identity) in connectedIdentities {
+            guard var profile = displayProfiles[displayID] else { continue }
+            profile.identity = identity
+            displayProfiles[displayID] = profile
+        }
+    }
+
+    private func saveProfiles(store: WallpaperStore) {
+        let document = DisplayProfileDocument(
+            profiles: displayProfiles.values.sorted { $0.profileID < $1.profileID },
+            unmatchedLegacyAssignments: unmatchedLegacyAssignments,
+            unmatchedLegacyBindings: unmatchedLegacyBindings
+        )
+        do {
+            try store.save(displayProfilesDocument: document)
+        } catch {
+            NSLog("WallpaperMac failed to save display profiles: \(error.localizedDescription)")
+        }
+    }
+
+    private func legacyAssignmentSnapshot() -> [DisplayAssignment] {
+        let connectedLegacyIDs = Set(
+            connectedIdentities.values.map(DisplayProfileMigrator.legacyDisplayID(for:))
+        )
+        var snapshot = unmatchedLegacyAssignments.filter { !connectedLegacyIDs.contains($0.id) }
+        for (profileID, identity) in connectedIdentities {
+            guard let assignment = assignments[profileID] ?? displayProfiles[profileID]?.assignment else {
+                continue
+            }
+            snapshot.append(
+                DisplayAssignment(
+                    id: DisplayProfileMigrator.legacyDisplayID(for: identity),
+                    displayName: identity.localizedName,
+                    isConnected: true,
+                    wallpaperID: assignment.wallpaperID,
+                    applicationState: assignment.applicationState
+                )
+            )
+        }
+        return snapshot
+    }
+
+    private func legacyBindingSnapshot() -> [DisplayPlaybackBinding] {
+        let connectedLegacyIDs = Set(
+            connectedIdentities.values.map(DisplayProfileMigrator.legacyDisplayID(for:))
+        )
+        var snapshot = unmatchedLegacyBindings.filter { !connectedLegacyIDs.contains($0.displayID) }
+        for (profileID, identity) in connectedIdentities {
+            guard let binding = bindings[profileID] ?? displayProfiles[profileID]?.binding else {
+                continue
+            }
+            snapshot.append(
+                DisplayPlaybackBinding(
+                    displayID: DisplayProfileMigrator.legacyDisplayID(for: identity),
+                    displayName: identity.localizedName,
+                    activeQueueID: binding.activeQueueID,
+                    queueStates: binding.queueStates
+                )
+            )
+        }
+        return snapshot
     }
 
     /// True while a corrupt queue/bindings file keeps queue writes disabled.
@@ -883,7 +1214,9 @@ final class WallpaperManager: ObservableObject {
     private func persistAssignments() {
         publishDisplayAssignments()
         guard let store else { return }
-        try? store.save(displayAssignments: displayAssignments)
+        syncProfilesFromRuntime()
+        saveProfiles(store: store)
+        try? store.save(displayAssignments: legacyAssignmentSnapshot())
     }
 
     @discardableResult
@@ -981,10 +1314,14 @@ final class WallpaperManager: ObservableObject {
             return
         }
         guard let store else { return }
+        syncProfilesFromRuntime()
+        saveProfiles(store: store)
         do {
+            // Keep the legacy file keyed by the current runtime ID so a
+            // downgraded build can still read the latest state.
             try store.save(
                 playbackQueues: playbackQueues,
-                displayPlaybackBindings: Array(bindings.values)
+                displayPlaybackBindings: legacyBindingSnapshot()
             )
             queueSaveError = nil
         } catch {
@@ -1231,7 +1568,8 @@ final class WallpaperManager: ObservableObject {
               let queue = queueLibrary[binding.activeQueueID],
               let state = binding.queueStates[queue.id],
               queue.wallpaperIDs.indices.contains(state.currentIndex),
-              let item = queueItems[queue.wallpaperIDs[state.currentIndex]] else {
+              let item = queueItems[queue.wallpaperIDs[state.currentIndex]],
+              WallpaperVisibility.isEligible(item, showsHidden: showsHiddenWallpapers) else {
             invalidateQueueTimers(for: displayID)
             return
         }
@@ -1264,8 +1602,28 @@ final class WallpaperManager: ObservableObject {
             freezeQueueTimers(for: displayID)
             return
         }
-        guard state.isEnabled, let next = nextQueueIndex(queue: queue, state: state) else {
+        guard state.isEnabled else {
             stopQueue(displayID: displayID)
+            return
+        }
+        guard let next = nextQueueIndex(queue: queue, state: state) else {
+            let hasHiddenMembers = !showsHiddenWallpapers
+                && queue.wallpaperIDs.contains { queueItems[$0]?.isHidden == true }
+            if hasHiddenMembers {
+                // Do not destroy the queue's enabled intent just because every
+                // remaining member is hidden while the switch is locked.
+                var pausedState = state
+                pausedState.isPlaying = false
+                var updatedBinding = binding
+                updatedBinding.queueStates[queue.id] = pausedState
+                bindings[displayID] = updatedBinding
+                publishBindings()
+                publishLegacyQueues()
+                persistQueues()
+                suspendPresentation(displayID: displayID)
+            } else {
+                stopQueue(displayID: displayID)
+            }
             return
         }
         guard let item = queueItems[queue.wallpaperIDs[next]] else {
@@ -1303,7 +1661,11 @@ final class WallpaperManager: ObservableObject {
     }
 
     private func nextQueueIndex(queue: PlaybackQueue, state: DisplayQueueState) -> Int? {
-        let available = queue.wallpaperIDs.indices.filter { queueItems[queue.wallpaperIDs[$0]]?.availability == .available }
+        let available = WallpaperVisibility.eligibleIndices(
+            in: queue,
+            items: queueItems,
+            showsHidden: showsHiddenWallpapers
+        )
         guard !available.isEmpty else { return nil }
         if effectivePlaybackMode(queue: queue, state: state) == .random {
             let candidates = available.filter { available.count == 1 || $0 != state.currentIndex }
@@ -1319,7 +1681,11 @@ final class WallpaperManager: ObservableObject {
     }
 
     private func nextAvailableIndex(in queue: PlaybackQueue, state: DisplayQueueState, preferCurrent: Bool) -> Int? {
-        let available = queue.wallpaperIDs.indices.filter { queueItems[queue.wallpaperIDs[$0]]?.availability == .available }
+        let available = WallpaperVisibility.eligibleIndices(
+            in: queue,
+            items: queueItems,
+            showsHidden: showsHiddenWallpapers
+        )
         guard !available.isEmpty else { return nil }
         if preferCurrent, available.contains(state.currentIndex) { return state.currentIndex }
         return available.first
@@ -1391,15 +1757,14 @@ final class WallpaperManager: ObservableObject {
 
     private func currentDisplays() -> [DisplayService.Display] {
         NSScreen.screens.enumerated().map { index, screen in
-            let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
-            let id = number.map { "display-\($0.uint32Value)" } ?? "display-\(index)"
-            return DisplayService.Display(id: id, name: screen.localizedName.isEmpty ? "显示器 \(index + 1)" : screen.localizedName, screen: screen)
+            let identity = DisplayIdentityProvider.identity(for: screen)
+            let name = screen.localizedName.isEmpty ? "显示器 \(index + 1)" : screen.localizedName
+            return DisplayService.Display(id: identity.profileID, name: name, screen: screen, identity: identity)
         }
     }
 
     private func displayID(for screen: NSScreen) -> String {
-        let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
-        return number.map { "display-\($0.uint32Value)" } ?? "display-0"
+        DisplayIdentityProvider.identity(for: screen).profileID
     }
 }
 

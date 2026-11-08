@@ -875,6 +875,19 @@ let tests: [(String, () throws -> Void)] = [
     ("only loops ffmpeg after a clean drained EOF", testVideoStreamExitPolicyOnlyLoopsCleanEOF),
     ("tracks AVPlayer time and duration progress", testVideoPlaybackProgressUsesActualTimeAndDuration),
     ("keeps unchanged displays during screen reconciliation", testDisplayReconcilerDoesNotRebuildUnchangedScreens),
+    ("uses stable uuid display profile ids", testDisplayIdentityUsesStableUUID),
+    ("migrates legacy displays by name across swapped ids", testDisplayProfileMigrationUsesNamesAcrossSwappedIDs),
+    ("keeps profiles through a reboot id swap", testDisplayProfileMergeSurvivesRebootIDSwap),
+    ("matches a changed uuid by hardware serial", testDisplayProfileMergeMatchesChangedUUIDBySerial),
+    ("ignores a legacy record for another display", testDisplayProfileMergeIgnoresForeignLegacyRecord),
+    ("fills missing profile data from an older legacy file", testDisplayProfileMergeFillsMissingDataFromOlderLegacy),
+    ("keeps newer profile data over older legacy records", testDisplayProfileMergeKeepsNewerProfileData),
+    ("round trips display profiles through the store", testDisplayProfilesRoundTripThroughStore),
+    ("defaults legacy wallpapers to visible", testHiddenFlagDefaultsAndRoundTrips),
+    ("updates hidden flag without clobbering edits", testUpdateHiddenPreservesOtherFields),
+    ("derives PBKDF2-HMAC-SHA256 vectors", testPBKDF2KnownVectors),
+    ("verifies hidden wallpaper passwords", testHiddenWallpaperLockVerification),
+    ("filters hidden wallpapers from queues", testWallpaperVisibilityFiltersQueues),
     ("requires a one-shot native gesture for external navigation", testExternalNavigationRequiresOneShotNativeGesture),
     ("bounds WebContent recovery with healthy reset", testWebContentRecoveryUsesBoundedBackoffAndHealthyReset),
     ("delivers fragmented video tail frames without loss", testVideoFrameBufferDeliversFragmentedTailWithoutLoss),
@@ -3748,4 +3761,379 @@ func testQueueReorderKeepsDeletedPlaceholders() throws {
 
     try expect(wallpaperIDs, equals: [visible2, visible1, placeholder], "reorder preserves the placeholder row")
     try expect(wallpaperIDs.contains(placeholder), "deleted wallpaper IDs survive reordering")
+}
+
+func makeTestDisplayIdentity(
+    uuid: String? = "UUID-1",
+    cgid: UInt32 = 1,
+    vendor: UInt32? = 100,
+    model: UInt32? = 200,
+    serial: UInt32? = 300,
+    name: String = "Display",
+    pixelWidth: Int = 2560,
+    pixelHeight: Int = 1440
+) -> DisplayIdentity {
+    DisplayIdentity(
+        uuid: uuid,
+        cgDisplayID: cgid,
+        vendorNumber: vendor,
+        modelNumber: model,
+        serialNumber: serial,
+        localizedName: name,
+        geometry: DisplayGeometry(
+            originX: 0,
+            originY: 0,
+            width: Double(pixelWidth) / 2,
+            height: Double(pixelHeight) / 2,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight
+        ),
+        isBuiltIn: false
+    )
+}
+
+func testDisplayIdentityUsesStableUUID() throws {
+    try expect(
+        makeTestDisplayIdentity(uuid: "A", cgid: 4).profileID,
+        equals: "uuid-A",
+        "a present UUID must be the persistent key"
+    )
+    try expect(
+        makeTestDisplayIdentity(uuid: nil, cgid: 7).profileID,
+        equals: "cgid-7",
+        "a missing UUID falls back to the runtime id"
+    )
+}
+
+func testDisplayProfileMigrationUsesNamesAcrossSwappedIDs() throws {
+    let queueA = UUID()
+    let queueB = UUID()
+    let identities = [
+        makeTestDisplayIdentity(uuid: "A", cgid: 2, name: "Left"),
+        makeTestDisplayIdentity(uuid: "B", cgid: 1, name: "Right")
+    ]
+    let assignments = [
+        DisplayAssignment(id: "display-1", displayName: "Right", isConnected: true, wallpaperID: UUID()),
+        DisplayAssignment(id: "display-2", displayName: "Left", isConnected: true, wallpaperID: UUID())
+    ]
+    let bindings = [
+        DisplayPlaybackBinding(displayID: "display-1", displayName: "Right", activeQueueID: queueB),
+        DisplayPlaybackBinding(displayID: "display-2", displayName: "Left", activeQueueID: queueA)
+    ]
+
+    let result = DisplayProfileMigrator.migrate(
+        legacyAssignments: assignments,
+        legacyBindings: bindings,
+        identities: identities,
+        now: Date(timeIntervalSince1970: 100)
+    )
+
+    let profileA = result.document.profiles.first { $0.profileID == "uuid-A" }
+    let profileB = result.document.profiles.first { $0.profileID == "uuid-B" }
+    try expect(profileA?.binding?.activeQueueID, equals: queueA, "Left must keep Left's queue even though display-2 is now Left")
+    try expect(profileB?.binding?.activeQueueID, equals: queueB, "Right must keep Right's queue even though display-1 is now Right")
+    try expect(result.profileIDByLegacyID["display-2"], equals: "uuid-A", "legacy ids must map by name first")
+    try expect(result.profileIDByLegacyID["display-1"], equals: "uuid-B", "legacy ids must map by name first")
+}
+
+func testDisplayProfileMergeSurvivesRebootIDSwap() throws {
+    let queueA = UUID()
+    let queueB = UUID()
+    let profileA = DisplayProfile(
+        profileID: "uuid-A",
+        identity: makeTestDisplayIdentity(uuid: "A", cgid: 1, name: "Left"),
+        binding: DisplayPlaybackBinding(displayID: "uuid-A", displayName: "Left", activeQueueID: queueA)
+    )
+    let profileB = DisplayProfile(
+        profileID: "uuid-B",
+        identity: makeTestDisplayIdentity(uuid: "B", cgid: 2, name: "Right"),
+        binding: DisplayPlaybackBinding(displayID: "uuid-B", displayName: "Right", activeQueueID: queueB)
+    )
+    let document = DisplayProfileDocument(profiles: [profileA, profileB])
+
+    // Reboot: macOS reassigns the runtime IDs, but the physical displays keep
+    // their ColorSync UUIDs.
+    let afterReboot = [
+        makeTestDisplayIdentity(uuid: "A", cgid: 2, name: "Left"),
+        makeTestDisplayIdentity(uuid: "B", cgid: 1, name: "Right")
+    ]
+    let merged = DisplayProfileMigrator.merge(
+        document: document,
+        identities: afterReboot,
+        now: Date(timeIntervalSince1970: 200)
+    )
+
+    try expect(merged.profiles.count, equals: 2, "a reboot must not duplicate profiles")
+    try expect(
+        merged.profiles.first { $0.profileID == "uuid-A" }?.binding?.activeQueueID,
+        equals: queueA,
+        "display A must keep its queue after the runtime id swaps"
+    )
+    try expect(
+        merged.profiles.first { $0.profileID == "uuid-B" }?.binding?.activeQueueID,
+        equals: queueB,
+        "display B must keep its queue after the runtime id swaps"
+    )
+    try expect(
+        merged.profiles.first { $0.profileID == "uuid-A" }?.identity.cgDisplayID,
+        equals: 2,
+        "the identity snapshot should record the new runtime id"
+    )
+}
+
+func testDisplayProfileMergeMatchesChangedUUIDBySerial() throws {
+    let queueID = UUID()
+    let document = DisplayProfileDocument(profiles: [
+        DisplayProfile(
+            profileID: "uuid-OLD",
+            identity: makeTestDisplayIdentity(uuid: "OLD", cgid: 1, vendor: 10, model: 20, serial: 777, name: "Monitor"),
+            binding: DisplayPlaybackBinding(displayID: "uuid-OLD", displayName: "Monitor", activeQueueID: queueID)
+        )
+    ])
+    let changed = makeTestDisplayIdentity(uuid: "NEW", cgid: 5, vendor: 10, model: 20, serial: 777, name: "Monitor")
+
+    let merged = DisplayProfileMigrator.merge(
+        document: document,
+        identities: [changed],
+        now: Date(timeIntervalSince1970: 300)
+    )
+
+    try expect(merged.profiles.count, equals: 1, "a changed UUID with the same hardware must reuse the profile")
+    try expect(merged.profiles[0].profileID, equals: "uuid-OLD", "the original stable id must be kept")
+    try expect(merged.profiles[0].identity.uuid, equals: "NEW", "the identity should learn the new UUID")
+    try expect(merged.profiles[0].binding?.activeQueueID, equals: queueID, "the binding must survive")
+}
+
+func testDisplayProfileMergeIgnoresForeignLegacyRecord() throws {
+    let ownQueue = UUID()
+    let foreignQueue = UUID()
+    let document = DisplayProfileDocument(profiles: [
+        DisplayProfile(
+            profileID: "uuid-A",
+            identity: makeTestDisplayIdentity(uuid: "A", cgid: 1, name: "Left"),
+            binding: DisplayPlaybackBinding(displayID: "uuid-A", displayName: "Left", activeQueueID: ownQueue)
+        )
+    ])
+    let foreign = DisplayPlaybackBinding(displayID: "display-1", displayName: "Right", activeQueueID: foreignQueue)
+
+    let merged = DisplayProfileMigrator.merge(
+        document: document,
+        identities: [makeTestDisplayIdentity(uuid: "A", cgid: 1, name: "Left")],
+        legacyBindings: [foreign],
+        now: Date(timeIntervalSince1970: 400)
+    )
+
+    try expect(merged.profiles[0].binding?.activeQueueID, equals: ownQueue, "a legacy record for another display must not override the profile")
+    try expect(merged.unmatchedLegacyBindings.map(\.displayID), equals: ["display-1"], "the foreign record should stay unmatched")
+}
+
+func testDisplayProfilesRoundTripThroughStore() throws {
+    let fixture = try Fixture()
+    let identity = makeTestDisplayIdentity(uuid: "A", cgid: 7)
+    let document = DisplayProfileDocument(
+        profiles: [
+            DisplayProfile(
+                profileID: "uuid-A",
+                identity: identity,
+                lastSeenAt: Date(timeIntervalSince1970: 500),
+                assignment: DisplayAssignment(
+                    id: "uuid-A",
+                    displayName: "Display",
+                    isConnected: true,
+                    wallpaperID: UUID(),
+                    applicationState: .applied
+                )
+            )
+        ],
+        unmatchedLegacyAssignments: [
+            DisplayAssignment(id: "display-9", displayName: "Gone", isConnected: false)
+        ]
+    )
+
+    try fixture.store.save(displayProfilesDocument: document)
+    guard let loaded = try fixture.store.displayProfilesDocument() else {
+        throw TestFailure(message: "profiles document should load")
+    }
+    try expect(loaded, equals: document, "profiles document should round-trip through the store")
+}
+
+func testDisplayProfileMergeFillsMissingDataFromOlderLegacy() throws {
+    let queueID = UUID()
+    let document = DisplayProfileDocument(profiles: [
+        DisplayProfile(
+            profileID: "uuid-A",
+            identity: makeTestDisplayIdentity(uuid: "A", cgid: 1, name: "Left")
+        )
+    ])
+    let legacy = DisplayPlaybackBinding(displayID: "display-1", displayName: "Left", activeQueueID: queueID)
+
+    let merged = DisplayProfileMigrator.merge(
+        document: document,
+        identities: [makeTestDisplayIdentity(uuid: "A", cgid: 1, name: "Left")],
+        legacyBindings: [legacy],
+        overwriteBindings: false,
+        now: Date(timeIntervalSince1970: 450)
+    )
+
+    try expect(
+        merged.profiles[0].binding?.activeQueueID,
+        equals: queueID,
+        "an older legacy file must still fill a profile that has no binding"
+    )
+}
+
+func testDisplayProfileMergeKeepsNewerProfileData() throws {
+    let profileQueue = UUID()
+    let staleQueue = UUID()
+    let document = DisplayProfileDocument(profiles: [
+        DisplayProfile(
+            profileID: "uuid-A",
+            identity: makeTestDisplayIdentity(uuid: "A", cgid: 1, name: "Left"),
+            binding: DisplayPlaybackBinding(displayID: "uuid-A", displayName: "Left", activeQueueID: profileQueue)
+        )
+    ])
+    let older = DisplayPlaybackBinding(displayID: "display-1", displayName: "Left", activeQueueID: staleQueue)
+
+    let merged = DisplayProfileMigrator.merge(
+        document: document,
+        identities: [makeTestDisplayIdentity(uuid: "A", cgid: 1, name: "Left")],
+        legacyBindings: [older],
+        overwriteBindings: false,
+        now: Date(timeIntervalSince1970: 460)
+    )
+
+    try expect(
+        merged.profiles[0].binding?.activeQueueID,
+        equals: profileQueue,
+        "an older legacy file must not replace a profile that already has data"
+    )
+}
+
+func testHiddenFlagDefaultsAndRoundTrips() throws {
+    let fixture = try Fixture()
+    let source = fixture.root.appendingPathComponent("hidden.png")
+    try Data("png".utf8).write(to: source)
+    let item = try fixture.store.importItem(at: source, storageMode: .externalReference)
+    try expect(item.isHidden, equals: false, "new wallpapers must be visible")
+
+    var hidden = item
+    hidden.isHidden = true
+    try fixture.store.save(items: [hidden])
+    let reloaded = try WallpaperStore(libraryURL: fixture.library).items().first
+    try expect(reloaded?.isHidden, equals: true, "the hidden flag must round-trip")
+
+    let legacyJSON = """
+    {"id":"11111111-2222-3333-4444-555555555555","name":"legacy","type":"image","sourceURL":"file:///tmp/old.png","storageMode":"externalReference"}
+    """
+    let legacy = try JSONDecoder().decode(WallpaperItem.self, from: Data(legacyJSON.utf8))
+    try expect(legacy.isHidden, equals: false, "legacy records must default to visible")
+}
+
+func testUpdateHiddenPreservesOtherFields() throws {
+    let fixture = try Fixture()
+    let source = fixture.root.appendingPathComponent("hidden.png")
+    try Data("png".utf8).write(to: source)
+    var item = try fixture.store.importItem(at: source, storageMode: .externalReference)
+    item.fitModeOverride = .fit
+    item.isFavorite = true
+    item.metadata = WallpaperMetadata(pixelWidth: 1920, pixelHeight: 1080)
+    try fixture.store.save(items: [item])
+
+    let updated = try fixture.store.updateHidden(id: item.id, isHidden: true)
+    try expect(updated.isHidden, equals: true, "the hidden flag must update")
+    try expect(updated.fitModeOverride, equals: .fit, "fit override must survive a hidden update")
+    try expect(updated.isFavorite, equals: true, "favorite must survive a hidden update")
+    try expect(updated.metadata?.pixelWidth, equals: 1920, "metadata must survive a hidden update")
+}
+
+func testPBKDF2KnownVectors() throws {
+    let salt = Data("salt".utf8)
+    let vectors: [(Int, String)] = [
+        (1, "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"),
+        (2, "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"),
+        (4096, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a")
+    ]
+    for (iterations, expected) in vectors {
+        let derived = HiddenWallpaperLock.derivedKey(
+            password: "password",
+            salt: salt,
+            iterations: iterations,
+            keyLength: 32
+        )
+        try expect(derived.map { String(format: "%02x", $0) }.joined(), equals: expected, "PBKDF2 vector for \(iterations) iterations")
+    }
+}
+
+func testHiddenWallpaperLockVerification() throws {
+    guard let lock = HiddenWallpaperLock.make(password: "correct horse", iterations: 1_000) else {
+        throw TestFailure(message: "the lock should be created")
+    }
+    try expect(lock.verify(password: "correct horse"), "the correct password must verify")
+    try expect(!lock.verify(password: "wrong"), "a wrong password must not verify")
+    try expect(!lock.verify(password: ""), "an empty password must not verify")
+    try expect(!HiddenWallpaperLock.isValidPassword("abc"), "passwords shorter than four bytes are rejected")
+    try expect(HiddenWallpaperLock.make(password: "abc") == nil, "short passwords cannot create a lock")
+
+    var tampered = lock
+    tampered.hashBase64 = Data(repeating: 0, count: 32).base64EncodedString()
+    try expect(!tampered.verify(password: "correct horse"), "a tampered digest must not verify")
+
+    let fixture = try Fixture()
+    try fixture.store.save(hiddenWallpaperLock: lock)
+    let loaded = try fixture.store.hiddenWallpaperLock()
+    try expect(loaded, equals: lock, "the lock must round-trip through the store")
+    let attributes = try FileManager.default.attributesOfItem(
+        atPath: fixture.library.appendingPathComponent("hidden-wallpapers-lock.json").path
+    )
+    try expect((attributes[.posixPermissions] as? NSNumber)?.intValue, equals: 0o600, "the lock file must be owner-only")
+}
+
+func testWallpaperVisibilityFiltersQueues() throws {
+    let hiddenID = UUID()
+    let visibleID = UUID()
+    let missingID = UUID()
+    let unavailableID = UUID()
+    let hidden = WallpaperItem(
+        id: hiddenID,
+        name: "hidden",
+        type: .image,
+        sourceURL: URL(fileURLWithPath: "/tmp/hidden.png"),
+        isHidden: true,
+        storageMode: .externalReference
+    )
+    let visible = WallpaperItem(
+        id: visibleID,
+        name: "visible",
+        type: .image,
+        sourceURL: URL(fileURLWithPath: "/tmp/visible.png"),
+        storageMode: .externalReference
+    )
+    var unavailable = visible
+    unavailable.availability = .missing
+    let items = [hiddenID: hidden, visibleID: visible, unavailableID: unavailable]
+    let queue = PlaybackQueue(
+        name: "mixed",
+        wallpaperIDs: [hiddenID, missingID, visibleID, unavailableID]
+    )
+
+    try expect(
+        WallpaperVisibility.eligibleIndices(in: queue, items: items, showsHidden: false),
+        equals: [2],
+        "locked mode must keep only the available visible item"
+    )
+    try expect(
+        WallpaperVisibility.eligibleIndices(in: queue, items: items, showsHidden: true),
+        equals: [0, 2],
+        "unlocked mode must include available hidden items"
+    )
+    try expect(
+        WallpaperVisibility.isEligible(hidden, showsHidden: false),
+        equals: false,
+        "a hidden item is not eligible while locked"
+    )
+    try expect(
+        WallpaperVisibility.isEligible(hidden, showsHidden: true),
+        equals: true,
+        "a hidden item is eligible after unlocking"
+    )
 }
