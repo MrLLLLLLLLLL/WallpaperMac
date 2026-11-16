@@ -138,7 +138,7 @@ struct QueueManagementView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(queue.name)
                                 .lineLimit(1)
-                            Text("\(visibleWallpaperCount(queue)) 项")
+                            Text("\(visibleWallpaperCount(queue)) 项 · \(model.queueKind(queue).title)")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -189,7 +189,7 @@ struct QueueManagementView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     queueRules(queue)
-                    displayBindings(queue)
+                    displayBindings()
                     wallpaperItems(queue)
                 }
                 .padding(20)
@@ -279,30 +279,80 @@ struct QueueManagementView: View {
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.42), in: RoundedRectangle(cornerRadius: 12))
     }
 
-    private func displayBindings(_ queue: PlaybackQueue) -> some View {
+    private func displayBindings() -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("显示器绑定").font(.headline)
+            Text("显示器队列槽位").font(.headline)
+            Text("默认模式只使用不含隐藏壁纸的队列；隐藏模式只使用含隐藏壁纸的队列。队列类型变化后请重新指定槽位。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             if model.displayService.displays.isEmpty {
                 Text("当前没有可用显示器。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(model.displayService.displays) { display in
-                    HStack {
-                        Image(systemName: "display")
-                        Text(display.name)
-                        Spacer()
-                        if model.wallpaperManager.activeQueue(for: display.id)?.id == queue.id {
-                            Label("当前队列", systemImage: "checkmark.circle.fill")
-                                .foregroundStyle(.green)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Image(systemName: "display")
+                            Text(display.name)
+                            Spacer()
+                            Text(model.showsHiddenWallpapers ? "当前：隐藏模式" : "当前：默认模式")
                                 .font(.caption)
-                        } else {
-                            Button("应用此队列") {
-                                model.setActiveQueue(queue, for: display.id)
+                                .foregroundStyle(.secondary)
+                        }
+                        HStack(spacing: 12) {
+                            Text("默认模式")
+                                .font(.caption)
+                                .frame(width: 64, alignment: .leading)
+                            Picker("默认模式", selection: Binding<UUID>(
+                                get: {
+                                    model.queueSlotID(for: display.id, kind: .normal)
+                                        ?? PlaybackQueue.defaultQueue.id
+                                },
+                                set: { queueID in
+                                    guard let queue = model.wallpaperManager.queue(with: queueID) else { return }
+                                    model.setQueueSlot(.normal, queue: queue, for: display.id)
+                                }
+                            )) {
+                                ForEach(model.queues(for: .normal)) { candidate in
+                                    Text(candidate.name).tag(candidate.id)
+                                }
                             }
-                            .buttonStyle(.bordered)
+                            .labelsHidden()
+                            .frame(width: 190)
+
+                            Text("隐藏模式")
+                                .font(.caption)
+                                .frame(width: 64, alignment: .leading)
+                            Picker("隐藏模式", selection: Binding<UUID?>(
+                                get: { model.queueSlotID(for: display.id, kind: .hidden) },
+                                set: { queueID in
+                                    let queue = queueID.flatMap { model.wallpaperManager.queue(with: $0) }
+                                    model.setQueueSlot(.hidden, queue: queue, for: display.id)
+                                }
+                            )) {
+                                Text("无").tag(nil as UUID?)
+                                ForEach(model.queues(for: .hidden)) { candidate in
+                                    Text(candidate.name).tag(Optional(candidate.id))
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(width: 190)
+                        }
+                        if !model.queueSlotIsValid(for: display.id, kind: .normal) {
+                            Text("默认槽位指向了含隐藏壁纸的队列，请重新指定。")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                        }
+                        if let hiddenID = model.queueSlotID(for: display.id, kind: .hidden),
+                           let hiddenQueue = model.wallpaperManager.queue(with: hiddenID),
+                           model.queueKind(hiddenQueue) != .hidden {
+                            Text("隐藏槽位指向了不含隐藏壁纸的队列，请重新指定。")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
                         }
                     }
+                    .padding(.vertical, 5)
                 }
             }
         }

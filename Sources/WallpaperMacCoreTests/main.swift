@@ -888,6 +888,12 @@ let tests: [(String, () throws -> Void)] = [
     ("derives PBKDF2-HMAC-SHA256 vectors", testPBKDF2KnownVectors),
     ("verifies hidden wallpaper passwords", testHiddenWallpaperLockVerification),
     ("filters hidden wallpapers from queues", testWallpaperVisibilityFiltersQueues),
+    ("pauses fullscreen only on the matching display", testFullScreenPauseIsPerDisplay),
+    ("migrates a complete wallpaper library", testLibraryMigrationCopiesCompleteLibrary),
+    ("rejects unsafe library migration targets", testLibraryMigrationRejectsUnsafeTargets),
+    ("classifies queues by hidden membership", testQueueKindFollowsHiddenMembership),
+    ("resolves normal and hidden queue slots", testQueueSlotResolverMatchesQueueKind),
+    ("decodes legacy display bindings into the default slot", testLegacyDisplayBindingDecodesIntoDefaultSlot),
     ("requires a one-shot native gesture for external navigation", testExternalNavigationRequiresOneShotNativeGesture),
     ("bounds WebContent recovery with healthy reset", testWebContentRecoveryUsesBoundedBackoffAndHealthyReset),
     ("delivers fragmented video tail frames without loss", testVideoFrameBufferDeliversFragmentedTailWithoutLoss),
@@ -1075,11 +1081,11 @@ func testDisplayBindingInvalidatesEditedQueue() throws {
         activeQueueID: queue.id,
         queueStates: [queue.id: state]
     )
-    try expect(binding.invalidateActiveQueue(ifMatching: queue.id), "editing the active queue should invalidate the display binding")
+    try expect(binding.invalidateBoundQueue(ifMatching: queue.id), "editing the active queue should invalidate the display binding")
     try expect(!binding.state(for: queue.id).isEnabled, "invalidated queue should require the user to apply it again")
     try expect(!binding.state(for: queue.id).isPlaying, "invalidated queue should stop automatic switching")
     try expect(binding.state(for: queue.id).currentIndex, equals: 3, "queue edit should preserve the last index for reapplication")
-    try expect(!binding.invalidateActiveQueue(ifMatching: UUID()), "editing another queue should not affect this display")
+    try expect(!binding.invalidateBoundQueue(ifMatching: UUID()), "editing another queue should not affect this display")
 }
 
 func testWallpaperPreviewUsesLandscapeSixteenByNineLayout() throws {
@@ -4201,4 +4207,203 @@ func testInstallScriptUsesDirectLaunch() throws {
     let status = try runUpdateScript(fixture, ditto: "/usr/bin/ditto", openStatus: 1, healthWaitSteps: 20)
     try expect(status, equals: 0, "the direct launch should satisfy the health handshake")
     try expect(!FileManager.default.fileExists(atPath: fixture.staging.path), "a direct healthy launch should clean staging")
+}
+
+func testFullScreenPauseIsPerDisplay() throws {
+    var policy = PlaybackPolicy(pauseInFullScreenApps: true)
+    let fullscreen = PlaybackActivityState(
+        isOnBattery: false,
+        fullScreenDisplayIDs: ["display-a"]
+    )
+    try expect(
+        policy.shouldPauseDynamicWallpaper(displayID: "display-a", activity: fullscreen),
+        "the display containing the fullscreen window should pause"
+    )
+    try expect(
+        !policy.shouldPauseDynamicWallpaper(displayID: "display-b", activity: fullscreen),
+        "other displays must keep playing during a fullscreen app"
+    )
+
+    let battery = PlaybackActivityState(isOnBattery: true)
+    policy.pauseOnBattery = true
+    try expect(
+        policy.shouldPauseDynamicWallpaper(displayID: "display-b", activity: battery),
+        "battery policy still applies to every display"
+    )
+    policy.pauseInFullScreenApps = false
+    try expect(
+        !policy.shouldPauseDynamicWallpaper(displayID: "display-a", activity: fullscreen),
+        "disabling the fullscreen policy must resume every display"
+    )
+}
+
+func testLibraryMigrationCopiesCompleteLibrary() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WallpaperMacLibraryMigrationTests", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let source = root.appendingPathComponent("Old Library", isDirectory: true)
+    let destination = root.appendingPathComponent("New Library", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: source.appendingPathComponent("Assets", isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    try FileManager.default.createDirectory(
+        at: source.appendingPathComponent("Thumbnails", isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    try Data("[]".utf8).write(to: source.appendingPathComponent("wallpapers.json"))
+    try Data("{\"groups\":[]}".utf8).write(to: source.appendingPathComponent("wallpaper-groups.json"))
+    try Data("{\"lock\":true}".utf8).write(to: source.appendingPathComponent("hidden-wallpapers-lock.json"))
+    try Data("{}".utf8).write(to: source.appendingPathComponent("display-profiles.json"))
+    try Data("asset".utf8).write(to: source.appendingPathComponent("Assets/asset.bin"))
+    try Data("thumb".utf8).write(to: source.appendingPathComponent("Thumbnails/thumb.png"))
+
+    let result = try WallpaperLibraryMigrator.migrate(from: source, to: destination)
+
+    try expect(FileManager.default.fileExists(atPath: source.path), "migration must preserve the source library")
+    try expect(FileManager.default.fileExists(atPath: destination.appendingPathComponent("wallpapers.json").path), "the index must be copied")
+    try expect(FileManager.default.fileExists(atPath: destination.appendingPathComponent("hidden-wallpapers-lock.json").path), "the hidden lock must be copied")
+    try expect(FileManager.default.fileExists(atPath: destination.appendingPathComponent("Assets/asset.bin").path), "managed assets must be copied")
+    try expect(FileManager.default.fileExists(atPath: destination.appendingPathComponent("Thumbnails/thumb.png").path), "thumbnails must be copied")
+    try expect(result.fileCount, equals: 6, "all library files should be counted")
+    try expect(
+        try String(contentsOf: destination.appendingPathComponent("Assets/asset.bin"), encoding: .utf8),
+        equals: "asset",
+        "copied bytes must match the source"
+    )
+}
+
+func testLibraryMigrationRejectsUnsafeTargets() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WallpaperMacLibraryMigrationRejectTests", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let source = root.appendingPathComponent("Source", isDirectory: true)
+    try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+    try Data("[]".utf8).write(to: source.appendingPathComponent("wallpapers.json"))
+
+    var samePathRejected = false
+    do {
+        _ = try WallpaperLibraryMigrator.migrate(from: source, to: source)
+    } catch WallpaperLibraryMigrationError.sameLocation {
+        samePathRejected = true
+    } catch {}
+    try expect(samePathRejected, "migrating onto the same path must be rejected")
+
+    var nestedRejected = false
+    do {
+        _ = try WallpaperLibraryMigrator.migrate(
+            from: source,
+            to: source.appendingPathComponent("Nested", isDirectory: true)
+        )
+    } catch WallpaperLibraryMigrationError.destinationInsideSource {
+        nestedRejected = true
+    } catch {}
+    try expect(nestedRejected, "migrating inside the source must be rejected")
+
+    var parentRejected = false
+    do {
+        _ = try WallpaperLibraryMigrator.migrate(from: source, to: root)
+    } catch WallpaperLibraryMigrationError.sourceInsideDestination {
+        parentRejected = true
+    } catch {}
+    try expect(parentRejected, "migrating into a parent of the source must be rejected")
+
+    let nonEmpty = root.appendingPathComponent("NotEmpty", isDirectory: true)
+    try FileManager.default.createDirectory(at: nonEmpty, withIntermediateDirectories: true)
+    try Data("x".utf8).write(to: nonEmpty.appendingPathComponent("existing.txt"))
+    var nonEmptyRejected = false
+    do {
+        _ = try WallpaperLibraryMigrator.migrate(from: source, to: nonEmpty)
+    } catch WallpaperLibraryMigrationError.destinationNotEmpty {
+        nonEmptyRejected = true
+    } catch {}
+    try expect(nonEmptyRejected, "a non-empty destination must be rejected")
+    try expect(FileManager.default.fileExists(atPath: source.path), "failed migrations must leave the source intact")
+}
+
+func makeQueueSlotItem(id: UUID, hidden: Bool) -> WallpaperItem {
+    WallpaperItem(
+        id: id,
+        name: hidden ? "hidden" : "visible",
+        type: .image,
+        sourceURL: URL(fileURLWithPath: "/tmp/\(id.uuidString).png"),
+        isHidden: hidden,
+        storageMode: .externalReference
+    )
+}
+
+func testQueueKindFollowsHiddenMembership() throws {
+    let visible = UUID()
+    let hidden = UUID()
+    let normalQueue = PlaybackQueue(name: "normal", wallpaperIDs: [visible])
+    let hiddenQueue = PlaybackQueue(name: "hidden", wallpaperIDs: [visible, hidden])
+    let emptyQueue = PlaybackQueue(name: "empty")
+    let items = [
+        visible: makeQueueSlotItem(id: visible, hidden: false),
+        hidden: makeQueueSlotItem(id: hidden, hidden: true)
+    ]
+
+    try expect(normalQueue.kind(items: items), equals: .normal, "a queue without hidden members is a default queue")
+    try expect(hiddenQueue.kind(items: items), equals: .hidden, "one hidden member makes the queue a hidden queue")
+    try expect(emptyQueue.kind(items: items), equals: .normal, "an empty queue is a default queue")
+}
+
+func testQueueSlotResolverMatchesQueueKind() throws {
+    let visible = UUID()
+    let hidden = UUID()
+    let normalQueue = PlaybackQueue(name: "normal", wallpaperIDs: [visible])
+    let hiddenQueue = PlaybackQueue(name: "hidden", wallpaperIDs: [hidden])
+    let items = [
+        visible: makeQueueSlotItem(id: visible, hidden: false),
+        hidden: makeQueueSlotItem(id: hidden, hidden: true)
+    ]
+    let queues = [normalQueue.id: normalQueue, hiddenQueue.id: hiddenQueue]
+
+    try expect(
+        QueueSlotResolver.resolve(queueID: normalQueue.id, expected: .normal, queues: queues, items: items),
+        equals: normalQueue.id,
+        "the default slot accepts a normal queue"
+    )
+    try expect(
+        QueueSlotResolver.resolve(queueID: hiddenQueue.id, expected: .normal, queues: queues, items: items),
+        equals: nil,
+        "the default slot rejects a hidden queue"
+    )
+    try expect(
+        QueueSlotResolver.resolve(queueID: hiddenQueue.id, expected: .hidden, queues: queues, items: items),
+        equals: hiddenQueue.id,
+        "the hidden slot accepts a hidden queue"
+    )
+    try expect(
+        QueueSlotResolver.resolve(queueID: normalQueue.id, expected: .hidden, queues: queues, items: items),
+        equals: nil,
+        "the hidden slot rejects a normal queue"
+    )
+    try expect(
+        QueueSlotResolver.resolve(queueID: nil, expected: .hidden, queues: queues, items: items),
+        equals: nil,
+        "an empty hidden slot resolves to empty"
+    )
+}
+
+func testLegacyDisplayBindingDecodesIntoDefaultSlot() throws {
+    let activeID = UUID()
+    let legacyJSON = """
+    {"displayID":"display-1","displayName":"Display","activeQueueID":"\(activeID.uuidString)","queueStates":[]}
+    """
+    let legacy = try JSONDecoder().decode(DisplayPlaybackBinding.self, from: Data(legacyJSON.utf8))
+    try expect(legacy.defaultQueueID, equals: activeID, "legacy active queue becomes the default slot")
+    try expect(legacy.hiddenQueueID, equals: nil, "legacy bindings start with an empty hidden slot")
+    try expect(legacy.activeQueueID, equals: activeID, "legacy active queue remains readable")
+
+    let hiddenQueue = UUID()
+    var updated = legacy
+    updated.setQueueID(hiddenQueue, for: .hidden)
+    let roundTripped = try JSONDecoder().decode(
+        DisplayPlaybackBinding.self,
+        from: JSONEncoder().encode(updated)
+    )
+    try expect(roundTripped, equals: updated, "both queue slots must round-trip")
 }

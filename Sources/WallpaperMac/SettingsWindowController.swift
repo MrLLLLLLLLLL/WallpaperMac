@@ -65,7 +65,7 @@ private struct SettingsView: View {
                         .lineLimit(2)
                         .truncationMode(.middle)
                     Spacer()
-                    Button("选择文件夹") { chooseLibraryFolder() }
+                    Button("迁移壁纸库…") { chooseLibraryFolder() }
                     Button("打开") {
                         NSWorkspace.shared.open(URL(fileURLWithPath: libraryPath))
                     }
@@ -352,15 +352,7 @@ private struct SettingsView: View {
     }
 
     private func chooseLibraryFolder() {
-        let panel = NSOpenPanel()
-        panel.title = "选择壁纸库位置"
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.directoryURL = URL(fileURLWithPath: libraryPath)
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        libraryPath = url.path
-        notifySettingsChanged()
+        NotificationCenter.default.post(name: .wallpaperMacRequestLibraryMigration, object: nil)
     }
 
     @MainActor
@@ -411,4 +403,5 @@ enum SettingsKey {
 
 extension Notification.Name {
     static let wallpaperMacSettingsChanged = Notification.Name("WallpaperMacSettingsChanged")
+    static let wallpaperMacRequestLibraryMigration = Notification.Name("WallpaperMacRequestLibraryMigration")
 }

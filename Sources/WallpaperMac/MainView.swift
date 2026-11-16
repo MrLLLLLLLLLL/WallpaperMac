@@ -88,6 +88,14 @@ struct ImportSummary: Identifiable {
 
 @MainActor
 final class LibraryViewModel: ObservableObject {
+    struct LibraryMigrationCompletion: Identifiable {
+        let id = UUID()
+        let oldURL: URL
+        let newURL: URL
+        let fileCount: Int
+        let byteCount: Int64
+    }
+
     @Published private(set) var wallpapers: [WallpaperItem] = []
     @Published private(set) var visibleWallpapers: [WallpaperItem] = []
     @Published private(set) var currentPage = 1
@@ -125,12 +133,15 @@ final class LibraryViewModel: ObservableObject {
     @Published private(set) var hiddenPasswordIsSet = false
     @Published var hiddenAuthRequest: HiddenWallpaperAuthRequest?
     @Published var hiddenAuthError: String?
+    @Published var isMigratingLibrary = false
+    @Published var libraryMigrationCompletion: LibraryMigrationCompletion?
 
     private(set) var store: WallpaperStore
     private var storeWorker: WallpaperStoreWorker
     let displayService = DisplayService()
     let wallpaperManager = WallpaperManager()
     private var settingsObserver: NSObjectProtocol?
+    private var migrationRequestObserver: NSObjectProtocol?
     private var statusBarObservers: [NSObjectProtocol] = []
     private var observationCancellables = Set<AnyCancellable>()
     private let libraryAccess: WallpaperLibraryAccess
@@ -187,6 +198,15 @@ final class LibraryViewModel: ObservableObject {
                 self?.applySettingsFromDefaults()
             }
         }
+        migrationRequestObserver = NotificationCenter.default.addObserver(
+            forName: .wallpaperMacRequestLibraryMigration,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.chooseLibraryForMigration()
+            }
+        }
         let center = NotificationCenter.default
         statusBarObservers = [
             center.addObserver(forName: .wallpaperMacStatusTogglePlayback, object: nil, queue: .main) { [weak self] _ in
@@ -203,13 +223,27 @@ final class LibraryViewModel: ObservableObject {
             .store(in: &observationCancellables)
         displayService.objectWillChange
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .sink { [weak self] _ in
+                self?.normalizeDestinationForConnectedDisplays()
+                self?.objectWillChange.send()
+            }
             .store(in: &observationCancellables)
+    }
+
+    private func normalizeDestinationForConnectedDisplays() {
+        guard case .display(let displayID) = destination,
+              !displayService.displays.contains(where: { $0.id == displayID }) else {
+            return
+        }
+        destination = .all
     }
 
     deinit {
         if let settingsObserver {
             NotificationCenter.default.removeObserver(settingsObserver)
+        }
+        if let migrationRequestObserver {
+            NotificationCenter.default.removeObserver(migrationRequestObserver)
         }
         statusBarObservers.forEach(NotificationCenter.default.removeObserver)
         metadataEnrichmentTask?.cancel()
@@ -269,7 +303,9 @@ final class LibraryViewModel: ObservableObject {
 
     var displayRows: [DisplayRow] {
         let assignments = UniquedDictionary.build(wallpaperManager.displayAssignments.map { ($0.id, $0) }, label: "display assignments")
-        let connectedRows = displayService.displays.map { display in
+        // Disconnected displays keep their assignments and queue state in the
+        // background. They are not actionable in the UI until they reconnect.
+        return displayService.displays.map { display in
             DisplayRow(
                 id: display.id,
                 name: display.name,
@@ -277,18 +313,6 @@ final class LibraryViewModel: ObservableObject {
                 applicationState: assignments[display.id]?.applicationState ?? .idle
             )
         }
-        let connectedIDs = Set(connectedRows.map(\.id))
-        let disconnectedRows = wallpaperManager.displayAssignments
-            .filter { !connectedIDs.contains($0.id) }
-            .map { assignment in
-                DisplayRow(
-                    id: assignment.id,
-                    name: assignment.displayName,
-                    isConnected: false,
-                    applicationState: assignment.applicationState
-                )
-            }
-        return connectedRows + disconnectedRows
     }
 
     var filteredWallpapers: [WallpaperItem] {
@@ -777,18 +801,19 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
-    func setLibraryURL(_ url: URL) {
+    @discardableResult
+    func setLibraryURL(_ url: URL) -> Bool {
         let normalizedURL = url.standardizedFileURL
         guard !Self.isTemporaryLibraryURL(normalizedURL) else {
             lastError = "不能使用临时目录作为壁纸库：\(normalizedURL.path)。临时目录可能在关机或重启后被系统清理，请选择文稿、图片或其他长期保存的位置。"
-            return
+            return false
         }
         do {
             try FileManager.default.createDirectory(at: normalizedURL, withIntermediateDirectories: true)
             try libraryAccess.persist(url: normalizedURL)
         } catch {
             lastError = "无法保存壁纸库位置：\(error.localizedDescription)"
-            return
+            return false
         }
         libraryURL = normalizedURL
         shouldCreateMissingLibraryDirectory = false
@@ -829,6 +854,7 @@ final class LibraryViewModel: ObservableObject {
         UserDefaults.standard.set(libraryURL.path, forKey: SettingsKey.libraryPath)
         wallpaperManager.configure(store: store, policy: playbackPolicy)
         reload(afterLoad: restoreWallpaperAssignments)
+        return true
     }
 
     private static func isTemporaryLibraryURL(_ url: URL) -> Bool {
@@ -846,16 +872,99 @@ final class LibraryViewModel: ObservableObject {
             || path.hasPrefix(temporaryPath + "/")
     }
 
-    func chooseLibraryURL() {
+    func chooseNewLibraryURL() {
         let panel = NSOpenPanel()
         panel.title = "选择壁纸库位置"
-        panel.message = "壁纸库副本将保存到这个文件夹"
+        panel.message = "壁纸库索引和副本将保存到这个文件夹"
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
-        panel.directoryURL = libraryURL
+        panel.directoryURL = libraryURL.deletingLastPathComponent()
         guard panel.runModal() == .OK, let url = panel.url else { return }
         setLibraryURL(url)
+    }
+
+    func chooseLibraryForMigration() {
+        guard !isMigratingLibrary else { return }
+        guard !isImporting, !isImportInspectionInProgress else {
+            lastError = "请先完成当前导入，再迁移壁纸库。"
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = "迁移壁纸库"
+        panel.message = "选择一个空文件夹或新建文件夹。当前壁纸库会完整复制到新位置，完成后可决定是否删除旧库。"
+        panel.prompt = "迁移到这里"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = libraryURL.deletingLastPathComponent()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        migrateLibrary(to: url)
+    }
+
+    func migrateLibrary(to destination: URL) {
+        guard !isMigratingLibrary else { return }
+        let source = libraryURL.standardizedFileURL
+        let destination = destination.standardizedFileURL
+        guard !Self.isTemporaryLibraryURL(destination) else {
+            lastError = "不能迁移到临时目录：\(destination.path)。请选择文稿、图片或其他长期保存的位置。"
+            return
+        }
+        guard destination != source else {
+            lastError = "迁移目标与当前壁纸库相同。"
+            return
+        }
+
+        let worker = storeWorker
+        let session = librarySessionID
+        metadataEnrichmentTask?.cancel()
+        libraryLoadTask?.cancel()
+        isMigratingLibrary = true
+        Task { [weak self] in
+            do {
+                let result = try await worker.migrateLibrary(to: destination)
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                guard self.setLibraryURL(destination) else {
+                    self.isMigratingLibrary = false
+                    return
+                }
+                self.isMigratingLibrary = false
+                self.libraryMigrationCompletion = LibraryMigrationCompletion(
+                    oldURL: source,
+                    newURL: destination,
+                    fileCount: result.fileCount,
+                    byteCount: result.byteCount
+                )
+                self.showToast("壁纸库已迁移")
+            } catch {
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.isMigratingLibrary = false
+                self.lastError = error.localizedDescription
+            }
+        }
+    }
+
+    func deleteOldLibrary(at oldURL: URL) {
+        let oldURL = oldURL.standardizedFileURL.resolvingSymlinksInPath()
+        let current = libraryURL.standardizedFileURL.resolvingSymlinksInPath()
+        guard oldURL != current,
+              !current.path.hasPrefix(oldURL.path + "/") else {
+            lastError = "拒绝删除当前壁纸库或其父目录：\(oldURL.path)"
+            return
+        }
+        let worker = storeWorker
+        Task { [weak self] in
+            do {
+                try await worker.removeLibrary(at: oldURL)
+                guard let self else { return }
+                self.showToast("已删除旧壁纸库")
+            } catch {
+                guard let self else { return }
+                self.lastError = "旧壁纸库删除失败：\(error.localizedDescription)"
+            }
+        }
     }
 
     func setFitModeOverride(_ mode: WallpaperFitMode?, for item: WallpaperItem) {
@@ -1022,6 +1131,9 @@ final class LibraryViewModel: ObservableObject {
                 }
             }
             self.wallpaperManager.updateHiddenState(for: updated)
+            if isHidden {
+                self.wallpaperManager.removeHiddenItemsFromDefaultQueues(ids)
+            }
             self.refreshVisibleWallpapers()
             if !self.showsHiddenWallpapers {
                 self.wallpaperManager.setShowsHiddenWallpapers(
@@ -1199,6 +1311,50 @@ final class LibraryViewModel: ObservableObject {
     }
 
     var queueLibrary: [PlaybackQueue] { wallpaperManager.playbackQueues }
+
+    func queueKind(_ queue: PlaybackQueue) -> PlaybackQueueKind {
+        let byID = UniquedDictionary.build(wallpapers.map { ($0.id, $0) }, label: "queue items")
+        return queue.kind(items: byID)
+    }
+
+    func queues(for kind: PlaybackQueueKind) -> [PlaybackQueue] {
+        queueLibrary
+            .filter { queueKind($0) == kind }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    func queueSlotID(for displayID: String, kind: PlaybackQueueKind) -> UUID? {
+        wallpaperManager.queueSlotID(for: displayID, kind: kind)
+    }
+
+    func queueSlotIsValid(for displayID: String, kind: PlaybackQueueKind) -> Bool {
+        guard let queueID = queueSlotID(for: displayID, kind: kind),
+              let queue = wallpaperManager.queue(with: queueID) else {
+            return kind == .hidden
+        }
+        return queueKind(queue) == kind
+    }
+
+    @discardableResult
+    func setQueueSlot(_ kind: PlaybackQueueKind, queue: PlaybackQueue?, for displayID: String) -> Bool {
+        guard let display = displayService.displays.first(where: { $0.id == displayID }) else {
+            lastError = "该显示器当前不可用。"
+            return false
+        }
+        let accepted = wallpaperManager.setQueueSlot(
+            kind,
+            queueID: queue?.id,
+            for: display.id,
+            policy: playbackPolicy,
+            items: wallpapers
+        )
+        if !accepted {
+            lastError = kind == .normal
+                ? "默认模式只能选择不含隐藏壁纸的队列。"
+                : "隐藏模式只能选择包含隐藏壁纸的队列。"
+        }
+        return accepted
+    }
 
     func beginCreateQueue(for ids: Set<UUID> = []) {
         pendingQueueAssignmentIDs = ids
@@ -1447,6 +1603,47 @@ struct MainView: View {
                 .frame(width: 340)
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .disabled(model.isMigratingLibrary)
+        .overlay {
+            if model.isMigratingLibrary {
+                ZStack {
+                    Color.black.opacity(0.28).ignoresSafeArea()
+                    VStack(spacing: 12) {
+                        ProgressView()
+                            .controlSize(.large)
+                        Text("正在迁移壁纸库…")
+                            .font(.headline)
+                        Text("正在复制索引、素材和缩略图，请勿退出应用。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(28)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }
+            }
+        }
+        .confirmationDialog(
+            "壁纸库迁移完成",
+            isPresented: Binding(
+                get: { model.libraryMigrationCompletion != nil },
+                set: { if !$0 { model.libraryMigrationCompletion = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("保留旧库", role: .cancel) {
+                model.libraryMigrationCompletion = nil
+            }
+            Button("删除旧库", role: .destructive) {
+                if let completion = model.libraryMigrationCompletion {
+                    model.deleteOldLibrary(at: completion.oldURL)
+                }
+                model.libraryMigrationCompletion = nil
+            }
+        } message: {
+            if let completion = model.libraryMigrationCompletion {
+                Text("新位置：\(completion.newURL.path)\n旧库仍保存在：\(completion.oldURL.path)。是否删除旧库？")
+            }
+        }
     }
 }
 
@@ -1556,7 +1753,7 @@ private struct OnboardingView: View {
                         .lineLimit(2)
                         .truncationMode(.middle)
                     Spacer()
-                    Button("选择文件夹") { model.chooseLibraryURL() }
+                    Button("选择文件夹") { model.chooseNewLibraryURL() }
                 }
                 Text("当前目录会自动创建 Assets 和索引文件，不会添加演示壁纸。")
                     .font(.caption)
@@ -1952,11 +2149,11 @@ private struct SidebarView: View {
             Spacer(minLength: 12)
             Divider()
             HStack {
-                Button(action: { model.chooseLibraryURL() }) {
+                Button(action: { model.chooseLibraryForMigration() }) {
                     Image(systemName: "folder")
                 }
                 .buttonStyle(.borderless)
-                .help("选择壁纸库位置")
+                .help("迁移壁纸库")
                 Text(model.libraryURL.path)
                     .font(.caption2)
                     .foregroundStyle(.secondary)

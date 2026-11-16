@@ -110,27 +110,29 @@ guard let color = bitmap.colorAt(x: bitmap.pixelsWide / 2, y: bitmap.pixelsHigh 
 guard color.redComponent > 0.65 && color.greenComponent < 0.35 && color.blueComponent < 0.35 else {
     fputs("visible wallpaper was not shown: \(color)\n", stderr); exit(1)
 }
-print("locked queue skipped the hidden wallpaper")
+print("locked default slot showed the visible wallpaper")
 SWIFT
 /usr/bin/swiftc "$TEST_ROOT/check-red.swift" -o "$TEST_ROOT/check-red" -framework AppKit >/dev/null
 
 write_library() {
     local library="$1"
-    local hidden_flag="$2"
+    local mode="$2"
     rm -rf "$library"
     mkdir -p "$library/Assets" "$library/Thumbnails"
-    python3 - "$library" "$TEST_ROOT" "$DISPLAY_NUMBER" "$DISPLAY_NAME" "$hidden_flag" <<'PY'
+    python3 - "$library" "$TEST_ROOT" "$DISPLAY_NUMBER" "$DISPLAY_NAME" "$mode" <<'PY'
 import json, sys, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 library = Path(sys.argv[1]); root = Path(sys.argv[2])
 display_id = f"display-{sys.argv[3]}"
 display_name = sys.argv[4]
-hidden_flag = sys.argv[5] == "all-hidden"
+mode = sys.argv[5]
 now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
 visible_id = str(uuid.uuid4()).upper()
 hidden_id = str(uuid.uuid4()).upper()
-queue_id = "50197D0A-990D-4741-B007-AC97D4B778D1"
+normal_queue_id = str(uuid.uuid4()).upper()
+hidden_queue_id = str(uuid.uuid4()).upper()
+builtin_queue_id = "50197D0A-990D-4741-B007-AC97D4B778D1"
 def item(item_id, name, path, hidden):
     return {
         "id": item_id, "name": name, "type": "image",
@@ -139,27 +141,37 @@ def item(item_id, name, path, hidden):
         "isHidden": hidden
     }
 items = [
-    item(visible_id, "visible", "visible.png", hidden_flag),
+    item(visible_id, "visible", "visible.png", False),
     item(hidden_id, "hidden", "hidden.png", True)
 ]
 (library / "wallpapers.json").write_text(json.dumps(items, separators=(',', ':')))
-queue = {
-    "id": queue_id, "name": "默认队列", "isDefault": True,
-    "wallpaperIDs": [hidden_id, visible_id],
-    "playbackMode": "sequential", "completionBehavior": "loop",
-    "advanceMode": "fixedInterval", "sortMode": "custom",
-    "defaultIntervalSeconds": 30, "transition": "cut",
-    "itemIntervalOverrides": [], "advanceAfterVideoCompletion": False,
-    "createdAt": now, "updatedAt": now
-}
-(library / "playback-queues.json").write_text(json.dumps([queue], separators=(',', ':')))
-state = {
-    "queueID": queue_id, "currentIndex": 0, "isPlaying": True,
-    "isEnabled": True, "overrides": {}
-}
+def queue(queue_id, name, ids, is_default=False):
+    return {
+        "id": queue_id, "name": name, "isDefault": is_default,
+        "wallpaperIDs": ids,
+        "playbackMode": "sequential", "completionBehavior": "loop",
+        "advanceMode": "fixedInterval", "sortMode": "custom",
+        "defaultIntervalSeconds": 30, "transition": "cut",
+        "itemIntervalOverrides": [], "advanceAfterVideoCompletion": False,
+        "createdAt": now, "updatedAt": now
+    }
+normal_ids = [] if mode == "empty-default" else [visible_id]
+(library / "playback-queues.json").write_text(json.dumps([
+    queue(builtin_queue_id, "默认队列", [], True),
+    queue(normal_queue_id, "日常队列", normal_ids),
+    queue(hidden_queue_id, "隐藏队列", [hidden_id])
+], separators=(',', ':')))
+def state(qid):
+    return {"queueID": qid, "currentIndex": 0, "isPlaying": True, "isEnabled": True, "overrides": {}}
 binding = {
     "displayID": display_id, "displayName": display_name,
-    "activeQueueID": queue_id, "queueStates": [queue_id, state]
+    "activeQueueID": normal_queue_id,
+    "defaultQueueID": normal_queue_id,
+    "hiddenQueueID": hidden_queue_id,
+    "queueStates": [
+        normal_queue_id, state(normal_queue_id),
+        hidden_queue_id, state(hidden_queue_id)
+    ]
 }
 (library / "display-playback-bindings.json").write_text(json.dumps([binding], separators=(',', ':')))
 (library / "display-assignments.json").write_text("[]")
@@ -184,10 +196,10 @@ stop_app() {
     sleep 1
 }
 
-write_library "$TEST_ROOT/Library-mixed" mixed
+write_library "$TEST_ROOT/Library-default" default
 defaults write com.wallpaper.mac 'WallpaperMac.onboardingCompleted' -bool YES
 defaults write com.wallpaper.mac 'WallpaperMac.fitMode' -string fill
-run_app "$TEST_ROOT/Library-mixed"
+run_app "$TEST_ROOT/Library-default"
 WINDOW_INFO=""
 for _ in {1..40}; do
     WINDOW_INFO="$("$TEST_ROOT/list-wallpaper-windows")"
@@ -196,15 +208,15 @@ for _ in {1..40}; do
 done
 [[ -n "$WINDOW_INFO" ]] || { echo 'no wallpaper window for the visible queue item' >&2; cat "$TEST_ROOT/app.log" >&2; exit 1; }
 WINDOW_ID="$(print -r -- "$WINDOW_INFO" | awk -F '\t' '{print $1}')"
-/usr/sbin/screencapture -x -o -l "$WINDOW_ID" "$TEST_ROOT/mixed.png"
-"$TEST_ROOT/check-red" "$TEST_ROOT/mixed.png"
+/usr/sbin/screencapture -x -o -l "$WINDOW_ID" "$TEST_ROOT/default.png"
+"$TEST_ROOT/check-red" "$TEST_ROOT/default.png"
 stop_app
 
-write_library "$TEST_ROOT/Library-all-hidden" all-hidden
-run_app "$TEST_ROOT/Library-all-hidden"
+write_library "$TEST_ROOT/Library-empty-default" empty-default
+run_app "$TEST_ROOT/Library-empty-default"
 sleep 4
 if [[ -n "$("$TEST_ROOT/list-wallpaper-windows")" ]]; then
-    echo 'a hidden-only queue must not create a wallpaper window' >&2
+    echo 'an empty default slot must not create a wallpaper window' >&2
     echo '--- wallpaper windows ---' >&2
     "$TEST_ROOT/list-wallpaper-windows" >&2
     echo '--- processes ---' >&2
@@ -212,7 +224,7 @@ if [[ -n "$("$TEST_ROOT/list-wallpaper-windows")" ]]; then
     echo '--- default library ---' >&2
     defaults read com.wallpaper.mac 'WallpaperMac.libraryPath' >&2 || true
     echo '--- fixture wallpapers ---' >&2
-    python3 -I - "$TEST_ROOT/Library-all-hidden" <<'PY' >&2
+    python3 -I - "$TEST_ROOT/Library-empty-default" <<'PY' >&2
 import json, sys
 from pathlib import Path
 lib = Path(sys.argv[1])
@@ -220,12 +232,12 @@ for item in json.loads((lib / "wallpapers.json").read_text()):
     print(item["name"], "isHidden=", item.get("isHidden"))
 PY
     echo '--- fixture profiles ---' >&2
-    test -f "$TEST_ROOT/Library-all-hidden/display-profiles.json" && cat "$TEST_ROOT/Library-all-hidden/display-profiles.json" >&2 || true
+    test -f "$TEST_ROOT/Library-empty-default/display-profiles.json" && cat "$TEST_ROOT/Library-empty-default/display-profiles.json" >&2 || true
     echo '--- app log ---' >&2
     cat "$TEST_ROOT/app.log" >&2 || true
     exit 1
 fi
-echo 'hidden-only queue did not display a wallpaper'
+echo 'empty default slot did not display a wallpaper'
 stop_app
 
 echo 'HIDDEN_WALLPAPERS_RUNTIME_TEST_PASSED'

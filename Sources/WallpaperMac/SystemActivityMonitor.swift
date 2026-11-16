@@ -10,13 +10,12 @@ import WallpaperMacCore
 /// supported macOS SDKs. Frontmost-app and display changes are event-driven.
 @MainActor
 final class SystemActivityMonitor {
-    private let onChange: (Bool) -> Void
-    private var policy = PlaybackPolicy()
+    private let onChange: (PlaybackActivityState) -> Void
     private var observers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
     private var timer: Timer?
-    private var lastPausedState: Bool?
+    private var lastState: PlaybackActivityState?
 
-    init(onChange: @escaping (Bool) -> Void) {
+    init(onChange: @escaping (PlaybackActivityState) -> Void) {
         self.onChange = onChange
 
         let workspaceCenter = NSWorkspace.shared.notificationCenter
@@ -55,19 +54,14 @@ final class SystemActivityMonitor {
         timer?.invalidate()
     }
 
-    func update(policy: PlaybackPolicy) {
-        self.policy = policy
-        evaluate()
-    }
-
-    private func evaluate() {
-        let paused = policy.shouldPauseDynamicWallpaper(
+    func evaluate() {
+        let state = PlaybackActivityState(
             isOnBattery: isUsingBatteryPower(),
-            isFullScreenAppActive: isFrontmostApplicationFullScreen()
+            fullScreenDisplayIDs: frontmostFullScreenDisplayIDs()
         )
-        guard paused != lastPausedState else { return }
-        lastPausedState = paused
-        onChange(paused)
+        guard state != lastState else { return }
+        lastState = state
+        onChange(state)
     }
 
     private func isUsingBatteryPower() -> Bool {
@@ -90,35 +84,39 @@ final class SystemActivityMonitor {
         return false
     }
 
-    private func isFrontmostApplicationFullScreen() -> Bool {
+    private func frontmostFullScreenDisplayIDs() -> Set<String> {
         guard let application = NSWorkspace.shared.frontmostApplication,
               application.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
-            return false
+            return []
         }
         guard let windowInfo = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
         ) as? [[String: Any]] else {
-            return false
+            return []
         }
-        let screenFrames = NSScreen.screens.map(\.frame)
+        let screens = NSScreen.screens
         let pid = application.processIdentifier
-        return windowInfo.contains { info in
+        var result = Set<String>()
+        for info in windowInfo {
             guard let ownerPID = info[kCGWindowOwnerPID as String] as? Int,
                   ownerPID == pid,
                   let layer = info[kCGWindowLayer as String] as? Int,
                   layer == 0,
                   let bounds = info[kCGWindowBounds as String] as? NSDictionary else {
-                return false
+                continue
             }
             var rect = CGRect.zero
-            guard CGRectMakeWithDictionaryRepresentation(bounds, &rect) else { return false }
-            return screenFrames.contains { frame in
-                abs(rect.minX - frame.minX) < 2 &&
+            guard CGRectMakeWithDictionaryRepresentation(bounds, &rect) else { continue }
+            guard let screen = screens.first(where: { screen in
+                let frame = screen.frame
+                return abs(rect.minX - frame.minX) < 2 &&
                     abs(rect.minY - frame.minY) < 2 &&
                     abs(rect.width - frame.width) < 2 &&
                     abs(rect.height - frame.height) < 2
-            }
+            }) else { continue }
+            result.insert(DisplayIdentityProvider.identity(for: screen).profileID)
         }
+        return result
     }
 }

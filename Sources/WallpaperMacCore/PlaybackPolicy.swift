@@ -74,6 +74,26 @@ public struct PlaybackPolicy: Codable, Equatable, Sendable {
         (pauseOnBattery && isOnBattery) ||
             (pauseInFullScreenApps && isFullScreenAppActive)
     }
+
+    /// Per-display suspension: battery applies to every screen, while a
+    /// fullscreen app only pauses the screen that contains its window.
+    public func shouldPauseDynamicWallpaper(
+        displayID: String,
+        activity: PlaybackActivityState
+    ) -> Bool {
+        (pauseOnBattery && activity.isOnBattery) ||
+            (pauseInFullScreenApps && activity.fullScreenDisplayIDs.contains(displayID))
+    }
+}
+
+public struct PlaybackActivityState: Equatable, Sendable {
+    public var isOnBattery: Bool
+    public var fullScreenDisplayIDs: Set<String>
+
+    public init(isOnBattery: Bool = false, fullScreenDisplayIDs: Set<String> = []) {
+        self.isOnBattery = isOnBattery
+        self.fullScreenDisplayIDs = fullScreenDisplayIDs
+    }
 }
 
 public enum ApplicationState: String, Codable, CaseIterable, Equatable, Sendable {

@@ -79,11 +79,9 @@ final class WallpaperManager: ObservableObject {
     private var persistenceGate = LibraryPersistenceGate()
     private var playbackPolicy = PlaybackPolicy()
     private var showsHiddenWallpapers = false
-    /// Playback intent captured when a hidden wallpaper forced a presentation
-    /// to suspend. Unlocking restores only displays that were actually playing,
-    /// so a manual pause is not turned into autoplay.
-    private var hiddenSuspendedPlayback: [String: Bool] = [:]
-    private var isSystemSuspended = false
+    private var didMigrateQueueSlots = false
+    private var activityState = PlaybackActivityState()
+    private var systemSuspendedDisplayIDs: Set<String> = []
     private var activityMonitor: SystemActivityMonitor?
     private var screenChangeObserver: NSObjectProtocol?
 
@@ -97,9 +95,9 @@ final class WallpaperManager: ObservableObject {
                 self?.handleScreenChange()
             }
         }
-        activityMonitor = SystemActivityMonitor { [weak self] suspended in
+        activityMonitor = SystemActivityMonitor { [weak self] state in
             Task { @MainActor [weak self] in
-                self?.setSystemSuspended(suspended)
+                self?.applySystemActivity(state)
             }
         }
     }
@@ -129,38 +127,159 @@ final class WallpaperManager: ObservableObject {
         unmatchedLegacyAssignments = []
         unmatchedLegacyBindings = []
         showsHiddenWallpapers = false
-        hiddenSuspendedPlayback.removeAll()
+        didMigrateQueueSlots = false
+        systemSuspendedDisplayIDs.removeAll()
         self.store = store
         self.playbackPolicy = policy
-        activityMonitor?.update(policy: policy)
         loadQueues()
         loadAssignments()
     }
 
     func update(policy: PlaybackPolicy) {
         playbackPolicy = policy
-        activityMonitor?.update(policy: policy)
         for (displayID, controller) in controllers {
             let item = assignments[displayID]?.wallpaperID.flatMap { queueItems[$0] }
             controller.setMuted(policy.isMuted)
             controller.setFitMode(item?.effectiveFitMode(global: policy.fitMode) ?? policy.fitMode)
             controller.setWebInteractionEnabled(policy.webWallpaperInteractionEnabled)
-            controller.setSystemSuspended(isSystemSuspended, reloadWebContentOnResume: false)
             playbackStates[displayID] = controller.playbackState
+        }
+        refreshSystemSuspension()
+    }
+
+    private func isSystemSuspended(for displayID: String) -> Bool {
+        playbackPolicy.shouldPauseDynamicWallpaper(
+            displayID: displayID,
+            activity: activityState
+        )
+    }
+
+    private var currentQueueKind: PlaybackQueueKind {
+        showsHiddenWallpapers ? .hidden : .normal
+    }
+
+    func queueKind(for queue: PlaybackQueue) -> PlaybackQueueKind {
+        queue.kind(items: queueItems)
+    }
+
+    /// Resolves the queue slot used by the current hidden-wallpaper mode.
+    /// Empty or type-mismatched slots intentionally resolve to nil so the
+    /// display stays empty instead of falling back to another queue.
+    func effectiveQueueID(for displayID: String) -> UUID? {
+        guard let binding = bindings[displayID] else { return nil }
+        return QueueSlotResolver.resolve(
+            queueID: binding.queueID(for: currentQueueKind),
+            expected: currentQueueKind,
+            queues: queueLibrary,
+            items: queueItems
+        )
+    }
+
+    func effectiveQueue(for displayID: String) -> PlaybackQueue? {
+        effectiveQueueID(for: displayID).flatMap { queueLibrary[$0] }
+    }
+
+    func queueSlotID(for displayID: String, kind: PlaybackQueueKind) -> UUID? {
+        bindings[displayID]?.queueID(for: kind)
+    }
+
+    /// Assigns a queue to one of a display's mode slots. A queue may only be
+    /// placed in the slot matching its current content-derived kind.
+    @discardableResult
+    func setQueueSlot(
+        _ kind: PlaybackQueueKind,
+        queueID: UUID?,
+        for displayID: String,
+        policy: PlaybackPolicy,
+        items: [WallpaperItem]
+    ) -> Bool {
+        guard !persistenceGate.blocksPersistence else { return false }
+        queueItems = UniquedDictionary.build(items.map { ($0.id, $0) }, label: "queue items")
+        playbackPolicy = policy
+        if let queueID {
+            guard let queue = queueLibrary[queueID], queue.kind(items: queueItems) == kind else {
+                return false
+            }
+        } else if kind == .normal {
+            return false
+        }
+        guard var binding = bindings[displayID] else { return false }
+        binding.setQueueID(queueID, for: kind)
+        bindings[displayID] = binding
+        publishBindings()
+        publishLegacyQueues()
+        persistQueues()
+        if kind == currentQueueKind, connectedDisplays[displayID] != nil {
+            activateQueueSlot(for: displayID)
+        }
+        return true
+    }
+
+    /// Switches one display to the slot for the current hidden-wallpaper mode.
+    /// The previous queue's state is retained untouched, so switching back
+    /// resumes its previous index/intent.
+    private func activateQueueSlot(for displayID: String) {
+        guard let display = connectedDisplays[displayID],
+              let binding = bindings[displayID] else { return }
+
+        invalidateQueueTimers(for: displayID)
+        currentSessions.removeValue(forKey: displayID)
+        sessionDurations.removeValue(forKey: displayID)
+        controllers.removeValue(forKey: displayID)?.teardownAndClose()
+        appliedWallpaperIDs.removeValue(forKey: displayID)
+        playbackStates.removeValue(forKey: displayID)
+        assignments[displayID]?.applicationState = .idle
+
+        var updated = binding
+        if let queueID = effectiveQueueID(for: displayID),
+           let queue = queueLibrary[queueID],
+           !queue.wallpaperIDs.isEmpty {
+            updated.activeQueueID = queueID
+            bindings[displayID] = updated
+            publishBindings()
+            publishLegacyQueues()
+            persistQueues()
+            startQueue(
+                queueID: queueID,
+                on: display,
+                policy: playbackPolicy,
+                items: Array(queueItems.values),
+                resetIndex: false
+            )
+        } else {
+            updated.activeQueueID = updated.defaultQueueID
+            bindings[displayID] = updated
+            publishBindings()
+            publishLegacyQueues()
+            persistQueues()
+            publishDisplayAssignments()
         }
     }
 
-    private func setSystemSuspended(_ suspended: Bool) {
-        guard suspended != isSystemSuspended else { return }
-        isSystemSuspended = suspended
-        for (displayID, controller) in controllers {
-            controller.setSystemSuspended(
-                suspended,
-                reloadWebContentOnResume: !suspended && playbackPolicy.reloadWebContentOnResume
-            )
-            playbackStates[displayID] = controller.playbackState
-        }
-        for displayID in bindings.keys {
+    private func applySystemActivity(_ state: PlaybackActivityState) {
+        activityState = state
+        refreshSystemSuspension()
+    }
+
+    /// Applies battery/fullscreen suspension only to the displays whose state
+    /// actually changed. Battery policies affect every display; a fullscreen
+    /// app only suspends the display containing its window.
+    private func refreshSystemSuspension() {
+        let candidates = Set(connectedDisplays.keys)
+            .union(controllers.keys)
+            .union(bindings.keys)
+        let next = Set(candidates.filter { isSystemSuspended(for: $0) })
+        let changed = next.symmetricDifference(systemSuspendedDisplayIDs)
+        systemSuspendedDisplayIDs = next
+        for displayID in changed {
+            let suspended = next.contains(displayID)
+            if let controller = controllers[displayID] {
+                controller.setSystemSuspended(
+                    suspended,
+                    reloadWebContentOnResume: !suspended && playbackPolicy.reloadWebContentOnResume
+                )
+                playbackStates[displayID] = controller.playbackState
+            }
             reconcileScheduling(for: displayID)
         }
     }
@@ -186,6 +305,7 @@ final class WallpaperManager: ObservableObject {
         let session = PlaybackSession(itemID: item.id, displayID: display.id)
         currentSessions[display.id] = session
         sessionDurations[display.id] = Self.validDuration(item.metadata?.durationSeconds)
+        let suspended = isSystemSuspended(for: display.id)
         let replacement = try WallpaperWindowController(
             item: item,
             screen: display.screen,
@@ -200,9 +320,14 @@ final class WallpaperManager: ObservableObject {
             onVideoDurationChanged: { [weak self] duration in
                 self?.videoDurationDidChange(for: display.id, session: session, duration: duration)
             },
-            initialSystemSuspended: isSystemSuspended
+            initialSystemSuspended: suspended
         )
-        replacement.setSystemSuspended(isSystemSuspended, reloadWebContentOnResume: false)
+        replacement.setSystemSuspended(suspended, reloadWebContentOnResume: false)
+        if suspended {
+            systemSuspendedDisplayIDs.insert(display.id)
+        } else {
+            systemSuspendedDisplayIDs.remove(display.id)
+        }
         let previous = controllers[display.id]
         controllers[display.id] = replacement
         let assignment = DisplayAssignment(
@@ -235,7 +360,7 @@ final class WallpaperManager: ObservableObject {
         publishDisplayAssignments()
         appliedWallpaperIDs.removeValue(forKey: displayID)
         playbackStates.removeValue(forKey: displayID)
-        hiddenSuspendedPlayback.removeValue(forKey: displayID)
+        systemSuspendedDisplayIDs.remove(displayID)
         persistAssignments()
     }
 
@@ -246,9 +371,10 @@ final class WallpaperManager: ObservableObject {
         }
     }
 
-    /// Applies the hidden-wallpaper switch. Locking immediately removes hidden
-    /// wallpapers from screens; unlocking lets the normal restore path bring
-    /// back still-assigned hidden items and hidden queue members.
+    /// Applies the hidden-wallpaper switch by activating each display's
+    /// default or hidden queue slot. Empty/mismatched slots leave the display
+    /// empty; fixed assignments outside a queue are restored only when
+    /// eligible.
     func setShowsHiddenWallpapers(
         _ shows: Bool,
         policy: PlaybackPolicy,
@@ -257,89 +383,37 @@ final class WallpaperManager: ObservableObject {
         playbackPolicy = policy
         showsHiddenWallpapers = shows
         queueItems = UniquedDictionary.build(items.map { ($0.id, $0) }, label: "queue items")
-        if shows {
-            for (displayID, wasPlaying) in hiddenSuspendedPlayback where wasPlaying {
-                guard var binding = bindings[displayID] else { continue }
-                let queueID = binding.activeQueueID
-                var state = binding.state(for: queueID)
-                guard state.isEnabled else { continue }
-                state.isPlaying = true
-                binding.queueStates[queueID] = state
-                bindings[displayID] = binding
-            }
-            reapply(to: currentDisplays(), policy: policy, items: items)
-            for (displayID, wasPlaying) in hiddenSuspendedPlayback where wasPlaying {
-                guard let controller = controllers[displayID] else { continue }
-                controller.setPlaybackEnabled(true)
-                playbackStates[displayID] = controller.playbackState
-            }
-            hiddenSuspendedPlayback.removeAll()
-        } else {
-            for display in connectedDisplays.values {
-                hideHiddenPresentationIfNeeded(displayID: display.id)
-            }
-            for displayID in bindings.keys {
-                reconcileScheduling(for: displayID)
-            }
+        for display in connectedDisplays.values {
+            activateQueueSlot(for: display.id)
+        }
+        for display in connectedDisplays.values where effectiveQueueID(for: display.id) == nil {
+            restoreFixedAssignmentIfNeeded(displayID: display.id)
         }
     }
 
-    private func hideHiddenPresentationIfNeeded(displayID: String) {
-        guard let itemID = assignments[displayID]?.wallpaperID,
+    private func restoreFixedAssignmentIfNeeded(displayID: String) {
+        guard effectiveQueueID(for: displayID) == nil,
+              let display = connectedDisplays[displayID],
+              let itemID = assignments[displayID]?.wallpaperID,
+              !assignmentIsManagedByQueue(displayID: displayID, itemID: itemID),
               let item = queueItems[itemID],
-              item.isHidden else { return }
-        guard let display = connectedDisplays[displayID] else {
-            suspendPresentation(displayID: displayID)
+              WallpaperVisibility.isEligible(item, showsHidden: showsHiddenWallpapers) else {
             return
         }
-        if let binding = bindings[displayID],
-           let queue = queueLibrary[binding.activeQueueID] {
-            var updated = binding
-            var state = updated.state(for: queue.id)
-            if let next = nextQueueIndex(queue: queue, state: state),
-               let nextItem = queueItems[queue.wallpaperIDs[next]] {
-                state.currentIndex = next
-                state.isPlaying = state.isEnabled && state.isPlaying
-                updated.queueStates[queue.id] = state
-                bindings[displayID] = updated
-                publishBindings()
-                publishLegacyQueues()
-                persistQueues()
-                invalidateQueueTimers(for: displayID)
-                var presentationPolicy = playbackPolicy
-                presentationPolicy.isPlaying = state.isEnabled && state.isPlaying
-                do {
-                    try apply(
-                        item: nextItem,
-                        to: display,
-                        policy: presentationPolicy,
-                        preserveQueue: true
-                    )
-                    return
-                } catch {
-                    suspendPresentation(displayID: displayID)
-                    return
-                }
-            }
-            hiddenSuspendedPlayback[displayID] = state.isEnabled && state.isPlaying
-            state.isPlaying = false
-            updated.queueStates[queue.id] = state
-            bindings[displayID] = updated
-            publishBindings()
-            publishLegacyQueues()
-            persistQueues()
-        }
-        suspendPresentation(displayID: displayID)
+        try? apply(item: item, to: display, policy: playbackPolicy, preserveQueue: true)
+    }
+
+    /// A fixed assignment must not be mistaken for queue playback when the
+    /// current mode slot is intentionally empty.
+    private func assignmentIsManagedByQueue(displayID: String, itemID: UUID) -> Bool {
+        guard let binding = bindings[displayID] else { return false }
+        let queueIDs = [binding.defaultQueueID, binding.hiddenQueueID].compactMap { $0 }
+        return queueIDs.contains { queueLibrary[$0]?.wallpaperIDs.contains(itemID) == true }
     }
 
     /// Tears down a display's presentation while keeping its assignment for a
     /// later unlock. Unlike `clear(displayID:)`, the wallpaperID is retained.
     private func suspendPresentation(displayID: String) {
-        if hiddenSuspendedPlayback[displayID] == nil {
-            hiddenSuspendedPlayback[displayID] = controllers[displayID]?.playbackState.isPlaying
-                ?? playbackStates[displayID]?.isPlaying
-                ?? false
-        }
         invalidateQueueTimers(for: displayID)
         currentSessions.removeValue(forKey: displayID)
         sessionDurations.removeValue(forKey: displayID)
@@ -379,7 +453,7 @@ final class WallpaperManager: ObservableObject {
         controllers.removeAll()
         currentSessions.removeAll()
         sessionDurations.removeAll()
-        hiddenSuspendedPlayback.removeAll()
+        systemSuspendedDisplayIDs.removeAll()
         bindings = bindings.mapValues { binding in
             var binding = binding
             for queueID in binding.queueStates.keys {
@@ -420,6 +494,7 @@ final class WallpaperManager: ObservableObject {
             mergeProfiles(for: displays)
         }
         queueItems = UniquedDictionary.build(items.map { ($0.id, $0) }, label: "queue items")
+        migrateLegacyQueueSlotsIfNeeded()
         let connectedIDs = Set(displays.map(\.id))
         let potentiallyDisconnected = Set(previousDisplays.keys)
             .union(assignments.keys)
@@ -440,7 +515,7 @@ final class WallpaperManager: ObservableObject {
             appliedWallpaperIDs.removeValue(forKey: key)
             playbackStates.removeValue(forKey: key)
             connectedIdentities.removeValue(forKey: key)
-            hiddenSuspendedPlayback.removeValue(forKey: key)
+                systemSuspendedDisplayIDs.remove(key)
         }
         publishDisplayAssignments()
 
@@ -459,15 +534,20 @@ final class WallpaperManager: ObservableObject {
                 )
                 bindings[display.id] = binding
             }
-            guard let binding = bindings[display.id] else { continue }
-            let queue = queueLibrary[binding.activeQueueID]
-            let state = queue.map { binding.state(for: $0.id) }
+            guard bindings[display.id] != nil else { continue }
+            let queue = effectiveQueue(for: display.id)
+            let state = queue.flatMap { bindings[display.id]?.state(for: $0.id) }
             let hasEnabledQueue = state?.isEnabled == true && queue?.wallpaperIDs.isEmpty == false
             let expectedItemID: UUID?
             if hasEnabledQueue, let queue, let state {
                 expectedItemID = queue.wallpaperIDs[safe: state.currentIndex]
+            } else if let assignedItemID = assignments[display.id]?.wallpaperID,
+                      !assignmentIsManagedByQueue(displayID: display.id, itemID: assignedItemID) {
+                expectedItemID = assignedItemID
             } else {
-                expectedItemID = assignments[display.id]?.wallpaperID
+                // An empty current-mode slot stays empty. Do not resurrect the
+                // previous queue item through a stale display assignment.
+                expectedItemID = nil
             }
             let currentItemMatches = expectedItemID != nil
                 && appliedWallpaperIDs[display.id] == expectedItemID
@@ -537,6 +617,78 @@ final class WallpaperManager: ObservableObject {
         reapply(to: displays, policy: policy, items: items)
     }
 
+    /// One-time migration from the single-active-queue format. A legacy queue
+    /// that contains hidden wallpapers becomes the hidden slot; the normal slot
+    /// falls back to the built-in default queue.
+    private func migrateLegacyQueueSlotsIfNeeded() {
+        guard !didMigrateQueueSlots else { return }
+        didMigrateQueueSlots = true
+        var changed = false
+        for displayID in Array(bindings.keys) {
+            guard var binding = bindings[displayID] else { continue }
+            let activeQueue = queueLibrary[binding.activeQueueID]
+            if binding.hiddenQueueID == nil,
+               let activeQueue,
+               queueKind(for: activeQueue) == .hidden {
+                binding.hiddenQueueID = activeQueue.id
+                changed = true
+            }
+            if queueLibrary[binding.defaultQueueID] == nil
+                || queueLibrary[binding.defaultQueueID].map({ queueKind(for: $0) == .hidden }) == true {
+                binding.defaultQueueID = defaultQueueID
+                changed = true
+            }
+            let target = currentQueueKind == .hidden
+                ? binding.hiddenQueueID
+                : binding.defaultQueueID
+            if let target, binding.activeQueueID != target {
+                binding.activeQueueID = target
+                changed = true
+            }
+            bindings[displayID] = binding
+        }
+        if changed {
+            publishBindings()
+            publishLegacyQueues()
+            persistQueues()
+        }
+    }
+
+    /// Removes newly hidden items from queues that were still normal. Queues
+    /// that already contained hidden wallpapers are already hidden queues and
+    /// keep their membership.
+    func removeHiddenItemsFromDefaultQueues(_ itemIDs: Set<UUID>) {
+        guard !itemIDs.isEmpty, !persistenceGate.blocksPersistence else { return }
+        var changedQueues = Set<UUID>()
+        for (queueID, value) in queueLibrary {
+            guard value.wallpaperIDs.contains(where: itemIDs.contains) else { continue }
+            let otherHidden = value.wallpaperIDs.contains { id in
+                !itemIDs.contains(id) && queueItems[id]?.isHidden == true
+            }
+            guard !otherHidden else { continue }
+            var queue = value
+            queue.removeWallpaperIDs(itemIDs)
+            queueLibrary[queueID] = queue
+            changedQueues.insert(queueID)
+            for displayID in bindings.keys {
+                guard var binding = bindings[displayID],
+                      var state = binding.queueStates[queueID] else { continue }
+                state.normalize(for: queue)
+                binding.queueStates[queueID] = state
+                bindings[displayID] = binding
+            }
+        }
+        guard !changedQueues.isEmpty else { return }
+        publishQueueLibrary()
+        persistQueues()
+        for displayID in bindings.keys {
+            guard let queueID = effectiveQueueID(for: displayID),
+                  changedQueues.contains(queueID),
+                  connectedDisplays[displayID] != nil else { continue }
+            activateQueueSlot(for: displayID)
+        }
+    }
+
     private func pruneDanglingQueueMembers(knownItemIDs: Set<UUID>) {
         var changed = false
         for (queueID, queue) in queueLibrary {
@@ -570,14 +722,13 @@ final class WallpaperManager: ObservableObject {
     }
 
     func activeQueue(for displayID: String) -> PlaybackQueue? {
-        guard let binding = bindings[displayID],
-              binding.state(for: binding.activeQueueID).isEnabled else { return nil }
-        return queueLibrary[binding.activeQueueID]
+        guard let queue = effectiveQueue(for: displayID),
+              bindings[displayID]?.state(for: queue.id).isEnabled == true else { return nil }
+        return queue
     }
 
     func boundQueue(for displayID: String) -> PlaybackQueue? {
-        guard let binding = bindings[displayID] else { return nil }
-        return queueLibrary[binding.activeQueueID]
+        effectiveQueue(for: displayID)
     }
 
     func state(for displayID: String, queueID: UUID) -> DisplayQueueState? {
@@ -647,16 +798,27 @@ final class WallpaperManager: ObservableObject {
         guard let queue = queueLibrary[id], !queue.isDefault else { return false }
         let fallbackID = defaultQueueID
         queueLibrary.removeValue(forKey: id)
-        for displayID in bindings.keys {
-            guard var binding = bindings[displayID], binding.activeQueueID == id else { continue }
-            binding.activeQueueID = fallbackID
+        for displayID in Array(bindings.keys) {
+            guard var binding = bindings[displayID] else { continue }
+            let wasActive = effectiveQueueID(for: displayID) == id
+            guard binding.defaultQueueID == id
+                || binding.hiddenQueueID == id
+                || binding.activeQueueID == id else { continue }
             binding.queueStates.removeValue(forKey: id)
-            if binding.queueStates[fallbackID] == nil {
-                binding.queueStates[fallbackID] = DisplayQueueState(queueID: fallbackID)
+            if binding.defaultQueueID == id {
+                binding.defaultQueueID = fallbackID
+            }
+            if binding.hiddenQueueID == id {
+                binding.hiddenQueueID = nil
+            }
+            if binding.activeQueueID == id {
+                binding.activeQueueID = currentQueueKind == .hidden
+                    ? (binding.hiddenQueueID ?? fallbackID)
+                    : binding.defaultQueueID
             }
             bindings[displayID] = binding
-            if let display = connectedDisplays[displayID], let policy, let items {
-                startQueue(queueID: fallbackID, on: display, policy: policy, items: items, resetIndex: false)
+            if wasActive, connectedDisplays[displayID] != nil {
+                activateQueueSlot(for: displayID)
             }
         }
         publishQueueLibrary()
@@ -667,23 +829,32 @@ final class WallpaperManager: ObservableObject {
     func addWallpaperIDs(_ itemIDs: [UUID], to queueID: UUID, items: [WallpaperItem]) {
         guard !persistenceGate.blocksPersistence else { return }
         guard var queue = queueLibrary[queueID] else { return }
+        let byID = UniquedDictionary.build(items.map { ($0.id, $0) }, label: "queue items")
+        let allowedIDs: [UUID]
+        if showsHiddenWallpapers {
+            allowedIDs = itemIDs
+        } else {
+            // While locked, hidden wallpapers cannot be added to any queue.
+            allowedIDs = itemIDs.filter { byID[$0]?.isHidden != true }
+        }
+        guard !allowedIDs.isEmpty else { return }
         let orderedIDs: [UUID]
         switch queue.sortMode {
         case .custom:
-            orderedIDs = itemIDs
+            orderedIDs = allowedIDs
         case .name:
-            orderedIDs = itemIDs.sorted { lhs, rhs in
+            orderedIDs = allowedIDs.sorted { lhs, rhs in
                 (items.first(where: { $0.id == lhs })?.name ?? "").localizedStandardCompare(items.first(where: { $0.id == rhs })?.name ?? "") == .orderedAscending
             }
         case .type:
-            orderedIDs = itemIDs.sorted { lhs, rhs in
+            orderedIDs = allowedIDs.sorted { lhs, rhs in
                 let left = items.first(where: { $0.id == lhs })
                 let right = items.first(where: { $0.id == rhs })
                 if left?.type != right?.type { return String(describing: left?.type) < String(describing: right?.type) }
                 return (left?.name ?? "").localizedStandardCompare(right?.name ?? "") == .orderedAscending
             }
         case .addedAt:
-            orderedIDs = itemIDs.sorted { lhs, rhs in
+            orderedIDs = allowedIDs.sorted { lhs, rhs in
                 (items.first(where: { $0.id == lhs })?.createdAt ?? .distantPast) < (items.first(where: { $0.id == rhs })?.createdAt ?? .distantPast)
             }
         }
@@ -717,22 +888,20 @@ final class WallpaperManager: ObservableObject {
         items: [WallpaperItem]
     ) {
         guard !persistenceGate.blocksPersistence else { return }
-        guard queueLibrary[queueID] != nil else { return }
-        var binding = bindings[display.id] ?? DisplayPlaybackBinding(displayID: display.id, displayName: display.name)
-        binding.displayName = display.name
-        binding.activeQueueID = queueID
-        if binding.queueStates[queueID] == nil {
-            binding.queueStates[queueID] = DisplayQueueState(queueID: queueID)
-        }
-        bindings[display.id] = binding
-        startQueue(queueID: queueID, on: display, policy: policy, items: items, resetIndex: false)
-        publishBindings()
-        persistQueues()
+        guard let queue = queueLibrary[queueID] else { return }
+        let byID = UniquedDictionary.build(items.map { ($0.id, $0) }, label: "queue items")
+        _ = setQueueSlot(
+            queue.kind(items: byID),
+            queueID: queueID,
+            for: display.id,
+            policy: policy,
+            items: items
+        )
     }
 
     func saveQueue(_ queue: DisplayPlaybackQueue) {
         guard !persistenceGate.blocksPersistence else { return }
-        let queueID = bindings[queue.displayID]?.activeQueueID ?? UUID()
+        let queueID = effectiveQueueID(for: queue.displayID) ?? defaultQueueID
         let isNew = queueLibrary[queueID] == nil
         let namedQueue = PlaybackQueue(
             id: queueID,
@@ -747,7 +916,11 @@ final class WallpaperManager: ObservableObject {
         queueLibrary[queueID] = namedQueue
         var binding = bindings[queue.displayID] ?? DisplayPlaybackBinding(displayID: queue.displayID, displayName: queue.displayName)
         binding.displayName = queue.displayName
-        binding.activeQueueID = queueID
+        let kind = queueKind(for: namedQueue)
+        binding.setQueueID(queueID, for: kind)
+        if kind == currentQueueKind {
+            binding.activeQueueID = queueID
+        }
         binding.queueStates[queueID] = DisplayQueueState(
             queueID: queueID,
             currentIndex: queue.currentIndex,
@@ -767,7 +940,7 @@ final class WallpaperManager: ObservableObject {
         resetIndex: Bool
     ) {
         saveQueue(queue)
-        guard let queueID = bindings[display.id]?.activeQueueID else { return }
+        guard let queueID = effectiveQueueID(for: display.id) ?? bindings[display.id]?.defaultQueueID else { return }
         startQueue(queueID: queueID, on: display, policy: policy, items: items, resetIndex: resetIndex)
     }
 
@@ -796,7 +969,6 @@ final class WallpaperManager: ObservableObject {
                 // A locked hidden-only queue keeps its enabled intent so it can
                 // resume after unlocking, but it must not leave a hidden
                 // wallpaper on screen.
-                hiddenSuspendedPlayback[display.id] = state.isEnabled && state.isPlaying
                 state.isPlaying = false
                 binding.queueStates[queueID] = state
                 bindings[display.id] = binding
@@ -850,8 +1022,8 @@ final class WallpaperManager: ObservableObject {
 
     func stopQueue(displayID: String, persist: Bool = true) {
         invalidateQueueTimers(for: displayID)
-        guard var binding = bindings[displayID] else { return }
-        let queueID = binding.activeQueueID
+        guard var binding = bindings[displayID],
+              let queueID = effectiveQueueID(for: displayID) else { return }
         var state = binding.state(for: queueID)
         state.isEnabled = false
         state.isPlaying = false
@@ -879,8 +1051,8 @@ final class WallpaperManager: ObservableObject {
         for (displayID, controller) in controllers {
             controller.setPlaybackEnabled(isPlaying)
             playbackStates[displayID] = controller.playbackState
-            guard var binding = bindings[displayID] else { continue }
-            let queueID = binding.activeQueueID
+            guard var binding = bindings[displayID],
+                  let queueID = effectiveQueueID(for: displayID) else { continue }
             var state = binding.state(for: queueID)
             // Pausing playback must not become a permanent queue stop. Keep
             // the user's queue intent enabled and freeze/resume scheduling in
@@ -907,8 +1079,8 @@ final class WallpaperManager: ObservableObject {
     func togglePlayback(for displayID: String) {
         guard let controller = controllers[displayID] else { return }
         if case .staticImage = controller.playbackState { return }
-        guard var binding = bindings[displayID] else { return }
-        let queueID = binding.activeQueueID
+        guard var binding = bindings[displayID],
+              let queueID = effectiveQueueID(for: displayID) else { return }
         var state = binding.state(for: queueID)
         // playbackState also contains system suspension. Toggle the saved user
         // intent instead of reading the effective (possibly suspended) state.
@@ -936,7 +1108,7 @@ final class WallpaperManager: ObservableObject {
         guard let store, let allItems = try? store.items(), let wallpaper = allItems.first(where: { $0.id == itemID }) else { return }
         playbackPolicy = policy
         queueItems[wallpaper.id] = wallpaper
-        let activeQueue = bindings[displayID].flatMap { queueLibrary[$0.activeQueueID] }
+        let activeQueue = effectiveQueue(for: displayID)
         let advanceAfterVideoCompletion = activeQueue?.usesCompletionAdvance(for: wallpaper.type) == true
         do {
             // New session invalidates completion callbacks from the replaced
@@ -944,6 +1116,7 @@ final class WallpaperManager: ObservableObject {
             let session = PlaybackSession(itemID: wallpaper.id, displayID: displayID)
             currentSessions[displayID] = session
             sessionDurations[displayID] = Self.validDuration(wallpaper.metadata?.durationSeconds)
+            let suspended = isSystemSuspended(for: displayID)
             let replacement = try WallpaperWindowController(
                 item: wallpaper,
                 screen: display,
@@ -958,9 +1131,14 @@ final class WallpaperManager: ObservableObject {
                 onVideoDurationChanged: { [weak self] duration in
                     self?.videoDurationDidChange(for: displayID, session: session, duration: duration)
                 },
-                initialSystemSuspended: isSystemSuspended
+                initialSystemSuspended: suspended
             )
-            replacement.setSystemSuspended(isSystemSuspended, reloadWebContentOnResume: false)
+            replacement.setSystemSuspended(suspended, reloadWebContentOnResume: false)
+            if suspended {
+                systemSuspendedDisplayIDs.insert(displayID)
+            } else {
+                systemSuspendedDisplayIDs.remove(displayID)
+            }
             controllers[displayID]?.teardownAndClose()
             controllers[displayID] = replacement
             playbackStates[displayID] = replacement.playbackState
@@ -1027,6 +1205,8 @@ final class WallpaperManager: ObservableObject {
                 displayID: profile.profileID,
                 displayName: profile.displayName,
                 activeQueueID: binding.activeQueueID,
+                defaultQueueID: binding.defaultQueueID,
+                hiddenQueueID: binding.hiddenQueueID,
                 queueStates: binding.queueStates
             )
         }
@@ -1034,6 +1214,7 @@ final class WallpaperManager: ObservableObject {
         for displayID in bindings.keys {
             guard var binding = bindings[displayID], queueLibrary[binding.activeQueueID] == nil else { continue }
             binding.activeQueueID = defaultQueueID
+            binding.defaultQueueID = defaultQueueID
             if binding.queueStates[defaultQueueID] == nil {
                 binding.queueStates[defaultQueueID] = DisplayQueueState(queueID: defaultQueueID)
             }
@@ -1206,6 +1387,8 @@ final class WallpaperManager: ObservableObject {
                     displayID: DisplayProfileMigrator.legacyDisplayID(for: identity),
                     displayName: identity.localizedName,
                     activeQueueID: binding.activeQueueID,
+                    defaultQueueID: binding.defaultQueueID,
+                    hiddenQueueID: binding.hiddenQueueID,
                     queueStates: binding.queueStates
                 )
             )
@@ -1261,7 +1444,7 @@ final class WallpaperManager: ObservableObject {
             // Capture each display's current item before membership changes.
             var currentItems: [String: UUID] = [:]
             for displayID in bindings.keys {
-                guard let binding = bindings[displayID], binding.activeQueueID == queueID else { continue }
+                guard let binding = bindings[displayID], effectiveQueueID(for: displayID) == queueID else { continue }
                 let state = binding.state(for: queueID)
                 if queue.wallpaperIDs.indices.contains(state.currentIndex) {
                     currentItems[displayID] = queue.wallpaperIDs[state.currentIndex]
@@ -1271,7 +1454,7 @@ final class WallpaperManager: ObservableObject {
             queue.removeWallpaperIDs(itemIDs)
             queueLibrary[queueID] = queue
             for displayID in bindings.keys {
-                guard var binding = bindings[displayID], binding.activeQueueID == queueID else { continue }
+                guard var binding = bindings[displayID], effectiveQueueID(for: displayID) == queueID else { continue }
                 var state = binding.state(for: queueID)
                 let wasEnabled = state.isEnabled
                 let currentItemID = currentItems[displayID]
@@ -1319,7 +1502,7 @@ final class WallpaperManager: ObservableObject {
 
     private func publishLegacyQueues() {
         displayQueues = UniquedDictionary.build(bindings.values.compactMap { binding -> (String, DisplayPlaybackQueue)? in
-            guard let queue = queueLibrary[binding.activeQueueID] else { return nil }
+            guard let queue = effectiveQueue(for: binding.displayID) else { return nil }
             let state = binding.state(for: queue.id)
             return (
                 binding.displayID,
@@ -1379,9 +1562,14 @@ final class WallpaperManager: ObservableObject {
         var changed = false
         for displayID in Array(bindings.keys) {
             guard var binding = bindings[displayID],
-                  binding.invalidateActiveQueue(ifMatching: queueID) else { continue }
+                  binding.invalidateBoundQueue(ifMatching: queueID) else { continue }
             invalidateQueueTimers(for: displayID)
             bindings[displayID] = binding
+            if effectiveQueueID(for: displayID) == nil, connectedDisplays[displayID] != nil {
+                // The bound queue no longer matches its slot's type. Leave the
+                // display empty until the user assigns a valid queue.
+                activateQueueSlot(for: displayID)
+            }
             changed = true
         }
         guard changed else { return }
@@ -1489,8 +1677,7 @@ final class WallpaperManager: ObservableObject {
             // the current session's stall timer.
             guard sessionDurations[displayID] != normalized else { continue }
             sessionDurations[displayID] = normalized
-            guard let binding = bindings[displayID],
-                  let queue = queueLibrary[binding.activeQueueID],
+            guard let queue = effectiveQueue(for: displayID),
                   queue.usesCompletionAdvance(for: .video) else { continue }
             let stall = queue.stallWatchdogInterval(
                 forVideoWithDurationSeconds: durationForCurrentSession(displayID: displayID, itemID: itemID)
@@ -1514,11 +1701,11 @@ final class WallpaperManager: ObservableObject {
     private func noteVideoFrameProgress(for displayID: String, session: PlaybackSession) {
         guard currentSessions[displayID] == session else { return }
         guard let binding = bindings[displayID],
-              let queue = queueLibrary[binding.activeQueueID],
+              let queue = effectiveQueue(for: displayID),
               let state = binding.queueStates[queue.id],
               state.isEnabled,
               state.isPlaying,
-              !isSystemSuspended,
+              !isSystemSuspended(for: displayID),
               queue.advanceMode == .videoCompletion else { return }
         let itemID = queue.wallpaperIDs[safe: state.currentIndex]
         guard itemID == session.itemID else { return }
@@ -1539,11 +1726,11 @@ final class WallpaperManager: ObservableObject {
             return
         }
         guard let binding = bindings[displayID],
-              let queue = queueLibrary[binding.activeQueueID],
+              let queue = effectiveQueue(for: displayID),
               let state = binding.queueStates[queue.id],
               state.isEnabled,
               state.isPlaying,
-              !isSystemSuspended,
+              !isSystemSuspended(for: displayID),
               queue.advanceMode == .videoCompletion,
               let itemID = queue.wallpaperIDs[safe: state.currentIndex],
               itemID == session.itemID,
@@ -1588,14 +1775,14 @@ final class WallpaperManager: ObservableObject {
         PlaybackSchedulingState(
             isQueueEnabled: state.isEnabled,
             isPlaybackWanted: state.isPlaying,
-            isSystemSuspended: isSystemSuspended,
+            isSystemSuspended: isSystemSuspended(for: displayID),
             isDisplayConnected: connectedDisplays[displayID] != nil
         ).shouldSchedule
     }
 
     private func reconcileScheduling(for displayID: String) {
         guard let binding = bindings[displayID],
-              let queue = queueLibrary[binding.activeQueueID],
+              let queue = effectiveQueue(for: displayID),
               let state = binding.queueStates[queue.id],
               queue.wallpaperIDs.indices.contains(state.currentIndex),
               let item = queueItems[queue.wallpaperIDs[state.currentIndex]],
@@ -1616,7 +1803,7 @@ final class WallpaperManager: ObservableObject {
     private func advanceQueue(for displayID: String, generation: Int? = nil) {
         if let generation, generation != queueTimerGenerations[displayID] { return }
         guard let binding = bindings[displayID],
-              let queue = queueLibrary[binding.activeQueueID],
+              let queue = effectiveQueue(for: displayID),
               let display = connectedDisplays[displayID] else {
             // A missing display is not a user stop. Preserve queue intent and
             // do not let a stale deadline persistently disable reconnection.
@@ -1642,7 +1829,6 @@ final class WallpaperManager: ObservableObject {
             if hasHiddenMembers {
                 // Do not destroy the queue's enabled intent just because every
                 // remaining member is hidden while the switch is locked.
-                hiddenSuspendedPlayback[displayID] = state.isEnabled && state.isPlaying
                 var pausedState = state
                 pausedState.isPlaying = false
                 var updatedBinding = binding

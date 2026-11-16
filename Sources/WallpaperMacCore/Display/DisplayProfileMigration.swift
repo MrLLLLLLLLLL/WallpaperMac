@@ -395,6 +395,8 @@ public enum DisplayProfileMigrator {
             displayID: profileID,
             displayName: displayName,
             activeQueueID: binding.activeQueueID,
+            defaultQueueID: binding.defaultQueueID,
+            hiddenQueueID: binding.hiddenQueueID,
             queueStates: binding.queueStates
         )
     }

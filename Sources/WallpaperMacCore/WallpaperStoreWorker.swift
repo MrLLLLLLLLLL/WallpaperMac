@@ -79,6 +79,14 @@ public actor WallpaperStoreWorker {
         store = WallpaperStore(libraryURL: libraryURL)
     }
 
+    public func migrateLibrary(to destination: URL) throws -> WallpaperLibraryMigrationResult {
+        try WallpaperLibraryMigrator.migrate(from: store.libraryURL, to: destination)
+    }
+
+    public func removeLibrary(at url: URL) throws {
+        try FileManager.default.removeItem(at: url)
+    }
+
     public func loadLibrary() throws -> WallpaperLibrarySnapshot {
         let items = try store.refreshAllAvailability()
         return WallpaperLibrarySnapshot(items: items, groups: try store.groups())
