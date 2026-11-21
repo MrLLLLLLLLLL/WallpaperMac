@@ -72,7 +72,7 @@ final class UpdateService: ObservableObject {
         retryUpdate = nil
         let currentVersion = ApplicationVersionInfo(
             infoDictionary: Bundle.main.infoDictionary ?? [:],
-            fallbackVersion: "0.2.7"
+            fallbackVersion: ApplicationVersionInfo.developmentFallbackVersion
         ).version
 
         task = Task {

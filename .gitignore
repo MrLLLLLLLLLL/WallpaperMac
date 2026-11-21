@@ -41,7 +41,6 @@ Thumbnails/
 
 # Local editor, IDE, task and environment files
 .vscode/
-.github/
 .idea/
 .fleet/
 plan.md

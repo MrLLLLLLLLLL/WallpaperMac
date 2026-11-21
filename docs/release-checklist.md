@@ -7,7 +7,7 @@
 - [ ] `VERSION` 已更新为 `x.y.z`
 - [ ] `CHANGELOG.md` 有对应的 `## [x.y.z] - 日期` 段落
 - [ ] `docs/release-notes/x.y.z.md` 已编写
-- [ ] `UpdateService` 与 `SettingsWindowController` 的 `fallbackVersion` 已同步
+- [ ] `ApplicationVersionInfo.developmentFallbackVersion` 已同步为当前版本（应用层统一引用该常量）
 - [ ] 工作区无意外未提交改动（报告类文件除外）
 
 ## 2. 测试

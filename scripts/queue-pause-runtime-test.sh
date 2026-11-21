@@ -117,10 +117,23 @@ done
 [[ -n "$RUN_PID" ]] || { echo 'WallpaperMac did not start' >&2; exit 1; }
 
 read_queue_state() {
-    python3 - "$LIBRARY/display-playback-bindings.json" <<'PY'
+    python3 - "$LIBRARY/display-playback-bindings.json" "$DISPLAY_NAME" "$DISPLAY_NUMBER" <<'PY'
 import json, sys
-binding = json.load(open(sys.argv[1]))[0]
-state = binding['queueStates'][1]
+bindings = json.load(open(sys.argv[1]))
+name, number = sys.argv[2], sys.argv[3]
+legacy_id = f"display-{number}"
+binding = next((b for b in bindings if b.get("displayName") == name), None)
+if binding is None:
+    binding = next((b for b in bindings if b.get("displayID") == legacy_id), None)
+if binding is None:
+    raise SystemExit("queue binding for the fixture display was not found")
+raw = binding.get("queueStates") or []
+if isinstance(raw, list):
+    states = [value for _, value in zip(raw[0::2], raw[1::2])]
+else:
+    states = list(raw.values())
+active = binding.get("activeQueueID")
+state = next((s for s in states if s.get("queueID") == active), states[0] if states else {})
 print(f"{state.get('currentIndex', -1)}\t{state.get('isEnabled', False)}\t{state.get('isPlaying', False)}")
 PY
 }
@@ -168,11 +181,34 @@ printf 'paused_index=%s after_wait=%s resumed_index=%s\n' "$PAUSED_INDEX" "$AFTE
 echo 'QUEUE_PAUSE_RUNTIME_TEST_PASSED'
 
 # Exercise the separate system-suspension path with a real full-screen app.
-open -a TextEdit
+# Open a document explicitly: on recent macOS versions TextEdit launched with
+# no document shows the Open dialog, which cannot enter full screen.
+FULLSCREEN_DOC="$TEST_ROOT/fullscreen-probe.txt"
+printf 'fullscreen suspension probe\n' > "$FULLSCREEN_DOC"
+open -a TextEdit "$FULLSCREEN_DOC"
 TEXTEDIT_OPEN=1
-sleep 1
-osascript -e 'tell application "TextEdit" to activate' -e 'tell application "System Events" to keystroke "f" using {command down, control down}'
 sleep 2
+# Toggle full screen through the accessibility attribute and wait for the
+# transition instead of relying on a fixed delay after a keystroke. The
+# fixture queue belongs to the primary display, so move the document window
+# there first; otherwise TextEdit may open on a secondary screen and
+# per-display suspension would correctly leave the queue running.
+osascript -e 'tell application "TextEdit" to activate' -e 'delay 0.5' \
+    -e 'tell application "System Events" to tell process "TextEdit" to set position of window 1 to {100, 100}' \
+    -e 'delay 0.5' \
+    -e 'tell application "System Events" to tell process "TextEdit" to set value of attribute "AXFullScreen" of window 1 to true'
+FULLSCREEN_ACTIVE=0
+for _ in {1..20}; do
+    if [[ "$(osascript -e 'tell application "System Events" to tell process "TextEdit" to get value of attribute "AXFullScreen" of window 1' 2>/dev/null)" == "true" ]]; then
+        FULLSCREEN_ACTIVE=1
+        break
+    fi
+    sleep 0.25
+done
+[[ "$FULLSCREEN_ACTIVE" -eq 1 ]] || { echo 'TextEdit did not enter full screen' >&2; exit 1; }
+# Let the app's one-second activity monitor observe the full-screen window
+# before taking the suspended baseline.
+sleep 1.5
 SUSPENDED_STATE="$(read_queue_state)"
 SUSPENDED_INDEX="$(print -r -- "$SUSPENDED_STATE" | awk -F '\t' '{print $1}')"
 sleep 3

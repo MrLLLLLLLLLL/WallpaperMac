@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core-checks:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # `git diff --check HEAD^` needs the parent commit.
+          fetch-depth: 2
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcode-select -p
+
+      - name: Validate web wallpaper template
+        run: ./scripts/validate-web-wallpaper-template.sh
+
+      - name: Build
+        run: swift build
+
+      - name: Run core regression tests
+        run: swift run WallpaperMacCoreTests
+
+      - name: Check whitespace errors
+        run: git diff --check HEAD^

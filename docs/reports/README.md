@@ -18,3 +18,4 @@
 | 2026-11-06 | [project-report.md](2026-11-06/project-report.md) | 多显示器阶段 4 后的项目整体报告 |
 | 2026-11-07 | [project-review.md](2026-11-07/project-review.md) | 网页地址壁纸改动后的整体整理与验证报告 |
 | 2026-11-07 | [deep-audit-plan.md](2026-11-07/deep-audit-plan.md) | 四条关键链路深度检测、证据分级与分阶段修复规划 |
+| 2026-11-22 | [project-report.md](2026-11-22/project-report.md) | 0.2.11 定版评审、发布卫生修复与验证记录 |

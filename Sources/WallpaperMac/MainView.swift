@@ -4,6 +4,19 @@ import SwiftUI
 import UniformTypeIdentifiers
 import WallpaperMacCore
 
+enum MainWindowMetrics {
+    static let sidebarWidth: CGFloat = 220
+    static let inspectorWidth: CGFloat = 340
+    /// Fixed header height so resizing the window cannot change the toolbar
+    /// height by compressing or wrapping its title.
+    static let libraryHeaderHeight: CGFloat = 76
+    /// Smallest content width that fits the compact library header. The
+    /// window minimum is derived from it so the complete toolbar is visible.
+    static let libraryHeaderMinimumWidth: CGFloat = 680
+    static let minimumWindowWidth =
+        sidebarWidth + inspectorWidth + libraryHeaderMinimumWidth + 2
+}
+
 enum SidebarDestination: Hashable {
     case all
     case images
@@ -99,6 +112,7 @@ final class LibraryViewModel: ObservableObject {
     @Published private(set) var wallpapers: [WallpaperItem] = []
     @Published private(set) var visibleWallpapers: [WallpaperItem] = []
     @Published private(set) var currentPage = 1
+    @Published private(set) var pageSize = WallpaperLibraryPagination.defaultPageSize
     @Published private(set) var groups: [WallpaperGroup] = []
     @Published var selectedWallpaperID: UUID?
     @Published var selectedWallpaperIDs: Set<UUID> = []
@@ -161,7 +175,6 @@ final class LibraryViewModel: ObservableObject {
     private func isCurrentLibrarySession(_ session: UUID) -> Bool {
         session == librarySessionID
     }
-    private static let pageSize = WallpaperLibraryPagination.defaultPageSize
 
     init() {
         let defaults = UserDefaults.standard
@@ -440,7 +453,7 @@ final class LibraryViewModel: ObservableObject {
     var totalPageCount: Int {
         WallpaperLibraryPagination.pageCount(
             totalCount: filteredWallpapers.count,
-            pageSize: Self.pageSize
+            pageSize: pageSize
         )
     }
 
@@ -459,10 +472,24 @@ final class LibraryViewModel: ObservableObject {
         currentPage = WallpaperLibraryPagination.normalizedPage(
             pageNumber,
             totalCount: filteredWallpapers.count,
-            pageSize: Self.pageSize
+            pageSize: pageSize
         )
         refreshVisibleWallpapers()
         selectedWallpaperID = nil
+    }
+
+    /// Updates the page capacity from the visible content area. The first
+    /// visible wallpaper stays on screen when a resize changes the capacity.
+    func updatePaginationPageSize(_ newSize: Int) {
+        let clamped = max(1, newSize)
+        guard clamped != pageSize else { return }
+        let anchorID = visibleWallpapers.first?.id
+        pageSize = clamped
+        if let anchorID,
+           let index = filteredWallpapers.firstIndex(where: { $0.id == anchorID }) {
+            currentPage = index / clamped + 1
+        }
+        refreshVisibleWallpapers()
     }
 
     private func resetPagination() {
@@ -474,12 +501,12 @@ final class LibraryViewModel: ObservableObject {
         currentPage = WallpaperLibraryPagination.normalizedPage(
             currentPage,
             totalCount: filteredWallpapers.count,
-            pageSize: Self.pageSize
+            pageSize: pageSize
         )
         visibleWallpapers = WallpaperLibraryPagination.page(
             from: filteredWallpapers,
             pageNumber: currentPage,
-            pageSize: Self.pageSize
+            pageSize: pageSize
         )
     }
 
@@ -1594,13 +1621,13 @@ struct MainView: View {
     private var mainWorkspace: some View {
         HStack(spacing: 0) {
             SidebarView(model: model)
-                .frame(width: 220)
+                .frame(width: MainWindowMetrics.sidebarWidth)
             Divider()
             LibraryContentView(model: model)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             Divider()
             InspectorView(model: model)
-                .frame(width: 340)
+                .frame(width: MainWindowMetrics.inspectorWidth)
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .disabled(model.isMigratingLibrary)
@@ -2206,7 +2233,15 @@ private struct LibraryContentView: View {
     @State private var isDropTargeted = false
     @State private var showingBatchRemoveConfirmation = false
 
-    private let columns = [GridItem(.adaptive(minimum: 190), spacing: 16)]
+    private func gridColumns(_ layout: WallpaperLibraryGridLayout) -> [GridItem] {
+        Array(
+            repeating: GridItem(
+                .fixed(CGFloat(layout.tileWidth)),
+                spacing: CGFloat(layout.horizontalSpacing)
+            ),
+            count: layout.columns
+        )
+    }
 
     var body: some View {
         Group {
@@ -2221,125 +2256,7 @@ private struct LibraryContentView: View {
     @ViewBuilder
     private var libraryBody: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(title)
-                        .font(.title2.weight(.semibold))
-                    Text(model.isSelectionMode
-                         ? "已选 \(model.selectedWallpaperIDs.count) / \(model.filteredWallpapers.count) 项"
-                         : "\(model.filteredWallpapers.count) 个资源 · 第 \(model.currentPage) / \(max(model.totalPageCount, 1)) 页")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                if model.isSelectionMode {
-                    Button("全选") { model.selectAllFiltered() }
-                        .buttonStyle(.borderless)
-                    Button("清空") { model.clearSelection() }
-                        .buttonStyle(.borderless)
-                    Menu {
-                        Button("移出分组") { model.assignSelected(to: nil) }
-                        if !model.groups.isEmpty {
-                            Divider()
-                            ForEach(model.groups) { group in
-                                Button(group.name) { model.assignSelected(to: group.id) }
-                            }
-                        }
-                        Divider()
-                        Button("新建分组…") { model.isNewGroupSheetPresented = true }
-                    } label: {
-                        Label("分组", systemImage: "folder")
-                    }
-                    .menuStyle(.borderlessButton)
-                    Button("删除", role: .destructive) {
-                        showingBatchRemoveConfirmation = true
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(model.selectedWallpaperIDs.isEmpty)
-                    Button("完成") {
-                        model.clearSelection()
-                        model.isSelectionMode = false
-                    }
-                    .buttonStyle(.borderedProminent)
-                } else {
-                    TextField("搜索壁纸", text: $model.searchText)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 170)
-                    Menu {
-                        Picker("类型", selection: $model.selectedType) {
-                            Text("全部类型").tag(nil as WallpaperType?)
-                            Text("图片").tag(WallpaperType?.some(.image))
-                            Text("视频").tag(WallpaperType?.some(.video))
-                            Text("网页").tag(WallpaperType?.some(.web))
-                        }
-                        Divider()
-                        Picker("状态", selection: $model.statusFilter) {
-                            ForEach(WallpaperStatusFilter.allCases) { filter in
-                                Text(filter.title).tag(filter)
-                            }
-                        }
-                    } label: {
-                        Label("筛选", systemImage: "line.3.horizontal.decrease.circle")
-                    }
-                    .menuStyle(.borderlessButton)
-                    .help("筛选类型和状态")
-                    Menu {
-                        Picker("排序", selection: $model.sortOrder) {
-                            ForEach(WallpaperSortOrder.allCases) { order in
-                                Text(order.title).tag(order)
-                            }
-                        }
-                    } label: {
-                        Label(model.sortOrder.title, systemImage: "arrow.up.arrow.down")
-                    }
-                    .menuStyle(.borderlessButton)
-                    .help("排序")
-                    Picker("视图", selection: $model.layout) {
-                        ForEach(LibraryLayout.allCases) { layout in
-                            Image(systemName: layout.icon).tag(layout)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .accessibilityLabel("视图")
-                    .frame(width: 76)
-                    .help("切换网格或列表")
-                    HStack(spacing: 6) {
-                        Image(systemName: model.showsHiddenWallpapers ? "eye" : "eye.slash")
-                            .foregroundStyle(model.showsHiddenWallpapers ? Color.accentColor : .secondary)
-                            .frame(width: 16)
-                        Toggle("显示隐藏壁纸", isOn: Binding(
-                            get: { model.showsHiddenWallpapers },
-                            set: { model.requestSetShowsHiddenWallpapers($0) }
-                        ))
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                    }
-                    .fixedSize()
-                    .help("隐藏壁纸默认不显示；打开需要密码")
-                    .accessibilityLabel("显示隐藏壁纸")
-                    Button { model.isSelectionMode = true } label: {
-                        Label("批量管理", systemImage: "checklist")
-                    }
-                    .buttonStyle(.borderless)
-                    .fixedSize()
-                    Menu {
-                        Button("导入文件或文件夹") { model.importWallpapers() }
-                        Button("导入网址") { model.isWebURLImportPresented = true }
-                    } label: {
-                        Label("添加壁纸", systemImage: "plus")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    Button(action: { (NSApp.delegate as? AppDelegate)?.showSettingsWindow() }) {
-                        Image(systemName: "gearshape")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("设置")
-                }
-            }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 18)
+            libraryHeader
 
             Divider()
 
@@ -2350,56 +2267,76 @@ private struct LibraryContentView: View {
                     importURLAction: { model.isWebURLImportPresented = true }
                 )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if model.layout == .grid {
-                ScrollView {
-                    LazyVGrid(columns: columns, spacing: 18) {
-                        ForEach(model.visibleWallpapers) { item in
-                            WallpaperCard(
-                                item: item,
-                                isSelected: model.isSelectionMode
-                                    ? model.selectedWallpaperIDs.contains(item.id)
-                                    : item.id == model.selectedWallpaperID,
-                                selectionMode: model.isSelectionMode,
-                                appliedDisplays: model.appliedDisplayNames(for: item)
-                            ) {
-                                if model.isSelectionMode {
-                                    model.toggleSelection(for: item)
-                                } else {
-                                    model.selectedWallpaperID = item.id
-                                }
-                            } favoriteAction: {
-                                model.toggleFavorite(item)
-                            }
-                            .contextMenu {
-                                WallpaperContextMenu(model: model, item: item)
-                            }
-                        }
-                    }
-                    .padding(24)
-                }
             } else {
-                List(model.visibleWallpapers) { item in
-                    WallpaperListRow(
-                        item: item,
-                        isSelected: model.isSelectionMode
-                            ? model.selectedWallpaperIDs.contains(item.id)
-                            : item.id == model.selectedWallpaperID,
-                        selectionMode: model.isSelectionMode,
-                        appliedDisplays: model.appliedDisplayNames(for: item)
-                    ) {
-                        if model.isSelectionMode {
-                            model.toggleSelection(for: item)
+                GeometryReader { proxy in
+                    Group {
+                        if model.layout == .grid {
+                            let layout = WallpaperLibraryPageLayout.grid(
+                                availableWidth: Double(proxy.size.width),
+                                availableHeight: Double(proxy.size.height)
+                            )
+                            ScrollView {
+                                LazyVGrid(
+                                    columns: gridColumns(layout),
+                                    spacing: CGFloat(layout.verticalSpacing)
+                                ) {
+                                    ForEach(model.visibleWallpapers) { item in
+                                        WallpaperCard(
+                                            item: item,
+                                            isSelected: model.isSelectionMode
+                                                ? model.selectedWallpaperIDs.contains(item.id)
+                                                : item.id == model.selectedWallpaperID,
+                                            selectionMode: model.isSelectionMode,
+                                            appliedDisplays: model.appliedDisplayNames(for: item)
+                                        ) {
+                                            if model.isSelectionMode {
+                                                model.toggleSelection(for: item)
+                                            } else {
+                                                model.selectedWallpaperID = item.id
+                                            }
+                                        } favoriteAction: {
+                                            model.toggleFavorite(item)
+                                        }
+                                        .contextMenu {
+                                            WallpaperContextMenu(model: model, item: item)
+                                        }
+                                    }
+                                }
+                                .padding(CGFloat(WallpaperLibraryPageLayout.contentPadding))
+                            }
                         } else {
-                            model.selectedWallpaperID = item.id
+                            List(model.visibleWallpapers) { item in
+                                WallpaperListRow(
+                                    item: item,
+                                    isSelected: model.isSelectionMode
+                                        ? model.selectedWallpaperIDs.contains(item.id)
+                                        : item.id == model.selectedWallpaperID,
+                                    selectionMode: model.isSelectionMode,
+                                    appliedDisplays: model.appliedDisplayNames(for: item)
+                                ) {
+                                    if model.isSelectionMode {
+                                        model.toggleSelection(for: item)
+                                    } else {
+                                        model.selectedWallpaperID = item.id
+                                    }
+                                } favoriteAction: {
+                                    model.toggleFavorite(item)
+                                }
+                                .contextMenu {
+                                    WallpaperContextMenu(model: model, item: item)
+                                }
+                            }
+                            .listStyle(.inset)
                         }
-                    } favoriteAction: {
-                        model.toggleFavorite(item)
                     }
-                    .contextMenu {
-                        WallpaperContextMenu(model: model, item: item)
+                    .onAppear { updatePagination(for: proxy.size) }
+                    .onChange(of: proxy.size) { size in
+                        updatePagination(for: size)
+                    }
+                    .onChange(of: model.layout) { _ in
+                        updatePagination(for: proxy.size)
                     }
                 }
-                .listStyle(.inset)
             }
 
             if !model.filteredWallpapers.isEmpty {
@@ -2429,6 +2366,235 @@ private struct LibraryContentView: View {
             Button("取消", role: .cancel) {}
         } message: {
             Text("应用库副本会被删除；外部文件引用只删除 WallpaperMac 中的记录，不会删除原文件。")
+        }
+    }
+
+    private var libraryHeader: some View {
+        GeometryReader { proxy in
+            let compact = proxy.size.width < 870
+            HStack(spacing: compact ? 8 : 10) {
+                headerTitle(compact: compact)
+                Spacer(minLength: 8)
+                if model.isSelectionMode {
+                    selectionModeControls
+                } else if compact {
+                    compactBrowseControls
+                } else {
+                    fullBrowseControls
+                }
+            }
+            .padding(.horizontal, compact ? 16 : 20)
+            .frame(width: proxy.size.width, height: MainWindowMetrics.libraryHeaderHeight)
+        }
+        .frame(height: MainWindowMetrics.libraryHeaderHeight)
+    }
+
+    private func headerTitle(compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.title2.weight(.semibold))
+                .lineLimit(1)
+            Text(headerSubtitle(compact: compact))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .frame(width: compact ? 120 : 130, alignment: .leading)
+    }
+
+    private func headerSubtitle(compact: Bool) -> String {
+        if model.isSelectionMode {
+            return "已选 \(model.selectedWallpaperIDs.count) / \(model.filteredWallpapers.count) 项"
+        }
+        let page = max(model.totalPageCount, 1)
+        if compact {
+            return "\(model.filteredWallpapers.count) 项 · \(model.currentPage)/\(page) 页"
+        }
+        return "\(model.filteredWallpapers.count) 个资源 · 第 \(model.currentPage) / \(page) 页"
+    }
+
+    @ViewBuilder
+    private var selectionModeControls: some View {
+        Button("全选") { model.selectAllFiltered() }
+            .buttonStyle(.borderless)
+            .lineLimit(1)
+        Button("清空") { model.clearSelection() }
+            .buttonStyle(.borderless)
+            .lineLimit(1)
+        Menu {
+            Button("移出分组") { model.assignSelected(to: nil) }
+            if !model.groups.isEmpty {
+                Divider()
+                ForEach(model.groups) { group in
+                    Button(group.name) { model.assignSelected(to: group.id) }
+                }
+            }
+            Divider()
+            Button("新建分组…") { model.isNewGroupSheetPresented = true }
+        } label: {
+            Label("分组", systemImage: "folder")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        Button("删除", role: .destructive) {
+            showingBatchRemoveConfirmation = true
+        }
+        .buttonStyle(.bordered)
+        .disabled(model.selectedWallpaperIDs.isEmpty)
+        .fixedSize()
+        Button("完成") {
+            model.clearSelection()
+            model.isSelectionMode = false
+        }
+        .buttonStyle(.borderedProminent)
+        .fixedSize()
+    }
+
+    @ViewBuilder
+    private var fullBrowseControls: some View {
+        TextField("搜索壁纸", text: $model.searchText)
+            .textFieldStyle(.roundedBorder)
+            .frame(width: 150)
+        filterMenu { Label("筛选", systemImage: "line.3.horizontal.decrease.circle") }
+        sortMenu { Label(model.sortOrder.title, systemImage: "arrow.up.arrow.down") }
+        layoutPicker
+        hiddenWallpaperToggle
+        Button { model.isSelectionMode = true } label: {
+            Label("批量管理", systemImage: "checklist")
+        }
+        .buttonStyle(.borderless)
+        .fixedSize()
+        Menu {
+            Button("导入文件或文件夹") { model.importWallpapers() }
+            Button("导入网址") { model.isWebURLImportPresented = true }
+        } label: {
+            Label("添加壁纸", systemImage: "plus")
+        }
+        .buttonStyle(.borderedProminent)
+        .fixedSize()
+        settingsButton
+    }
+
+    @ViewBuilder
+    private var compactBrowseControls: some View {
+        TextField("搜索", text: $model.searchText)
+            .textFieldStyle(.roundedBorder)
+            .frame(width: 130)
+        filterMenu { Image(systemName: "line.3.horizontal.decrease.circle") }
+        sortMenu { Image(systemName: "arrow.up.arrow.down") }
+        layoutPicker
+        hiddenWallpaperToggle
+        Button { model.isSelectionMode = true } label: {
+            Image(systemName: "checklist")
+        }
+        .buttonStyle(.borderless)
+        .fixedSize()
+        .help("批量管理")
+        Menu {
+            Button("导入文件或文件夹") { model.importWallpapers() }
+            Button("导入网址") { model.isWebURLImportPresented = true }
+        } label: {
+            Image(systemName: "plus")
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("添加壁纸")
+        settingsButton
+    }
+
+    private func filterMenu<MenuLabel: View>(@ViewBuilder label: () -> MenuLabel) -> some View {
+        Menu {
+            Picker("类型", selection: $model.selectedType) {
+                Text("全部类型").tag(nil as WallpaperType?)
+                Text("图片").tag(WallpaperType?.some(.image))
+                Text("视频").tag(WallpaperType?.some(.video))
+                Text("网页").tag(WallpaperType?.some(.web))
+            }
+            Divider()
+            Picker("状态", selection: $model.statusFilter) {
+                ForEach(WallpaperStatusFilter.allCases) { filter in
+                    Text(filter.title).tag(filter)
+                }
+            }
+        } label: {
+            label()
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("筛选类型和状态")
+    }
+
+    private func sortMenu<MenuLabel: View>(@ViewBuilder label: () -> MenuLabel) -> some View {
+        Menu {
+            Picker("排序", selection: $model.sortOrder) {
+                ForEach(WallpaperSortOrder.allCases) { order in
+                    Text(order.title).tag(order)
+                }
+            }
+        } label: {
+            label()
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("排序：\(model.sortOrder.title)")
+    }
+
+    private var layoutPicker: some View {
+        Picker("视图", selection: $model.layout) {
+            ForEach(LibraryLayout.allCases) { layout in
+                Image(systemName: layout.icon).tag(layout)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .accessibilityLabel("视图")
+        .frame(width: 76)
+        .help("切换网格或列表")
+    }
+
+    private var hiddenWallpaperToggle: some View {
+        HStack(spacing: 6) {
+            Image(systemName: model.showsHiddenWallpapers ? "eye" : "eye.slash")
+                .foregroundStyle(model.showsHiddenWallpapers ? Color.accentColor : .secondary)
+                .frame(width: 16)
+            Toggle("显示隐藏壁纸", isOn: Binding(
+                get: { model.showsHiddenWallpapers },
+                set: { model.requestSetShowsHiddenWallpapers($0) }
+            ))
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+        }
+        .fixedSize()
+        .help("隐藏壁纸默认不显示；打开需要密码")
+        .accessibilityLabel("显示隐藏壁纸")
+    }
+
+    private var settingsButton: some View {
+        Button(action: { (NSApp.delegate as? AppDelegate)?.showSettingsWindow() }) {
+            Image(systemName: "gearshape")
+        }
+        .buttonStyle(.borderless)
+        .fixedSize()
+        .help("设置")
+    }
+
+    private func updatePagination(for size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        switch model.layout {
+        case .grid:
+            let layout = WallpaperLibraryPageLayout.grid(
+                availableWidth: Double(size.width),
+                availableHeight: Double(size.height)
+            )
+            model.updatePaginationPageSize(layout.pageSize)
+        case .list:
+            model.updatePaginationPageSize(
+                WallpaperLibraryPageLayout.listPageSize(availableHeight: Double(size.height))
+            )
         }
     }
 
@@ -2614,7 +2780,7 @@ private struct WallpaperCard: View {
     let favoriteAction: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .topTrailing) {
                 WallpaperPreviewFrame {
                     ThumbnailView(item: item)
@@ -2642,27 +2808,36 @@ private struct WallpaperCard: View {
                 .buttonStyle(.plain)
                 .padding(8)
             }
-            Text(item.name)
-                .font(.callout.weight(.medium))
-                .lineLimit(2)
-            HStack(spacing: 5) {
-                Image(systemName: iconName)
-                Text(typeName)
-                Spacer()
-                if item.isHidden {
-                    Label("已隐藏", systemImage: "eye.slash")
-                        .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(item.name)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(2)
+                HStack(spacing: 5) {
+                    Image(systemName: iconName)
+                    Text(typeName)
+                    Spacer()
+                    if item.isHidden {
+                        Label("已隐藏", systemImage: "eye.slash")
+                            .foregroundStyle(.orange)
+                    }
+                    if item.availability != .available {
+                        Text(availabilityLabel(item.availability)).foregroundStyle(.red)
+                    } else if !appliedDisplays.isEmpty {
+                        Text(appliedDisplays.joined(separator: "、"))
+                            .lineLimit(1)
+                            .foregroundStyle(.green)
+                    }
                 }
-                if item.availability != .available {
-                    Text(availabilityLabel(item.availability)).foregroundStyle(.red)
-                } else if !appliedDisplays.isEmpty {
-                    Text(appliedDisplays.joined(separator: "、"))
-                        .lineLimit(1)
-                        .foregroundStyle(.green)
-                }
+                .font(.caption)
+                .foregroundStyle(item.availability == .missing ? .red : .secondary)
             }
-            .font(.caption)
-            .foregroundStyle(item.availability == .missing ? .red : .secondary)
+            // Reserve a stable text block so every card has the same height
+            // and the dynamic page capacity matches what is actually visible.
+            .frame(
+                height: CGFloat(WallpaperLibraryPageLayout.cardTextHeight),
+                alignment: .topLeading
+            )
+            .padding(.top, CGFloat(WallpaperLibraryPageLayout.cardTextSpacing))
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: selectAction)

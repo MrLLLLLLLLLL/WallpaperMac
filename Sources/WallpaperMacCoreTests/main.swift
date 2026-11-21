@@ -860,6 +860,9 @@ let tests: [(String, () throws -> Void)] = [
     ("removes legacy external playback proxies", testStoreRemovesLegacyExternalPlaybackProxy),
     ("uses landscape 16:9 wallpaper preview layout", testWallpaperPreviewUsesLandscapeSixteenByNineLayout),
     ("uses real 20-item pagination for library and groups", testWallpaperLibraryPaginationUsesSamePageContractForGroups),
+    ("sizes grid pages from the viewport without resizing tiles", testWallpaperLibraryGridPageSizeFitsViewportWithoutResizingTiles),
+    ("sizes list pages from the viewport height", testWallpaperLibraryListPageSizeTracksViewportHeight),
+    ("clamps pagination for tiny viewports", testWallpaperLibraryPageLayoutClampsTinyViewports),
     ("invalidates edited active queue bindings", testDisplayBindingInvalidatesEditedQueue),
     ("migrates legacy display queues", testStoreMigratesLegacyDisplayQueues),
     ("round trips display queue state", testQueueStoreRoundTripsDisplayQueueState),
@@ -1070,6 +1073,41 @@ func testWallpaperLibraryPaginationUsesSamePageContractForGroups() throws {
     try expect(WallpaperLibraryPagination.page(from: items, pageNumber: 6), equals: [101], "last page should contain only the remaining items")
     try expect(WallpaperLibraryPagination.normalizedPage(7, totalCount: items.count), equals: 6, "page selection should clamp to the final page")
     try expect(WallpaperLibraryPagination.normalizedPage(4, totalCount: 20), equals: 1, "deleting items should clamp the current page")
+}
+
+func testWallpaperLibraryGridPageSizeFitsViewportWithoutResizingTiles() throws {
+    let baseline = WallpaperLibraryPageLayout.grid(availableWidth: 880, availableHeight: 700)
+    try expect(baseline.columns, equals: 4, "880pt should fit four fixed 190pt tiles")
+    try expect(baseline.tileWidth, equals: 190, "tile width should stay at the fixed card width")
+    try expect(baseline.rows, equals: 3, "700pt should fit three grid rows")
+    try expect(baseline.pageSize, equals: 12, "grid page should hold columns times rows")
+    try expect(baseline.horizontalSpacing, equals: 24, "leftover width should become equal column spacing")
+
+    let shorter = WallpaperLibraryPageLayout.grid(availableWidth: 880, availableHeight: 500)
+    let taller = WallpaperLibraryPageLayout.grid(availableWidth: 880, availableHeight: 1000)
+    try expect(shorter.tileWidth, equals: baseline.tileWidth, "a shorter viewport must not resize tiles")
+    try expect(taller.tileWidth, equals: baseline.tileWidth, "a taller viewport must not resize tiles")
+    try expect(shorter.pageSize, equals: 8, "a shorter viewport should hold fewer rows")
+    try expect(taller.pageSize, equals: 20, "a taller viewport should hold more rows")
+
+    let wider = WallpaperLibraryPageLayout.grid(availableWidth: 1200, availableHeight: 900)
+    try expect(wider.tileWidth, equals: baseline.tileWidth, "a wider viewport must not resize tiles")
+    try expect(wider.columns, equals: 5, "a wider viewport should add a column")
+    try expect(wider.pageSize, equals: 20, "a wider and taller viewport should hold more wallpapers")
+    try expect(wider.pageSize > baseline.pageSize, "page capacity should grow with the viewport")
+}
+
+func testWallpaperLibraryListPageSizeTracksViewportHeight() throws {
+    try expect(WallpaperLibraryPageLayout.listPageSize(availableHeight: 700), equals: 8, "700pt should fit eight 76pt rows after padding")
+    try expect(WallpaperLibraryPageLayout.listPageSize(availableHeight: 900), equals: 11, "a taller viewport should fit more list rows")
+    let tall = WallpaperLibraryPageLayout.listPageSize(availableHeight: 2000)
+    try expect(tall > 11, "list capacity should keep growing with the viewport")
+}
+
+func testWallpaperLibraryPageLayoutClampsTinyViewports() throws {
+    try expect(WallpaperLibraryPageLayout.grid(availableWidth: 0, availableHeight: 0).pageSize, equals: 1, "an empty viewport should still expose one page slot")
+    try expect(WallpaperLibraryPageLayout.grid(availableWidth: 100, availableHeight: 100).pageSize, equals: 1, "a tiny viewport should expose one page slot")
+    try expect(WallpaperLibraryPageLayout.listPageSize(availableHeight: 0), equals: 1, "an empty list viewport should still expose one page slot")
 }
 
 func testDisplayBindingInvalidatesEditedQueue() throws {

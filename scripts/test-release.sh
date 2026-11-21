@@ -16,6 +16,37 @@ if [[ ! "$VERSION" =~ '^[0-9]+\.[0-9]+\.[0-9]+$' ]]; then
 fi
 ZIP="$ROOT/dist/WallpaperMac-v${VERSION}-macOS.zip"
 
+# Several runtime tests launch the app with a temporary library and persist
+# that path into UserDefaults and Configuration/library-configuration.json.
+# Snapshot both before the suite and restore them on exit so a test failure
+# cannot leave the user's real library path pointing at deleted fixtures.
+STATE_BACKUP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/wallpapermac-release-state.XXXXXX")"
+CONFIG_DIR="$HOME/Library/Application Support/WallpaperMac/Configuration"
+DEFAULTS_BACKUP="$STATE_BACKUP_DIR/defaults.plist"
+CONFIG_EXISTED=0
+if [[ -d "$CONFIG_DIR" ]]; then
+    cp -R "$CONFIG_DIR" "$STATE_BACKUP_DIR/Configuration"
+    CONFIG_EXISTED=1
+fi
+if ! defaults export com.wallpaper.mac "$DEFAULTS_BACKUP" 2>/dev/null; then
+    rm -f "$DEFAULTS_BACKUP"
+fi
+
+restore_app_state() {
+    if [[ -f "$DEFAULTS_BACKUP" ]]; then
+        defaults delete com.wallpaper.mac >/dev/null 2>&1 || true
+        defaults import com.wallpaper.mac "$DEFAULTS_BACKUP" >/dev/null 2>&1 || true
+    fi
+    if (( CONFIG_EXISTED )); then
+        rm -rf "$CONFIG_DIR"
+        cp -R "$STATE_BACKUP_DIR/Configuration" "$CONFIG_DIR"
+    else
+        rm -rf "$CONFIG_DIR"
+    fi
+    rm -rf "$STATE_BACKUP_DIR"
+}
+trap restore_app_state EXIT INT TERM
+
 cd "$ROOT"
 printf '%s\n' '== Web wallpaper template validation =='
 ./scripts/validate-web-wallpaper-template.sh
