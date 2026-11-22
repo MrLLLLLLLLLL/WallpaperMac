@@ -56,3 +56,7 @@ plan.md
 # Update signing private keys (never commit)
 secrets/
 *.update.key
+
+# Private project documentation and development planning (local only)
+/docs/
+/.claude/

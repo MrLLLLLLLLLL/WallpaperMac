@@ -1,6 +1,6 @@
 # 贡献指南
 
-感谢你愿意改进 WallpaperMac。本仓库是一个 macOS 13+ 的 Swift Package：UI 层使用 SwiftUI 与 AppKit，核心数据模型和存储逻辑位于独立的 `WallpaperMacCore` Target。提交前请先熟悉 [README](README.md)、[开发与发布指南](docs/development/build-and-release.md) 和现有发布说明。
+感谢你愿意改进 WallpaperMac。本仓库是一个 macOS 13+ 的 Swift Package：UI 层使用 SwiftUI 与 AppKit，核心数据模型和存储逻辑位于独立的 `WallpaperMacCore` Target。提交前请先熟悉 [README](README.md)、本贡献指南与现有 `CHANGELOG.md`。
 
 本项目采用 [GPL-3.0-or-later](LICENSE)。向本仓库提交代码即表示你确认自己有权提交该内容，并同意该贡献按同一许可证随项目发布。
 
@@ -67,7 +67,7 @@ UI、视频和 `WKWebView` 改动还应手工检查：导入、检查器预览�
 - 每个提交聚焦一个可审查的目的，例如 `fix: 修复队列切换后的播放器释放` 或 `docs: 补充安装说明`。
 - PR 描述应说明用户可见行为、受影响的资源类型、兼容性和实际执行过的验证命令。
 - 不要把 `dist/`、`.build/` 或单纯格式化的无关改动混入功能 PR。
-- 如果改动影响版本行为，请更新 `CHANGELOG.md`，必要时补充 `docs/release-notes/` 条目。
+- 如果改动影响版本行为，请更新 `CHANGELOG.md`，必要时在本地补充发布说明（`docs/release-notes/`，不随仓库发布）。
 
 ## 行为边界
 

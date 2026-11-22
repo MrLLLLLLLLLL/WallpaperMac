@@ -46,7 +46,7 @@ App 内置兼容视频转换工具，用于播放 AV1 等 macOS AVFoundation 不
 └───────────────┴────────────────────────────────────────┴─────────────────────┘
 ```
 
-完整的本地设计规范、页面蓝图和实现契约在 [`docs/design/`](docs/design/README.md) 中维护。界面采用统一的“黄铜接触印相表”视觉语言：石墨背景、黄铜选中信号、衬线标题、等宽数值与细分隔线；主窗口顶部工具栏固定高度，窗口变窄时切换为图标紧凑布局，窗口最小宽度为 1242pt，避免标题换行或控件越界。当前仓库不放置伪造截图或演示素材；首次启动时通过干净的空状态引导导入真实本地资源。
+完整的本地设计规范、页面蓝图和实现契约保存在本地 `docs/design/`（不随仓库发布）。界面采用统一的“黄铜接触印相表”视觉语言：石墨背景、黄铜选中信号、衬线标题、等宽数值与细分隔线；主窗口顶部工具栏固定高度，窗口变窄时切换为图标紧凑布局，窗口最小宽度为 1242pt，避免标题换行或控件越界。当前仓库不放置伪造截图或演示素材；首次启动时通过干净的空状态引导导入真实本地资源。
 
 ## 快速开始
 
@@ -79,7 +79,7 @@ swift run WallpaperMac
 open dist/WallpaperMac.app
 ```
 
-要求：macOS 13+、已安装兼容的 Xcode 或 Command Line Tools。更多步骤见 [构建、验证与发布指南](docs/development/build-and-release.md)。
+要求：macOS 13+、已安装兼容的 Xcode 或 Command Line Tools。更多步骤见本地 `docs/development/build-and-release.md`（不随仓库发布）与 `scripts/` 中的构建脚本。
 
 ## 首次启动与壁纸库
 
@@ -179,7 +179,7 @@ Templates/SimpleWebWallpaper/
 ./scripts/validate-web-wallpaper-template.sh
 ```
 
-参见 [网页壁纸模板导入说明](docs/guides/web-wallpaper-template.md)。
+参见 [网页壁纸模板说明](Templates/SimpleWebWallpaper/README.md)；完整使用指南保存在本地 `docs/guides/`（不随仓库发布）。
 
 ## 开发、测试与发布
 
@@ -228,7 +228,7 @@ WallpaperMac-v<version>-macOS.zip.sig
 WallpaperMac-v<version>-SHA256SUMS.txt
 ```
 
-这些文件是可再生二进制产物，不提交到 Git。版本号来自根目录 [`VERSION`](VERSION)，具体发布内容见 [`CHANGELOG.md`](CHANGELOG.md) 和 [`docs/release-notes/`](docs/release-notes/)。
+这些文件是可再生二进制产物，不提交到 Git。版本号来自根目录 [`VERSION`](VERSION)，具体发布内容见 [`CHANGELOG.md`](CHANGELOG.md)；发布说明与检查清单保存在本地，不随仓库发布。
 
 GitHub Actions 在 macOS runner 上自动验证网页模板、`swift build` 和 `WallpaperMacCoreTests`。与真实桌面会话相关的播放器、状态栏、多显示器、签名、DMG 挂载和内存压力验证仍需在本地 macOS 环境执行。
 
@@ -243,12 +243,6 @@ WallpaperMac/
 │   └── WallpaperMacCoreTests/       # 无 XCTest 依赖的可执行核心回归测试
 ├── Templates/
 │   └── SimpleWebWallpaper/          # 离线网页壁纸导入测试模板
-├── docs/
-│   ├── design/                      # UI 规范、页面蓝图与实现契约
-│   ├── development/                 # 构建、验证与发布流程
-│   ├── guides/                      # 使用与网页壁纸指南
-│   ├── release-notes/               # 版本发布说明
-│   └── superpowers/                 # 历史设计决策与实施计划
 ├── scripts/                         # 构建、打包、运行时与内存回归脚本
 ├── CHANGELOG.md                     # 简明变更记录
 ├── CONTRIBUTING.md                  # 贡献约定
@@ -257,7 +251,7 @@ WallpaperMac/
 └── VERSION                          # 当前版本号
 ```
 
-`dist/`、`.build/`、Finder 元数据、用户壁纸索引、日志以及本地编辑器配置被 `.gitignore` 排除。
+`docs/` 与私人开发规划保存在本地，已通过 `.gitignore` 排除，不随仓库上传；`dist/`、`.build/`、Finder 元数据、用户壁纸索引、日志以及本地编辑器配置同样被排除。
 
 ## 许可证
 
@@ -272,12 +266,10 @@ WallpaperMac 采用 [GNU General Public License v3.0 或更高版本（GPL-3.0-o
 
 ## 文档与支持
 
-- [文档中心](docs/README.md)
-- [快速开始](docs/guides/quick-start.md)
-- [构建、验证与发布](docs/development/build-and-release.md)
-- [设计文档](docs/design/README.md)
 - [贡献指南](CONTRIBUTING.md)
 - [安全政策](SECURITY.md)
 - [更新记录](CHANGELOG.md)
+
+项目设计文档、开发指南、发布说明与私人开发规划保存在本地 `docs/`，已通过 `.gitignore` 排除，不随仓库上传。
 
 遇到问题时，请通过 GitHub Issue 提供 WallpaperMac 版本、macOS 版本、素材类型、导入方式和最小复现步骤。请不要上传私人壁纸、完整用户目录、Cookie、Token、证书或其他敏感信息。
