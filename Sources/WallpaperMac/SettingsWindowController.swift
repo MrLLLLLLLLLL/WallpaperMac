@@ -120,7 +120,7 @@ private struct SettingsView: View {
                 if let launchAtLoginError {
                     Text(launchAtLoginError)
                         .font(.caption)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(AppTheme.Palette.danger)
                 }
             }
             Section("软件更新") {
@@ -147,6 +147,8 @@ private struct SettingsView: View {
         .formStyle(.grouped)
         .padding(20)
         .frame(minWidth: 600, minHeight: 540)
+        .tint(AppTheme.Palette.brass)
+        .background(AppTheme.Palette.canvas)
         }
         .onAppear {
             // Reflect external login-item changes without re-applying them.
@@ -240,7 +242,7 @@ private struct SettingsView: View {
             .padding(8)
             .background(
                 RoundedRectangle(cornerRadius: 6)
-                    .fill(Color.accentColor.opacity(0.08))
+                    .fill(AppTheme.Palette.brass.opacity(0.08))
             )
         case .downloading(let update, let progress):
             VStack(alignment: .leading, spacing: 6) {
@@ -292,7 +294,7 @@ private struct SettingsView: View {
             HStack(alignment: .top) {
                 Text(message)
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(AppTheme.Palette.danger)
                 Spacer()
                 if updateService.canRetryDownload {
                     Button("重试下载") { updateService.retryDownload() }
@@ -326,7 +328,7 @@ private struct SettingsView: View {
         if case .available(let update) = updateService.phase {
             HStack(spacing: 10) {
                 Image(systemName: "arrow.down.circle.fill")
-                    .foregroundStyle(Color.accentColor)
+                    .foregroundStyle(AppTheme.Palette.brass)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("发现新版本 \(update.version)")
                         .font(.headline)
@@ -339,7 +341,7 @@ private struct SettingsView: View {
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 10)
-            .background(Color.accentColor.opacity(0.10))
+            .background(AppTheme.Palette.brass.opacity(0.10))
             Divider()
         }
     }

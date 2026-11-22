@@ -17,26 +17,27 @@ struct QueueManagementView: View {
             HStack(spacing: 0) {
                 queueList
                     .frame(width: 230)
-                Divider()
+                ThemeVerticalHairline()
                 if let queue = selectedQueue {
                     queueDetail(queue)
                 } else {
                     VStack(spacing: 10) {
                         Image(systemName: "list.bullet.rectangle")
-                            .font(.system(size: 34, weight: .light))
-                            .foregroundStyle(.secondary)
+                            .font(.system(size: 30, weight: .light))
+                            .foregroundStyle(AppTheme.Palette.textTertiary)
                         Text("还没有播放队列")
-                            .font(.headline)
+                            .font(AppTheme.Typography.display(18))
+                            .foregroundStyle(AppTheme.Palette.text)
                         Text("创建一个队列后，可以将图片、视频和网页壁纸加入其中。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .font(AppTheme.Typography.caption)
+                            .foregroundStyle(AppTheme.Palette.textSecondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
             .disabled(model.wallpaperManager.isQueuePersistenceBlocked)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(AppTheme.Palette.canvas)
         .onAppear {
             if selectedQueueID == nil {
                 selectedQueueID = model.queueLibrary.first?.id
@@ -67,7 +68,7 @@ struct QueueManagementView: View {
     private func queueLoadWarning(_ error: String) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+                .foregroundStyle(AppTheme.Palette.warning)
             VStack(alignment: .leading, spacing: 3) {
                 Text("播放队列文件无法加载")
                     .font(.headline)
@@ -93,7 +94,7 @@ struct QueueManagementView: View {
     private func queueSaveWarning(_ error: String) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+                .foregroundStyle(AppTheme.Palette.warning)
             VStack(alignment: .leading, spacing: 3) {
                 Text("播放队列保存失败")
                     .font(.headline)
@@ -118,73 +119,99 @@ struct QueueManagementView: View {
 
     private var queueList: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
+            HStack(spacing: 8) {
                 Text("队列库")
-                    .font(.headline)
-                Spacer()
-                Button { model.beginCreateQueue() } label: {
-                    Image(systemName: "plus")
-                }
-                .buttonStyle(.borderless)
-                .help("新建播放队列")
-            }
-            .padding(16)
-            Divider()
-            List(selection: $selectedQueueID) {
-                ForEach(model.queueLibrary) { queue in
-                    HStack(spacing: 9) {
-                        Image(systemName: queue.isDefault ? "star.fill" : "list.bullet.rectangle")
-                            .foregroundStyle(queue.isDefault ? .yellow : .accentColor)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(queue.name)
-                                .lineLimit(1)
-                            Text("\(visibleWallpaperCount(queue)) 项 · \(model.queueKind(queue).title)")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    .tag(queue.id)
-                    .contextMenu {
-                        Button("复制队列") { model.duplicateQueue(queue) }
-                        if !queue.isDefault {
-                            Button("删除队列", role: .destructive) {
-                                queueToDelete = queue
-                                showingDeleteConfirmation = true
-                            }
-                        }
-                    }
+                    .font(AppTheme.Typography.display(18))
+                    .foregroundStyle(AppTheme.Palette.text)
+                Spacer(minLength: 8)
+                ThemeIconButton(systemName: "plus", help: "新建播放队列") {
+                    model.beginCreateQueue()
                 }
             }
-            .listStyle(.sidebar)
+            .padding(.horizontal, 12)
+            .frame(height: MainWindowMetrics.libraryHeaderHeight)
+
+            ThemeHairline()
+
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(model.queueLibrary) { queue in
+                        queueRow(queue)
+                    }
+                }
+                .padding(8)
+            }
         }
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.35))
+        .background(AppTheme.Palette.sidebar)
+    }
+
+    private func queueRow(_ queue: PlaybackQueue) -> some View {
+        let isSelected = selectedQueueID == queue.id
+        return HStack(spacing: 8) {
+            RoundedRectangle(cornerRadius: 1, style: .continuous)
+                .fill(isSelected ? AppTheme.Palette.brass : Color.clear)
+                .frame(width: 2, height: 15)
+            Image(systemName: queue.isDefault ? "star.fill" : "list.bullet.rectangle")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(isSelected ? AppTheme.Palette.brass : AppTheme.Palette.textSecondary)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(queue.name)
+                    .font(.system(size: 12.5, weight: isSelected ? .semibold : .regular))
+                    .foregroundStyle(isSelected ? AppTheme.Palette.text : AppTheme.Palette.textSecondary)
+                    .lineLimit(1)
+                Text("\(visibleWallpaperCount(queue)) 项  \(model.queueKind(queue).title)")
+                    .font(AppTheme.Typography.micro)
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, 4)
+        .padding(.trailing, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill(isSelected ? AppTheme.Palette.brassWash : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { selectedQueueID = queue.id }
+        .contextMenu {
+            Button("复制队列") { model.duplicateQueue(queue) }
+            if !queue.isDefault {
+                Button("删除队列", role: .destructive) {
+                    queueToDelete = queue
+                    showingDeleteConfirmation = true
+                }
+            }
+        }
     }
 
     private func queueDetail(_ queue: PlaybackQueue) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top) {
+            HStack(alignment: .center) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(queue.name)
-                        .font(.title2.weight(.semibold))
-                    Text(queue.isDefault ? "系统默认队列 · 不可删除" : "命名播放队列")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(AppTheme.Typography.display(20))
+                        .foregroundStyle(AppTheme.Palette.text)
+                    Text(queue.isDefault ? "系统默认队列，不可删除" : "命名播放队列")
+                        .font(AppTheme.Typography.caption)
+                        .foregroundStyle(AppTheme.Palette.textSecondary)
                 }
                 Spacer()
                 Button("复制") { model.duplicateQueue(queue) }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(QuietButtonStyle())
                 if !queue.isDefault {
                     Button("删除", role: .destructive) {
                         queueToDelete = queue
                         showingDeleteConfirmation = true
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(QuietButtonStyle(tone: AppTheme.Palette.danger))
                 }
             }
-            .padding(20)
+            .padding(.horizontal, 20)
+            .frame(height: MainWindowMetrics.libraryHeaderHeight)
 
-            Divider()
+            ThemeHairline()
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
@@ -200,7 +227,7 @@ struct QueueManagementView: View {
 
     private func queueRules(_ queue: PlaybackQueue) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("播放规则").font(.headline)
+            ThemeSectionHeader(title: "播放规则")
             HStack {
                 TextField("队列名称", text: Binding(
                     get: { queue.name },
@@ -276,12 +303,12 @@ struct QueueManagementView: View {
             }
         }
         .padding(16)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.42), in: RoundedRectangle(cornerRadius: 12))
+        .themeInsetSurface()
     }
 
     private func displayBindings() -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("显示器队列槽位").font(.headline)
+            ThemeSectionHeader(title: "显示器队列槽位")
             Text("默认模式只使用不含隐藏壁纸的队列；隐藏模式只使用含隐藏壁纸的队列。队列类型变化后请重新指定槽位。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -342,14 +369,14 @@ struct QueueManagementView: View {
                         if !model.queueSlotIsValid(for: display.id, kind: .normal) {
                             Text("默认槽位指向了含隐藏壁纸的队列，请重新指定。")
                                 .font(.caption2)
-                                .foregroundStyle(.orange)
+                                .foregroundStyle(AppTheme.Palette.warning)
                         }
                         if let hiddenID = model.queueSlotID(for: display.id, kind: .hidden),
                            let hiddenQueue = model.wallpaperManager.queue(with: hiddenID),
                            model.queueKind(hiddenQueue) != .hidden {
                             Text("隐藏槽位指向了不含隐藏壁纸的队列，请重新指定。")
                                 .font(.caption2)
-                                .foregroundStyle(.orange)
+                                .foregroundStyle(AppTheme.Palette.warning)
                         }
                     }
                     .padding(.vertical, 5)
@@ -357,7 +384,7 @@ struct QueueManagementView: View {
             }
         }
         .padding(16)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.42), in: RoundedRectangle(cornerRadius: 12))
+        .themeInsetSurface()
     }
 
     private func wallpaperItems(_ queue: PlaybackQueue) -> some View {
@@ -370,16 +397,16 @@ struct QueueManagementView: View {
         }
         return VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("队列内容").font(.headline)
+                ThemeSectionHeader(title: "队列内容")
                 Spacer()
                 Text("\(visibleEntries.count) 项")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(AppTheme.Typography.mono(9.5))
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
             }
             if hasHiddenMembers {
                 Label("队列包含隐藏壁纸，解锁后可编辑成员；播放时会自动跳过。", systemImage: "eye.slash")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(AppTheme.Palette.warning)
             }
             if visibleEntries.isEmpty {
                 Text(hasHiddenMembers ? "当前没有可显示的队列成员。" : "队列为空。可以在壁纸卡片上右键，选择“添加到播放队列”。")
@@ -426,7 +453,7 @@ struct QueueManagementView: View {
                         .padding(.vertical, 4)
                     } else {
                         Text("已删除的壁纸（\(id.uuidString.prefix(8))）")
-                            .foregroundStyle(.red)
+                            .foregroundStyle(AppTheme.Palette.danger)
                     }
                 }
                 .onMove { source, destination in
@@ -438,7 +465,7 @@ struct QueueManagementView: View {
             }
         }
         .padding(16)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.42), in: RoundedRectangle(cornerRadius: 12))
+        .themeInsetSurface()
     }
 
     private func visibleWallpaperCount(_ queue: PlaybackQueue) -> Int {

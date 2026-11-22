@@ -50,7 +50,7 @@ struct HiddenWallpaperAuthSheet: View {
                     .foregroundStyle(.secondary)
                 Text("隐藏只影响应用内显示，不会加密文件；密码无法找回。")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(AppTheme.Palette.warning)
             } else {
                 Text("输入密码后才能显示隐藏壁纸和编辑相关队列。")
                     .font(.callout)
@@ -81,7 +81,7 @@ struct HiddenWallpaperAuthSheet: View {
             if let error = model.hiddenAuthError {
                 Text(error)
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(AppTheme.Palette.danger)
             }
 
             HStack {

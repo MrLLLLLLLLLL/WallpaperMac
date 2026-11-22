@@ -2,6 +2,7 @@
 
 ## 文档
 
+- [视觉语言](./wallpapermac-visual-language.md)
 - [图形化界面设计规范](./wallpapermac-ui-spec.md)
 - [页面蓝图与原型路径](./wallpapermac-page-blueprint.md)
 - [实现接口约定](./wallpapermac-implementation-contract.md)

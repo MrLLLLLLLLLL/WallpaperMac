@@ -4,19 +4,6 @@ import SwiftUI
 import UniformTypeIdentifiers
 import WallpaperMacCore
 
-enum MainWindowMetrics {
-    static let sidebarWidth: CGFloat = 220
-    static let inspectorWidth: CGFloat = 340
-    /// Fixed header height so resizing the window cannot change the toolbar
-    /// height by compressing or wrapping its title.
-    static let libraryHeaderHeight: CGFloat = 76
-    /// Smallest content width that fits the compact library header. The
-    /// window minimum is derived from it so the complete toolbar is visible.
-    static let libraryHeaderMinimumWidth: CGFloat = 680
-    static let minimumWindowWidth =
-        sidebarWidth + inspectorWidth + libraryHeaderMinimumWidth + 2
-}
-
 enum SidebarDestination: Hashable {
     case all
     case images
@@ -1542,6 +1529,8 @@ struct MainView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .tint(AppTheme.Palette.brass)
+        .background(AppTheme.Palette.canvas)
         .sheet(isPresented: $model.isImporting) {
             ImportSheet(model: model)
         }
@@ -1587,7 +1576,7 @@ struct MainView: View {
                     if model.toastMessage != nil {
                         Button("撤销") { model.undoLastAction() }
                             .buttonStyle(.borderless)
-                            .foregroundStyle(Color.accentColor)
+                            .foregroundStyle(AppTheme.Palette.brass)
                     }
                 }
                 .font(.callout)
@@ -1622,14 +1611,14 @@ struct MainView: View {
         HStack(spacing: 0) {
             SidebarView(model: model)
                 .frame(width: MainWindowMetrics.sidebarWidth)
-            Divider()
+            ThemeVerticalHairline()
             LibraryContentView(model: model)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            Divider()
+            ThemeVerticalHairline()
             InspectorView(model: model)
                 .frame(width: MainWindowMetrics.inspectorWidth)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(AppTheme.Palette.canvas)
         .disabled(model.isMigratingLibrary)
         .overlay {
             if model.isMigratingLibrary {
@@ -1688,12 +1677,13 @@ private struct OnboardingView: View {
             VStack(spacing: 18) {
                 Image(systemName: icon)
                     .font(.system(size: 54, weight: .light))
-                    .foregroundStyle(Color.accentColor)
+                    .foregroundStyle(AppTheme.Palette.brass)
                 Text(title)
-                    .font(.system(size: 28, weight: .semibold))
+                    .font(AppTheme.Typography.display(28))
+                    .foregroundStyle(AppTheme.Palette.text)
                 Text(message)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .font(AppTheme.Typography.caption)
+                    .foregroundStyle(AppTheme.Palette.textSecondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 520)
                 content
@@ -1703,11 +1693,12 @@ private struct OnboardingView: View {
             HStack {
                 if step > 0 {
                     Button("上一步") { step -= 1 }
+                        .buttonStyle(QuietButtonStyle())
                 }
                 Spacer()
                 Text("第 \(step + 1) / 4 步")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(AppTheme.Typography.mono(9.5))
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
                 Button(step == 3 ? "完成并进入壁纸库" : "继续") {
                     if step == 3 {
                         NotificationCenter.default.post(name: .wallpaperMacSettingsChanged, object: nil)
@@ -1717,14 +1708,14 @@ private struct OnboardingView: View {
                         step += 1
                     }
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(BrassActionButtonStyle())
             }
             .frame(maxWidth: 700)
             .padding(.horizontal, 36)
             .padding(.bottom, 30)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(AppTheme.Palette.canvas)
         .onAppear { model.prepareLibrary() }
         .onChange(of: launchAtLogin) { enabled in
             do {
@@ -1787,7 +1778,7 @@ private struct OnboardingView: View {
                     .foregroundStyle(.secondary)
             }
             .padding(16)
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+            .themeInsetSurface()
         case 2:
             VStack(alignment: .leading, spacing: 10) {
                 Toggle("登录时启动", isOn: $launchAtLogin)
@@ -1795,7 +1786,7 @@ private struct OnboardingView: View {
                 Toggle("全屏应用时暂停动态壁纸", isOn: $pauseInFullScreen)
             }
             .padding(16)
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+            .themeInsetSurface()
         default:
             let permission = model.libraryPermissionState
             VStack(alignment: .leading, spacing: 10) {
@@ -1804,11 +1795,11 @@ private struct OnboardingView: View {
                 if !permission.writable {
                     Text("请在 Finder 中为所选文件夹授予当前用户读写权限，或在进入主界面后重新选择其他位置。")
                         .font(.caption)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(AppTheme.Palette.warning)
                 }
             }
             .padding(16)
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+            .themeInsetSurface()
         }
     }
 }
@@ -1818,12 +1809,16 @@ private struct OnboardingFeature: View {
     let icon: String
     var body: some View {
         VStack(spacing: 8) {
-            Image(systemName: icon).font(.title2).foregroundStyle(Color.accentColor)
-            Text(title).font(.callout)
+            Image(systemName: icon)
+                .font(.system(size: 18, weight: .light))
+                .foregroundStyle(AppTheme.Palette.brass)
+            Text(title)
+                .font(AppTheme.Typography.body)
+                .foregroundStyle(AppTheme.Palette.text)
         }
         .frame(maxWidth: .infinity)
         .padding(16)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+        .themeInsetSurface()
     }
 }
 
@@ -1833,12 +1828,14 @@ private struct PermissionRow: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: granted ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
-                .foregroundStyle(granted ? .green : .orange)
+                .foregroundStyle(granted ? AppTheme.Palette.applied : AppTheme.Palette.warning)
             Text(title)
+                .font(AppTheme.Typography.body)
+                .foregroundStyle(AppTheme.Palette.text)
             Spacer()
             Text(granted ? "可用" : "待处理")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(AppTheme.Typography.caption)
+                .foregroundStyle(AppTheme.Palette.textTertiary)
         }
     }
 }
@@ -1946,7 +1943,7 @@ private struct QueueEditorView: View {
                     if hasHiddenMembers {
                         Label("队列包含隐藏壁纸，解锁后可编辑成员；播放时会自动跳过。", systemImage: "eye.slash")
                             .font(.caption)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(AppTheme.Palette.warning)
                     }
 
                     if displayedQueueItems.isEmpty {
@@ -2053,6 +2050,7 @@ private struct QueueEditorView: View {
         }
         .padding(24)
         .frame(width: 520, height: 560)
+        .groupBoxStyle(ThemeGroupBoxStyle())
     }
 
     private func moveQueueItems(from offsets: IndexSet, to destination: Int) {
@@ -2110,87 +2108,123 @@ private struct SidebarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("壁纸库")
-                .font(.headline)
-                .padding(.horizontal, 16)
-                .padding(.top, 20)
-                .padding(.bottom, 12)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("壁纸库")
+                    .font(AppTheme.Typography.display(19))
+                    .foregroundStyle(AppTheme.Palette.text)
+                Spacer()
+                Text(verbatim: "\(visibleItems.count)")
+                    .font(AppTheme.Typography.mono(10))
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 18)
+            .padding(.bottom, 14)
+
+            ThemeHairline()
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 3) {
-                    SidebarRow(title: "全部壁纸", icon: "square.grid.2x2", isSelected: model.destination == .all) { model.destination = .all }
-                    SidebarRow(title: "图片", icon: "photo", isSelected: model.destination == .images) { model.destination = .images }
-                    SidebarRow(title: "视频", icon: "film", isSelected: model.destination == .videos) { model.destination = .videos }
-                    SidebarRow(title: "网页", icon: "safari", isSelected: model.destination == .web) { model.destination = .web }
-                    SidebarRow(title: "收藏", icon: "star", isSelected: model.destination == .favorites) { model.destination = .favorites }
+                VStack(alignment: .leading, spacing: 2) {
+                    SidebarRow(title: "全部壁纸", icon: "square.grid.2x2", isSelected: model.destination == .all, trailing: "\(visibleItems.count)") { model.destination = .all }
+                    SidebarRow(title: "图片", icon: "photo", isSelected: model.destination == .images, trailing: "\(count(of: .image))") { model.destination = .images }
+                    SidebarRow(title: "视频", icon: "film", isSelected: model.destination == .videos, trailing: "\(count(of: .video))") { model.destination = .videos }
+                    SidebarRow(title: "网页", icon: "safari", isSelected: model.destination == .web, trailing: "\(count(of: .web))") { model.destination = .web }
+                    SidebarRow(title: "收藏", icon: "star", isSelected: model.destination == .favorites, trailing: "\(visibleItems.filter(\.isFavorite).count)") { model.destination = .favorites }
                     SidebarRow(title: "最近使用", icon: "clock", isSelected: model.destination == .recent) { model.destination = .recent }
-                    SidebarRow(title: "播放队列", icon: "list.bullet.rectangle", isSelected: model.destination == .queueLibrary, subtitle: "\(model.queueLibrary.count) 个队列") { model.destination = .queueLibrary }
+                    SidebarRow(title: "播放队列", icon: "list.bullet.rectangle", isSelected: model.destination == .queueLibrary, trailing: "\(model.queueLibrary.count)") { model.destination = .queueLibrary }
 
-                    HStack {
-                        Text("分组")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                        Spacer()
+                    sectionHeader("分组") {
                         Button { model.isNewGroupSheetPresented = true } label: {
                             Image(systemName: "plus")
+                                .font(.system(size: 10, weight: .semibold))
                         }
                         .buttonStyle(.borderless)
+                        .foregroundStyle(AppTheme.Palette.textSecondary)
                         .help("新建分组")
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.top, 22)
-                    .padding(.bottom, 5)
 
                     ForEach(model.groups) { group in
                         SidebarRow(
                             title: group.name,
                             icon: "folder",
                             isSelected: model.destination == .group(group.id),
-                            subtitle: "\(model.wallpapers.filter { $0.groupID == group.id && model.isWallpaperVisible($0) }.count) 项"
+                            trailing: "\(groupCount(group.id))"
                         ) {
                             model.destination = .group(group.id)
                         }
                     }
 
                     if !model.displayRows.isEmpty {
-                        Text("显示器")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 12)
-                            .padding(.top, 22)
-                            .padding(.bottom, 5)
+                        sectionHeader("显示器")
                         ForEach(model.displayRows) { display in
                             SidebarRow(
                                 title: display.name,
                                 icon: display.isConnected ? "display" : "display.trianglebadge.exclamationmark",
                                 isSelected: model.destination == .display(display.id),
-                                subtitle: display.isConnected ? nil : "已断开"
+                                trailing: display.isConnected ? nil : "断开",
+                                trailingColor: AppTheme.Palette.warning
                             ) {
                                 model.destination = .display(display.id)
                             }
                         }
                     }
                 }
-                .padding(.horizontal, 10)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 10)
             }
-            Spacer(minLength: 12)
-            Divider()
-            HStack {
-                Button(action: { model.chooseLibraryForMigration() }) {
-                    Image(systemName: "folder")
+
+            Spacer(minLength: 8)
+            ThemeHairline()
+            HStack(spacing: 6) {
+                ThemeIconButton(systemName: "folder", help: "迁移壁纸库") {
+                    model.chooseLibraryForMigration()
                 }
-                .buttonStyle(.borderless)
-                .help("迁移壁纸库")
-                Text(model.libraryURL.path)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                Text(model.libraryURL.lastPathComponent)
+                    .font(AppTheme.Typography.caption)
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Spacer()
+                    .help(model.libraryURL.path)
+                Spacer(minLength: 0)
             }
-            .padding(12)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
         }
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.42))
+        .background(AppTheme.Palette.sidebar)
+    }
+
+    private var visibleItems: [WallpaperItem] {
+        model.wallpapers.filter { model.isWallpaperVisible($0) }
+    }
+
+    private func count(of type: WallpaperType) -> Int {
+        visibleItems.filter { $0.type == type }.count
+    }
+
+    private func groupCount(_ groupID: UUID) -> Int {
+        visibleItems.filter { $0.groupID == groupID }.count
+    }
+
+    private func sectionHeader<Accessory: View>(
+        _ title: String,
+        @ViewBuilder accessory: () -> Accessory = { EmptyView() }
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ThemeHairline()
+                .padding(.horizontal, 4)
+                .padding(.top, 14)
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(AppTheme.Typography.section)
+                    .tracking(0.6)
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
+                Spacer(minLength: 0)
+                accessory()
+            }
+            .padding(.horizontal, 8)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
+        }
     }
 }
 
@@ -2198,33 +2232,48 @@ private struct SidebarRow: View {
     let title: String
     let icon: String
     let isSelected: Bool
-    var subtitle: String? = nil
+    var trailing: String? = nil
+    var trailingColor: Color = AppTheme.Palette.textTertiary
     let action: () -> Void
+    @State private var isHovering = false
 
     var body: some View {
         Button(action: action) {
             HStack(spacing: 8) {
+                RoundedRectangle(cornerRadius: 1, style: .continuous)
+                    .fill(isSelected ? AppTheme.Palette.brass : Color.clear)
+                    .frame(width: 2, height: 15)
                 Image(systemName: icon)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(isSelected ? AppTheme.Palette.brass : AppTheme.Palette.textSecondary)
                     .frame(width: 16)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(title).lineLimit(1)
-                    if let subtitle {
-                        Text(subtitle)
-                            .font(.caption2)
-                            .foregroundStyle(isSelected ? .white.opacity(0.8) : .secondary)
-                    }
+                Text(title)
+                    .font(.system(size: 12.5, weight: isSelected ? .semibold : .regular))
+                    .foregroundStyle(isSelected ? AppTheme.Palette.text : AppTheme.Palette.textSecondary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if let trailing {
+                    Text(trailing)
+                        .font(AppTheme.Typography.mono(9.5))
+                        .monospacedDigit()
+                        .foregroundStyle(isSelected ? AppTheme.Palette.brass : trailingColor)
                 }
-                Spacer(minLength: 0)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 10)
+            .padding(.leading, 4)
+            .padding(.trailing, 8)
             .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(
+                        isSelected
+                            ? AppTheme.Palette.brassWash
+                            : (isHovering ? AppTheme.Palette.raised.opacity(0.55) : Color.clear)
+                    )
+            )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .foregroundStyle(isSelected ? Color.white : Color.primary)
-        .background(isSelected ? Color.accentColor.opacity(0.82) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .onHover { isHovering = $0 }
     }
 }
 
@@ -2258,13 +2307,18 @@ private struct LibraryContentView: View {
         VStack(spacing: 0) {
             libraryHeader
 
-            Divider()
+            ThemeHairline()
 
             if model.filteredWallpapers.isEmpty {
                 EmptyLibraryView(
                     hasItems: !model.wallpapers.isEmpty,
                     importAction: { model.importWallpapers() },
-                    importURLAction: { model.isWebURLImportPresented = true }
+                    importURLAction: { model.isWebURLImportPresented = true },
+                    clearFiltersAction: {
+                        model.searchText = ""
+                        model.selectedType = nil
+                        model.statusFilter = .all
+                    }
                 )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -2327,6 +2381,8 @@ private struct LibraryContentView: View {
                                 }
                             }
                             .listStyle(.inset)
+                            .scrollContentBackground(.hidden)
+                            .background(AppTheme.Palette.canvas)
                         }
                     }
                     .onAppear { updatePagination(for: proxy.size) }
@@ -2340,7 +2396,7 @@ private struct LibraryContentView: View {
             }
 
             if !model.filteredWallpapers.isEmpty {
-                Divider()
+                ThemeHairline()
                 paginationBar
             }
         }
@@ -2351,7 +2407,7 @@ private struct LibraryContentView: View {
         .overlay {
             if isDropTargeted {
                 RoundedRectangle(cornerRadius: 12)
-                    .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [8]))
+                    .stroke(AppTheme.Palette.brass, style: StrokeStyle(lineWidth: 2, dash: [8]))
                     .padding(10)
                     .overlay {
                         Text("松开以导入壁纸")
@@ -2392,11 +2448,13 @@ private struct LibraryContentView: View {
     private func headerTitle(compact: Bool) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title)
-                .font(.title2.weight(.semibold))
+                .font(AppTheme.Typography.pageTitle)
+                .foregroundStyle(AppTheme.Palette.text)
                 .lineLimit(1)
             Text(headerSubtitle(compact: compact))
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(AppTheme.Typography.caption)
+                .monospacedDigit()
+                .foregroundStyle(AppTheme.Palette.textSecondary)
                 .lineLimit(1)
         }
         .frame(width: compact ? 120 : 130, alignment: .leading)
@@ -2408,19 +2466,21 @@ private struct LibraryContentView: View {
         }
         let page = max(model.totalPageCount, 1)
         if compact {
-            return "\(model.filteredWallpapers.count) 项 · \(model.currentPage)/\(page) 页"
+            return "\(model.filteredWallpapers.count) 项　\(model.currentPage)/\(page) 页"
         }
-        return "\(model.filteredWallpapers.count) 个资源 · 第 \(model.currentPage) / \(page) 页"
+        return "\(model.filteredWallpapers.count) 个资源　第 \(model.currentPage) / \(page) 页"
     }
 
     @ViewBuilder
     private var selectionModeControls: some View {
         Button("全选") { model.selectAllFiltered() }
             .buttonStyle(.borderless)
-            .lineLimit(1)
+            .font(AppTheme.Typography.caption)
+            .foregroundStyle(AppTheme.Palette.textSecondary)
         Button("清空") { model.clearSelection() }
             .buttonStyle(.borderless)
-            .lineLimit(1)
+            .font(AppTheme.Typography.caption)
+            .foregroundStyle(AppTheme.Palette.textSecondary)
         Menu {
             Button("移出分组") { model.assignSelected(to: nil) }
             if !model.groups.isEmpty {
@@ -2433,74 +2493,103 @@ private struct LibraryContentView: View {
             Button("新建分组…") { model.isNewGroupSheetPresented = true }
         } label: {
             Label("分组", systemImage: "folder")
+                .font(AppTheme.Typography.caption)
         }
         .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
         .fixedSize()
         Button("删除", role: .destructive) {
             showingBatchRemoveConfirmation = true
         }
-        .buttonStyle(.bordered)
+        .buttonStyle(QuietButtonStyle(compact: true))
+        .tint(AppTheme.Palette.danger)
         .disabled(model.selectedWallpaperIDs.isEmpty)
         .fixedSize()
         Button("完成") {
             model.clearSelection()
             model.isSelectionMode = false
         }
-        .buttonStyle(.borderedProminent)
+        .buttonStyle(BrassActionButtonStyle(compact: true))
         .fixedSize()
     }
 
     @ViewBuilder
     private var fullBrowseControls: some View {
-        TextField("搜索壁纸", text: $model.searchText)
-            .textFieldStyle(.roundedBorder)
-            .frame(width: 150)
-        filterMenu { Label("筛选", systemImage: "line.3.horizontal.decrease.circle") }
-        sortMenu { Label(model.sortOrder.title, systemImage: "arrow.up.arrow.down") }
-        layoutPicker
+        ThemeSearchField(placeholder: "搜索壁纸", text: $model.searchText, width: 150)
+        filterMenu {
+            ThemeMenuLabel(title: "筛选", systemImage: "line.3.horizontal.decrease.circle")
+        }
+        sortMenu {
+            ThemeMenuLabel(title: model.sortOrder.title, systemImage: "arrow.up.arrow.down")
+        }
+        ThemeViewModeSwitch(layout: $model.layout)
         hiddenWallpaperToggle
         Button { model.isSelectionMode = true } label: {
             Label("批量管理", systemImage: "checklist")
+                .font(AppTheme.Typography.caption)
         }
         .buttonStyle(.borderless)
+        .foregroundStyle(AppTheme.Palette.textSecondary)
         .fixedSize()
-        Menu {
-            Button("导入文件或文件夹") { model.importWallpapers() }
-            Button("导入网址") { model.isWebURLImportPresented = true }
-        } label: {
-            Label("添加壁纸", systemImage: "plus")
-        }
-        .buttonStyle(.borderedProminent)
-        .fixedSize()
+        addWallpaperMenu(compact: false)
         settingsButton
     }
 
     @ViewBuilder
     private var compactBrowseControls: some View {
-        TextField("搜索", text: $model.searchText)
-            .textFieldStyle(.roundedBorder)
-            .frame(width: 130)
-        filterMenu { Image(systemName: "line.3.horizontal.decrease.circle") }
-        sortMenu { Image(systemName: "arrow.up.arrow.down") }
-        layoutPicker
-        hiddenWallpaperToggle
-        Button { model.isSelectionMode = true } label: {
-            Image(systemName: "checklist")
+        ThemeSearchField(placeholder: "搜索", text: $model.searchText, width: 130)
+        filterMenu {
+            ThemeMenuLabel(title: nil, systemImage: "line.3.horizontal.decrease.circle")
         }
-        .buttonStyle(.borderless)
-        .fixedSize()
-        .help("批量管理")
+        sortMenu {
+            ThemeMenuLabel(title: nil, systemImage: "arrow.up.arrow.down")
+        }
+        ThemeViewModeSwitch(layout: $model.layout)
+        hiddenWallpaperToggle
+        ThemeIconButton(systemName: "checklist", help: "批量管理") {
+            model.isSelectionMode = true
+        }
+        addWallpaperMenu(compact: true)
+        settingsButton
+    }
+
+    private func addWallpaperMenu(compact: Bool) -> some View {
         Menu {
             Button("导入文件或文件夹") { model.importWallpapers() }
             Button("导入网址") { model.isWebURLImportPresented = true }
         } label: {
-            Image(systemName: "plus")
+            if compact {
+                Image(systemName: "plus")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(AppTheme.Palette.canvas)
+                    .frame(width: 24, height: 24)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(AppTheme.Palette.brass)
+                    )
+            } else {
+                HStack(spacing: 5) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("添加壁纸")
+                        .font(.system(size: 12, weight: .semibold))
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 7, weight: .semibold))
+                        .opacity(0.7)
+                }
+                .foregroundStyle(AppTheme.Palette.canvas)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: AppTheme.Metrics.controlCorner, style: .continuous)
+                        .fill(AppTheme.Palette.brass)
+                )
+            }
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
         .help("添加壁纸")
-        settingsButton
     }
 
     private func filterMenu<MenuLabel: View>(@ViewBuilder label: () -> MenuLabel) -> some View {
@@ -2542,23 +2631,10 @@ private struct LibraryContentView: View {
         .help("排序：\(model.sortOrder.title)")
     }
 
-    private var layoutPicker: some View {
-        Picker("视图", selection: $model.layout) {
-            ForEach(LibraryLayout.allCases) { layout in
-                Image(systemName: layout.icon).tag(layout)
-            }
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .accessibilityLabel("视图")
-        .frame(width: 76)
-        .help("切换网格或列表")
-    }
-
     private var hiddenWallpaperToggle: some View {
         HStack(spacing: 6) {
             Image(systemName: model.showsHiddenWallpapers ? "eye" : "eye.slash")
-                .foregroundStyle(model.showsHiddenWallpapers ? Color.accentColor : .secondary)
+                .foregroundStyle(model.showsHiddenWallpapers ? AppTheme.Palette.brass : AppTheme.Palette.textSecondary)
                 .frame(width: 16)
             Toggle("显示隐藏壁纸", isOn: Binding(
                 get: { model.showsHiddenWallpapers },
@@ -2567,6 +2643,7 @@ private struct LibraryContentView: View {
             .labelsHidden()
             .toggleStyle(.switch)
             .controlSize(.mini)
+            .tint(AppTheme.Palette.brass)
         }
         .fixedSize()
         .help("隐藏壁纸默认不显示；打开需要密码")
@@ -2574,12 +2651,9 @@ private struct LibraryContentView: View {
     }
 
     private var settingsButton: some View {
-        Button(action: { (NSApp.delegate as? AppDelegate)?.showSettingsWindow() }) {
-            Image(systemName: "gearshape")
+        ThemeIconButton(systemName: "gearshape", help: "设置") {
+            (NSApp.delegate as? AppDelegate)?.showSettingsWindow()
         }
-        .buttonStyle(.borderless)
-        .fixedSize()
-        .help("设置")
     }
 
     private func updatePagination(for size: CGSize) {
@@ -2601,8 +2675,8 @@ private struct LibraryContentView: View {
     private var paginationBar: some View {
         HStack(spacing: 10) {
             Text("本页 \(model.visibleWallpapers.count) 项")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(AppTheme.Typography.mono(9.5))
+                .foregroundStyle(AppTheme.Palette.textSecondary)
                 .frame(minWidth: 72, alignment: .leading)
 
             Spacer()
@@ -2610,9 +2684,11 @@ private struct LibraryContentView: View {
             Button {
                 model.goToPage(1)
             } label: {
-                Image(systemName: "backward.end.fill")
+                Image(systemName: "backward.end")
+                    .font(.system(size: 9, weight: .semibold))
             }
             .buttonStyle(.borderless)
+            .foregroundStyle(AppTheme.Palette.textSecondary)
             .disabled(model.currentPage <= 1)
             .help("第一页")
 
@@ -2620,8 +2696,10 @@ private struct LibraryContentView: View {
                 model.goToPage(model.currentPage - 1)
             } label: {
                 Image(systemName: "chevron.left")
+                    .font(.system(size: 9, weight: .semibold))
             }
             .buttonStyle(.borderless)
+            .foregroundStyle(AppTheme.Palette.textSecondary)
             .disabled(model.currentPage <= 1)
             .help("上一页")
 
@@ -2637,30 +2715,34 @@ private struct LibraryContentView: View {
                 model.goToPage(model.currentPage + 1)
             } label: {
                 Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
             }
             .buttonStyle(.borderless)
+            .foregroundStyle(AppTheme.Palette.textSecondary)
             .disabled(model.currentPage >= model.totalPageCount)
             .help("下一页")
 
             Button {
                 model.goToPage(model.totalPageCount)
             } label: {
-                Image(systemName: "forward.end.fill")
+                Image(systemName: "forward.end")
+                    .font(.system(size: 9, weight: .semibold))
             }
             .buttonStyle(.borderless)
+            .foregroundStyle(AppTheme.Palette.textSecondary)
             .disabled(model.currentPage >= model.totalPageCount)
             .help("最后一页")
 
             Spacer()
 
             Text("第 \(model.currentPage) / \(model.totalPageCount) 页")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+                .font(AppTheme.Typography.mono(9.5))
+                .foregroundStyle(AppTheme.Palette.textSecondary)
                 .frame(minWidth: 72, alignment: .trailing)
         }
-        .padding(.horizontal, 24)
+        .padding(.horizontal, 20)
         .padding(.vertical, 10)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.24))
+        .background(AppTheme.Palette.panel.opacity(0.7))
     }
 
     private var title: String {
@@ -2686,14 +2768,19 @@ private struct PageNumberButton: View {
     var body: some View {
         Button(action: action) {
             Text("\(page)")
-                .font(.caption.monospacedDigit().weight(isCurrent ? .semibold : .regular))
-                .frame(minWidth: 26, minHeight: 24)
-                .foregroundStyle(isCurrent ? Color.white : Color.primary)
+                .font(AppTheme.Typography.mono(10, weight: isCurrent ? .semibold : .regular))
+                .frame(width: 26, height: 24)
+                .foregroundStyle(isCurrent ? AppTheme.Palette.brass : AppTheme.Palette.textSecondary)
                 .background(
-                    isCurrent
-                        ? Color.accentColor
-                        : Color(nsColor: .controlBackgroundColor),
-                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isCurrent ? AppTheme.Palette.brassWash : Color.clear)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .stroke(
+                            isCurrent ? AppTheme.Palette.brass.opacity(0.45) : Color.clear,
+                            lineWidth: 1
+                        )
                 )
         }
         .buttonStyle(.plain)
@@ -2712,44 +2799,111 @@ private struct WallpaperListRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
+            if isSelected {
+                RoundedRectangle(cornerRadius: 1, style: .continuous)
+                    .fill(AppTheme.Palette.brass)
+                    .frame(width: 2, height: 32)
+            }
             if selectionMode {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .font(.title3)
-                    .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(
+                        isSelected
+                            ? AppTheme.Palette.brass
+                            : AppTheme.Palette.textSecondary
+                    )
             }
             ThumbnailView(item: item)
                 .frame(width: 110, height: 68)
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            VStack(alignment: .leading, spacing: 4) {
-                Text(item.name).font(.callout.weight(.medium)).lineLimit(1)
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .stroke(AppTheme.Palette.hairline, lineWidth: 1)
+                )
+            VStack(alignment: .leading, spacing: 3) {
+                Text(item.name)
+                    .font(AppTheme.Typography.bodyMedium)
+                    .foregroundStyle(AppTheme.Palette.text)
+                    .lineLimit(1)
                 HStack(spacing: 5) {
                     Image(systemName: iconName)
+                        .font(.system(size: 9, weight: .medium))
                     Text(typeName)
-                    if item.availability != .available {
-                        Text(availabilityLabel(item.availability)).foregroundStyle(.red)
-                    }
-                    if !appliedDisplays.isEmpty {
-                        Text(appliedDisplays.joined(separator: "、")).foregroundStyle(.green).lineLimit(1)
-                    }
-                    if item.isHidden {
-                        Label("已隐藏", systemImage: "eye.slash")
-                            .foregroundStyle(.orange)
+                        .font(AppTheme.Typography.micro)
+                    if let detailText {
+                        Text(detailText)
+                            .font(AppTheme.Typography.mono(9))
+                            .foregroundStyle(AppTheme.Palette.textTertiary)
                     }
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(AppTheme.Palette.textSecondary)
+                statusLine
             }
-            Spacer()
+            Spacer(minLength: 8)
             Button(action: favoriteAction) {
                 Image(systemName: item.isFavorite ? "star.fill" : "star")
-                    .foregroundStyle(item.isFavorite ? .yellow : .secondary)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(
+                        item.isFavorite
+                            ? AppTheme.Palette.brass
+                            : AppTheme.Palette.textSecondary
+                    )
+                    .frame(width: 24, height: 24)
             }
             .buttonStyle(.plain)
+            .help(item.isFavorite ? "取消收藏" : "收藏壁纸")
         }
         .padding(.vertical, 4)
+        .padding(.horizontal, 4)
         .contentShape(Rectangle())
-        .background(isSelected ? Color.accentColor.opacity(0.16) : .clear)
+        .background(
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill(isSelected ? AppTheme.Palette.brassWash : Color.clear)
+        )
         .onTapGesture(perform: selectAction)
+    }
+
+    @ViewBuilder
+    private var statusLine: some View {
+        if item.availability != .available {
+            Label(availabilityLabel(item.availability), systemImage: "exclamationmark.triangle.fill")
+                .font(AppTheme.Typography.micro)
+                .foregroundStyle(AppTheme.Palette.danger)
+        } else if item.isHidden {
+            Label("已隐藏", systemImage: "eye.slash")
+                .font(AppTheme.Typography.micro)
+                .foregroundStyle(AppTheme.Palette.warning)
+        } else if !appliedDisplays.isEmpty {
+            HStack(spacing: 4) {
+                ThemeStatusDot(color: AppTheme.Palette.applied, size: 4)
+                Text(appliedDisplays.joined(separator: "、"))
+                    .font(AppTheme.Typography.micro)
+                    .foregroundStyle(AppTheme.Palette.applied)
+                    .lineLimit(1)
+            }
+        } else {
+            Text(sourceLabel)
+                .font(AppTheme.Typography.micro)
+                .foregroundStyle(AppTheme.Palette.textTertiary)
+        }
+    }
+
+    private var detailText: String? {
+        if let width = item.metadata?.pixelWidth,
+           let height = item.metadata?.pixelHeight,
+           width > 0, height > 0 {
+            return "\(width)×\(height)"
+        }
+        if let fileExtension = item.metadata?.fileExtension, !fileExtension.isEmpty {
+            return fileExtension.uppercased()
+        }
+        return nil
+    }
+
+    private var sourceLabel: String {
+        if !item.sourceURL.isFileURL { return "远程网址" }
+        if item.entryURL != nil { return "HTML 项目" }
+        return item.storageMode == .managedCopy ? "应用库副本" : "外部引用"
     }
 
     private var iconName: String {
@@ -2778,6 +2932,7 @@ private struct WallpaperCard: View {
     let appliedDisplays: [String]
     let selectAction: () -> Void
     let favoriteAction: () -> Void
+    @State private var isHovering = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -2785,51 +2940,60 @@ private struct WallpaperCard: View {
                 WallpaperPreviewFrame {
                     ThumbnailView(item: item)
                 }
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(isSelected ? Color.accentColor : .clear, lineWidth: 2)
-                }
-                    .overlay(alignment: .topLeading) {
-                        if selectionMode {
-                            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                                .font(.title2)
-                                .foregroundStyle(isSelected ? Color.accentColor : .white)
-                                .padding(10)
-                                .shadow(radius: 2)
-                        }
+                .clipShape(RoundedRectangle(cornerRadius: AppTheme.Metrics.cardCorner, style: .continuous))
+                .themeCardBorder(isSelected: isSelected, isHovering: isHovering)
+                .overlay(alignment: .topLeading) {
+                    if selectionMode {
+                        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(
+                                isSelected
+                                    ? AppTheme.Palette.brass
+                                    : AppTheme.Palette.text.opacity(0.85)
+                            )
+                            .background(
+                                Circle()
+                                    .fill(AppTheme.Palette.canvas.opacity(0.7))
+                                    .frame(width: 20, height: 20)
+                            )
+                            .padding(8)
                     }
+                }
                 Button(action: favoriteAction) {
                     Image(systemName: item.isFavorite ? "star.fill" : "star")
-                        .foregroundStyle(item.isFavorite ? .yellow : .white)
-                        .padding(8)
-                        .background(.black.opacity(0.42), in: Circle())
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(
+                            item.isFavorite
+                                ? AppTheme.Palette.brass
+                                : AppTheme.Palette.textSecondary
+                        )
+                        .frame(width: 22, height: 22)
+                        .background(Circle().fill(AppTheme.Palette.canvas.opacity(0.72)))
+                        .overlay(Circle().stroke(AppTheme.Palette.hairline, lineWidth: 0.5))
                 }
                 .buttonStyle(.plain)
                 .padding(8)
             }
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(item.name)
-                    .font(.callout.weight(.medium))
-                    .lineLimit(2)
-                HStack(spacing: 5) {
+                    .font(AppTheme.Typography.bodyMedium)
+                    .foregroundStyle(AppTheme.Palette.text)
+                    .lineLimit(1)
+                HStack(spacing: 4) {
                     Image(systemName: iconName)
+                        .font(.system(size: 9, weight: .medium))
                     Text(typeName)
-                    Spacer()
-                    if item.isHidden {
-                        Label("已隐藏", systemImage: "eye.slash")
-                            .foregroundStyle(.orange)
-                    }
-                    if item.availability != .available {
-                        Text(availabilityLabel(item.availability)).foregroundStyle(.red)
-                    } else if !appliedDisplays.isEmpty {
-                        Text(appliedDisplays.joined(separator: "、"))
+                        .font(AppTheme.Typography.micro)
+                    Spacer(minLength: 4)
+                    if let detailText {
+                        Text(detailText)
+                            .font(AppTheme.Typography.mono(9))
+                            .foregroundStyle(AppTheme.Palette.textTertiary)
                             .lineLimit(1)
-                            .foregroundStyle(.green)
                     }
                 }
-                .font(.caption)
-                .foregroundStyle(item.availability == .missing ? .red : .secondary)
+                .foregroundStyle(AppTheme.Palette.textSecondary)
+                statusLine
             }
             // Reserve a stable text block so every card has the same height
             // and the dynamic page capacity matches what is actually visible.
@@ -2841,6 +3005,46 @@ private struct WallpaperCard: View {
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: selectAction)
+        .onHover { isHovering = $0 }
+    }
+
+    @ViewBuilder
+    private var statusLine: some View {
+        if item.availability != .available {
+            Label(availabilityLabel(item.availability), systemImage: "exclamationmark.triangle.fill")
+                .font(AppTheme.Typography.micro)
+                .foregroundStyle(AppTheme.Palette.danger)
+                .lineLimit(1)
+        } else if item.isHidden {
+            Label("已隐藏", systemImage: "eye.slash")
+                .font(AppTheme.Typography.micro)
+                .foregroundStyle(AppTheme.Palette.warning)
+        } else if !appliedDisplays.isEmpty {
+            HStack(spacing: 4) {
+                ThemeStatusDot(color: AppTheme.Palette.applied, size: 4)
+                Text(appliedDisplays.joined(separator: "、"))
+                    .font(AppTheme.Typography.micro)
+                    .foregroundStyle(AppTheme.Palette.applied)
+                    .lineLimit(1)
+            }
+        } else {
+            EmptyView()
+        }
+    }
+
+    private var detailText: String? {
+        if let width = item.metadata?.pixelWidth,
+           let height = item.metadata?.pixelHeight,
+           width > 0, height > 0 {
+            return "\(width)×\(height)"
+        }
+        if let fileExtension = item.metadata?.fileExtension, !fileExtension.isEmpty {
+            return fileExtension.uppercased()
+        }
+        switch item.type {
+        case .web: return item.sourceURL.isFileURL ? "HTML" : "URL"
+        default: return nil
+        }
     }
 
     private func availabilityLabel(_ availability: WallpaperAvailability) -> String {
@@ -2901,17 +3105,17 @@ private struct ThumbnailView: View {
                 }
             } else {
                 LinearGradient(
-                    colors: [Color(nsColor: .controlBackgroundColor), Color(nsColor: .underPageBackgroundColor)],
+                    colors: [AppTheme.Palette.raised, AppTheme.Palette.panel],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )
                 Image(systemName: iconName)
                     .font(.system(size: 30, weight: .light))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
                 if item.type != .image {
                     Text(item.type == .video ? "视频" : (item.sourceURL.isFileURL ? "HTML" : "URL"))
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                        .font(AppTheme.Typography.caption)
+                        .foregroundStyle(AppTheme.Palette.textTertiary)
                         .padding(.top, 58)
                 }
             }
@@ -3047,11 +3251,11 @@ private struct ImportSheet: View {
                             } else if type == nil {
                                 Text("不支持")
                                     .font(.caption)
-                                    .foregroundStyle(.red)
+                                    .foregroundStyle(AppTheme.Palette.danger)
                             } else {
                                 Text("待导入")
                                     .font(.caption)
-                                    .foregroundStyle(.green)
+                                    .foregroundStyle(AppTheme.Palette.applied)
                             }
                         }
                     }
@@ -3107,6 +3311,7 @@ private struct ImportSheet: View {
         }
         .padding(24)
         .frame(width: 560)
+        .groupBoxStyle(ThemeGroupBoxStyle())
         .onAppear {
             selectedStorageMode = model.storageMode
             selectedEntry = candidates.first(where: { $0.lastPathComponent.lowercased() == "index.html" }) ?? candidates.first
@@ -3148,27 +3353,65 @@ private struct EmptyLibraryView: View {
     let hasItems: Bool
     let importAction: () -> Void
     let importURLAction: () -> Void
+    var clearFiltersAction: (() -> Void)? = nil
 
     var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: hasItems ? "magnifyingglass" : "photo.on.rectangle.angled")
-                .font(.system(size: 42, weight: .light))
-                .foregroundStyle(.secondary)
-            Text(hasItems ? "没有匹配的壁纸" : "壁纸库还是空的")
-                .font(.title3.weight(.semibold))
-            Text(hasItems ? "尝试修改搜索条件或筛选器" : "拖入图片、视频或本地 HTML 项目，开始创建你的壁纸库")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+        VStack(spacing: 18) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(
+                        AppTheme.Palette.hairline,
+                        style: StrokeStyle(lineWidth: 1, dash: [5, 4])
+                    )
+                    .frame(width: 250, height: 140)
+                Image(systemName: hasItems ? "magnifyingglass" : "plus")
+                    .font(.system(size: 24, weight: .light))
+                    .foregroundStyle(
+                        hasItems
+                            ? AppTheme.Palette.textTertiary
+                            : AppTheme.Palette.brass
+                    )
+            }
+            VStack(spacing: 6) {
+                Text(hasItems ? "没有匹配的壁纸" : "壁纸库还是空的")
+                    .font(AppTheme.Typography.display(21))
+                    .foregroundStyle(AppTheme.Palette.text)
+                Text(hasItems
+                     ? "尝试修改搜索条件或筛选器"
+                     : "拖入图片、视频或本地 HTML 项目，开始创建你的壁纸库")
+                    .font(AppTheme.Typography.caption)
+                    .foregroundStyle(AppTheme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 360)
+            }
             if !hasItems {
                 Menu {
                     Button("导入文件或文件夹", action: importAction)
                     Button("导入网址", action: importURLAction)
                 } label: {
-                    Label("添加第一张壁纸", systemImage: "plus")
+                    HStack(spacing: 6) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("添加第一张壁纸")
+                            .font(.system(size: 12, weight: .semibold))
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 7, weight: .semibold))
+                            .opacity(0.7)
+                    }
+                    .foregroundStyle(AppTheme.Palette.canvas)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(
+                        RoundedRectangle(cornerRadius: AppTheme.Metrics.controlCorner, style: .continuous)
+                            .fill(AppTheme.Palette.brass)
+                    )
                 }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+            } else if let clearFiltersAction {
+                Button("清除筛选", action: clearFiltersAction)
+                    .buttonStyle(QuietButtonStyle())
             }
         }
         .padding(40)
@@ -3181,219 +3424,56 @@ private struct InspectorView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("检查器")
-                .font(.headline)
-                .padding(.horizontal, 20)
-                .padding(.top, 20)
-                .padding(.bottom, 16)
-            Divider()
+            HStack(alignment: .center, spacing: 8) {
+                Text("检查器")
+                    .font(AppTheme.Typography.display(18))
+                    .foregroundStyle(AppTheme.Palette.text)
+                Spacer(minLength: 8)
+                if let item = model.selectedWallpaper {
+                    Button {
+                        model.toggleFavorite(item)
+                    } label: {
+                        Image(systemName: item.isFavorite ? "star.fill" : "star")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(
+                                item.isFavorite
+                                    ? AppTheme.Palette.brass
+                                    : AppTheme.Palette.textSecondary
+                            )
+                            .frame(width: 24, height: 24)
+                            .background(
+                                Circle()
+                                    .fill(item.isFavorite ? AppTheme.Palette.brassWash : Color.clear)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .help(item.isFavorite ? "取消收藏" : "收藏壁纸")
+                }
+            }
+            .padding(.horizontal, 16)
+            .frame(height: MainWindowMetrics.libraryHeaderHeight)
+            ThemeHairline()
+
             if let item = model.selectedWallpaper {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        WallpaperPreviewFrame {
-                            ThumbnailView(item: item)
-                        }
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(item.name).font(.title3.weight(.semibold))
-                            Text(typeName(for: item)).font(.caption).foregroundStyle(.secondary)
-                        }
-                        if item.type == .image || item.type == .video {
-                            GroupBox("适配方式") {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Picker("此壁纸", selection: Binding<WallpaperFitMode?>(
-                                        get: { item.fitModeOverride },
-                                        set: { model.setFitModeOverride($0, for: item) }
-                                    )) {
-                                        Text("跟随全局（\(model.playbackPolicy.fitMode.title)）").tag(nil as WallpaperFitMode?)
-                                        ForEach(WallpaperFitMode.allCases, id: \.self) { mode in
-                                            Text(mode.title).tag(Optional(mode))
-                                        }
-                                    }
-                                    .pickerStyle(.menu)
-                                    Text(item.fitModeOverride == nil ? "当前跟随全局：\(model.playbackPolicy.fitMode.title)。" : "当前使用此壁纸独立的适配方式，不受全局设置影响。")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .padding(.vertical, 4)
-                            }
-                        }
-                        GroupBox("显示器") {
-                            VStack(alignment: .leading, spacing: 8) {
-                                ForEach(model.displayRows) { row in
-                                    HStack(spacing: 8) {
-                                        Image(systemName: row.isConnected ? "display" : "display.trianglebadge.exclamationmark")
-                                            .foregroundStyle(row.isConnected ? Color.primary : Color.orange)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(row.name).font(.callout)
-                                            Text(status(for: row, item: item))
-                                                .font(.caption)
-                                                .foregroundStyle(statusColor(for: row, item: item))
-                                            if let queue = model.wallpaperManager.queue(for: row.id), !queue.wallpaperIDs.isEmpty {
-                                                Text(queue.isEnabled
-                                                     ? "队列播放中 · \(queue.wallpaperIDs.count) 项"
-                                                     : "队列已配置 · \(queue.wallpaperIDs.count) 项")
-                                                    .font(.caption2)
-                                                    .foregroundStyle(queue.isEnabled ? .green : .secondary)
-                                                Text("每 \(Int(queue.normalizedIntervalSeconds)) 秒 · \(queue.transition.title)")
-                                                    .font(.caption2)
-                                                    .foregroundStyle(.secondary)
-                                            }
-                                        }
-                                        Spacer(minLength: 4)
-                                        if row.isConnected,
-                                           let display = model.displayService.displays.first(where: { $0.id == row.id }) {
-                                            VStack(alignment: .trailing, spacing: 5) {
-                                                HStack(spacing: 5) {
-                                                    Button(model.wallpaperManager.appliedWallpaperIDs[display.id] == item.id ? "已应用" : "应用") {
-                                                        model.apply(item: item, to: display)
-                                                    }
-                                                    .buttonStyle(.borderedProminent)
-                                                    .controlSize(.small)
-                                                    .disabled(item.availability != .available || model.wallpaperManager.appliedWallpaperIDs[display.id] == item.id)
-                                                    Button("配置队列") {
-                                                        model.openQueueEditor(for: display.id)
-                                                    }
-                                                    .buttonStyle(.bordered)
-                                                    .controlSize(.small)
-                                                }
-                                            }
-                                        } else {
-                                            Text("已断开")
-                                                .font(.caption)
-                                                .foregroundStyle(.orange)
-                                        }
-                                    }
-                                }
-                            }
-                            .padding(.vertical, 3)
-                        }
+                    VStack(alignment: .leading, spacing: 20) {
+                        preview(for: item)
+                        titleBlock(for: item)
+                        displaySection(for: item)
                         if item.type != .image {
-                            GroupBox("播放") {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    HStack(spacing: 8) {
-                                        Button {
-                                            model.togglePlayback(for: item)
-                                        } label: {
-                                            Label(model.isPlaying(item) ? "暂停" : "播放", systemImage: model.isPlaying(item) ? "pause.fill" : "play.fill")
-                                        }
-                                        .buttonStyle(.borderedProminent)
-                                        .controlSize(.small)
-                                        .disabled(model.playbackDisplayIDs(for: item).isEmpty)
-
-                                        Button {
-                                            model.setMuted(!model.isMuted(item), for: item)
-                                        } label: {
-                                            Label(model.isMuted(item) ? "取消静音" : "静音", systemImage: model.isMuted(item) ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                                        }
-                                        .buttonStyle(.bordered)
-                                        .controlSize(.small)
-                                        .disabled(model.playbackDisplayIDs(for: item).isEmpty)
-
-                                        Button {
-                                            model.reloadPlayback(for: item)
-                                        } label: {
-                                            Label("重新加载", systemImage: "arrow.clockwise")
-                                        }
-                                        .buttonStyle(.bordered)
-                                        .controlSize(.small)
-                                        .disabled(model.playbackDisplayIDs(for: item).isEmpty)
-                                    }
-                                    Text(model.playbackDisplayIDs(for: item).isEmpty ? "尚未应用到显示器" : (model.isMuted(item) ? "当前静音" : "当前有声"))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .padding(.vertical, 4)
-                            }
+                            playbackSection(for: item)
                         }
-                        GroupBox("资源信息") {
-                            VStack(alignment: .leading, spacing: 9) {
-                                InspectorRow(
-                                    title: "存储模式",
-                                    value: item.sourceURL.isFileURL
-                                        ? (item.storageMode == .managedCopy ? "应用库副本" : "外部文件引用")
-                                        : "远程网址"
-                                )
-                                InspectorRow(
-                                    title: "状态",
-                                    value: !item.sourceURL.isFileURL && item.availability == .available
-                                        ? "网址已保存，联网时加载"
-                                        : availabilityLabel(item.availability)
-                                )
-                                InspectorRow(
-                                    title: "文件格式",
-                                    value: item.sourceURL.isFileURL
-                                        ? metadataValue(item.metadata?.fileExtension?.uppercased(), fallback: "正在读取…")
-                                        : "远程网页"
-                                )
-                                InspectorRow(
-                                    title: "文件大小",
-                                    value: item.sourceURL.isFileURL ? fileSizeText(item.metadata?.fileSizeBytes) : "不适用"
-                                )
-                                if item.type == .image || item.type == .video {
-                                    InspectorRow(title: "分辨率", value: resolutionText(item.metadata))
-                                }
-                                if item.type == .video {
-                                    InspectorRow(title: "时长", value: durationText(item.metadata?.durationSeconds))
-                                }
-                                InspectorRow(
-                                    title: "可见性",
-                                    value: item.isHidden ? "已隐藏" : "正常"
-                                )
-                                InspectorRow(
-                                    title: item.sourceURL.isFileURL ? "路径" : "网址",
-                                    value: item.sourceURL.isFileURL ? item.sourceURL.path : item.sourceURL.absoluteString
-                                )
-                                if let entryURL = item.entryURL {
-                                    InspectorRow(
-                                        title: entryURL.isFileURL ? "入口文件" : "网页地址",
-                                        value: entryURL.isFileURL ? entryURL.path : entryURL.absoluteString
-                                    )
-                                }
-                                if item.availability != .available {
-                                    Text(availabilityExplanation(item.availability))
-                                        .font(.caption)
-                                        .foregroundStyle(.red)
-                                    HStack {
-                                        Button("重新定位") { model.relocate(item: item) }
-                                            .buttonStyle(.borderedProminent)
-                                        Button("重新扫描") { model.refreshAvailability(for: item) }
-                                            .buttonStyle(.bordered)
-                                    }
-                                }
-                                HStack {
-                                    Button(item.isHidden ? "取消隐藏壁纸" : "隐藏壁纸") {
-                                        model.setHidden(!item.isHidden, for: [item.id])
-                                    }
-                                    .buttonStyle(.bordered)
-                                    Spacer()
-                                    Button("移除记录", role: .destructive) {
-                                        showingRemoveConfirmation = true
-                                    }
-                                    .buttonStyle(.bordered)
-                                }
-                            }
-                            .padding(.vertical, 3)
-                        }
+                        fitSection(for: item)
+                        resourceSection(for: item)
+                        actionSection(for: item)
                     }
-                    .padding(20)
+                    .padding(16)
                 }
             } else {
-                VStack(spacing: 12) {
-                    Image(systemName: "cursorarrow.click")
-                        .font(.system(size: 28, weight: .light))
-                        .foregroundStyle(.secondary)
-                    Text("选择一个壁纸").font(.callout.weight(.medium))
-                    Text("预览、分配显示器并查看资源信息")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(20)
+                emptyState
             }
         }
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.28))
+        .background(AppTheme.Palette.panel)
         .confirmationDialog("移除壁纸记录？", isPresented: $showingRemoveConfirmation, titleVisibility: .visible) {
             if let item = model.selectedWallpaper {
                 Button("移除记录", role: .destructive) {
@@ -3408,6 +3488,353 @@ private struct InspectorView: View {
                      : "这只会删除壁纸记录，不会删除原文件。")
             }
         }
+    }
+
+    private func preview(for item: WallpaperItem) -> some View {
+        WallpaperPreviewFrame {
+            ThumbnailView(item: item)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: AppTheme.Metrics.cardCorner, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: AppTheme.Metrics.cardCorner, style: .continuous)
+                .stroke(AppTheme.Palette.hairline, lineWidth: 1)
+        )
+    }
+
+    private func titleBlock(for item: WallpaperItem) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(item.name)
+                .font(AppTheme.Typography.inspectorTitle)
+                .foregroundStyle(AppTheme.Palette.text)
+                .lineLimit(2)
+            HStack(spacing: 6) {
+                Image(systemName: iconName(for: item))
+                    .font(.system(size: 9, weight: .medium))
+                Text(typeName(for: item))
+                    .font(AppTheme.Typography.caption)
+                Spacer(minLength: 8)
+                if let badge = resolutionBadge(for: item) {
+                    Text(badge)
+                        .font(AppTheme.Typography.mono(9.5))
+                        .foregroundStyle(AppTheme.Palette.textTertiary)
+                }
+            }
+            .foregroundStyle(AppTheme.Palette.textSecondary)
+        }
+    }
+
+    private func displaySection(for item: WallpaperItem) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ThemeSectionHeader(title: "显示器")
+            VStack(spacing: 0) {
+                ForEach(model.displayRows) { row in
+                    displayRow(row, item: item)
+                    if row.id != model.displayRows.last?.id {
+                        ThemeHairline()
+                            .padding(.leading, 10)
+                    }
+                }
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(AppTheme.Palette.raised.opacity(0.45))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(AppTheme.Palette.hairline, lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+    }
+
+    private func displayRow(_ row: DisplayRow, item: WallpaperItem) -> some View {
+        let applied = model.wallpaperManager.appliedWallpaperIDs[row.id] == item.id
+        return HStack(alignment: .center, spacing: 10) {
+            Image(systemName: row.isConnected ? "display" : "display.trianglebadge.exclamationmark")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(row.isConnected ? AppTheme.Palette.textSecondary : AppTheme.Palette.warning)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(row.name)
+                        .font(AppTheme.Typography.bodyMedium)
+                        .foregroundStyle(AppTheme.Palette.text)
+                        .lineLimit(1)
+                    if row.isConnected && applied {
+                        ThemeStatusDot(color: AppTheme.Palette.applied, size: 4)
+                        Text("当前壁纸")
+                            .font(AppTheme.Typography.micro)
+                            .foregroundStyle(AppTheme.Palette.applied)
+                    }
+                }
+                Text(row.isConnected ? (applied ? "已应用" : "未应用") : "已断开，保留原分配")
+                    .font(AppTheme.Typography.micro)
+                    .foregroundStyle(row.isConnected ? AppTheme.Palette.textTertiary : AppTheme.Palette.warning)
+                if let queue = model.wallpaperManager.queue(for: row.id), !queue.wallpaperIDs.isEmpty {
+                    HStack(spacing: 8) {
+                        Text(queue.isEnabled ? "队列播放中" : "队列已配置")
+                            .font(AppTheme.Typography.micro)
+                            .foregroundStyle(queue.isEnabled ? AppTheme.Palette.applied : AppTheme.Palette.textTertiary)
+                        Text("\(queue.wallpaperIDs.count) 项")
+                            .font(AppTheme.Typography.mono(8.5))
+                            .foregroundStyle(AppTheme.Palette.textTertiary)
+                        Text("\(Int(queue.normalizedIntervalSeconds)) 秒")
+                            .font(AppTheme.Typography.mono(8.5))
+                            .foregroundStyle(AppTheme.Palette.textTertiary)
+                        Text(queue.transition.title)
+                            .font(AppTheme.Typography.micro)
+                            .foregroundStyle(AppTheme.Palette.textTertiary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+            Spacer(minLength: 4)
+            if row.isConnected,
+               let display = model.displayService.displays.first(where: { $0.id == row.id }) {
+                VStack(alignment: .trailing, spacing: 5) {
+                    Button(applied ? "已应用" : "应用") {
+                        model.apply(item: item, to: display)
+                    }
+                    .buttonStyle(BrassActionButtonStyle(compact: true))
+                    .disabled(item.availability != .available || applied)
+                    Button("队列") {
+                        model.openQueueEditor(for: display.id)
+                    }
+                    .buttonStyle(QuietButtonStyle(compact: true))
+                }
+            } else {
+                Text("已断开")
+                    .font(AppTheme.Typography.caption)
+                    .foregroundStyle(AppTheme.Palette.warning)
+            }
+        }
+        .padding(10)
+    }
+
+    private func playbackSection(for item: WallpaperItem) -> some View {
+        let hasDisplay = !model.playbackDisplayIDs(for: item).isEmpty
+        return VStack(alignment: .leading, spacing: 8) {
+            ThemeSectionHeader(title: "播放")
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Button {
+                        model.togglePlayback(for: item)
+                    } label: {
+                        Label(model.isPlaying(item) ? "暂停" : "播放", systemImage: model.isPlaying(item) ? "pause.fill" : "play.fill")
+                    }
+                    .buttonStyle(BrassActionButtonStyle(compact: true))
+                    .disabled(!hasDisplay)
+
+                    Button {
+                        model.setMuted(!model.isMuted(item), for: item)
+                    } label: {
+                        Label(model.isMuted(item) ? "取消静音" : "静音", systemImage: model.isMuted(item) ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    }
+                    .buttonStyle(QuietButtonStyle(compact: true))
+                    .disabled(!hasDisplay)
+
+                    Button {
+                        model.reloadPlayback(for: item)
+                    } label: {
+                        Label("重新加载", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(QuietButtonStyle(compact: true))
+                    .disabled(!hasDisplay)
+                    Spacer(minLength: 0)
+                }
+                Text(hasDisplay ? (model.isMuted(item) ? "当前静音" : "当前有声") : "尚未应用到显示器")
+                    .font(AppTheme.Typography.caption)
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
+            }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(AppTheme.Palette.raised.opacity(0.45))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(AppTheme.Palette.hairline, lineWidth: 1)
+            )
+        }
+    }
+
+    private func fitSection(for item: WallpaperItem) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ThemeSectionHeader(title: "适配方式")
+            HStack(spacing: 8) {
+                Picker("适配方式", selection: Binding<WallpaperFitMode?>(
+                    get: { item.fitModeOverride },
+                    set: { model.setFitModeOverride($0, for: item) }
+                )) {
+                    Text("跟随全局（\(model.playbackPolicy.fitMode.title)）").tag(nil as WallpaperFitMode?)
+                    ForEach(WallpaperFitMode.allCases, id: \.self) { mode in
+                        Text(mode.title).tag(Optional(mode))
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .tint(AppTheme.Palette.brass)
+                .fixedSize()
+                Spacer(minLength: 0)
+                Text(item.fitModeOverride == nil ? "跟随全局" : "仅此壁纸")
+                    .font(AppTheme.Typography.caption)
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
+            }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(AppTheme.Palette.raised.opacity(0.45))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(AppTheme.Palette.hairline, lineWidth: 1)
+            )
+        }
+    }
+
+    private func resourceSection(for item: WallpaperItem) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ThemeSectionHeader(title: "资源")
+            VStack(spacing: 0) {
+                ledgerRow("存储模式", value: storageModeText(for: item))
+                ThemeHairline()
+                ledgerRow("状态", value: availabilityText(for: item))
+                ThemeHairline()
+                ledgerRow("格式", value: formatText(for: item))
+                ThemeHairline()
+                ledgerRow("大小", value: sizeText(for: item))
+                if item.type == .image || item.type == .video {
+                    ThemeHairline()
+                    ledgerRow("分辨率", value: resolutionText(item.metadata))
+                }
+                if item.type == .video {
+                    ThemeHairline()
+                    ledgerRow("时长", value: durationText(item.metadata?.durationSeconds))
+                }
+                ThemeHairline()
+                ledgerRow("可见性", value: item.isHidden ? "已隐藏" : "正常")
+                ThemeHairline()
+                ledgerRow(item.sourceURL.isFileURL ? "路径" : "网址", value: item.sourceURL.isFileURL ? item.sourceURL.path : item.sourceURL.absoluteString, stacked: true)
+                if let entryURL = item.entryURL {
+                    ThemeHairline()
+                    ledgerRow(entryURL.isFileURL ? "入口文件" : "网页地址", value: entryURL.isFileURL ? entryURL.path : entryURL.absoluteString, stacked: true)
+                }
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(AppTheme.Palette.raised.opacity(0.45))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(AppTheme.Palette.hairline, lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+            if item.availability != .available {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(availabilityLabel(item.availability), systemImage: "exclamationmark.triangle.fill")
+                        .font(AppTheme.Typography.caption)
+                        .foregroundStyle(AppTheme.Palette.danger)
+                    Text(availabilityExplanation(item.availability))
+                        .font(AppTheme.Typography.micro)
+                        .foregroundStyle(AppTheme.Palette.textSecondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(AppTheme.Palette.danger.opacity(0.08))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(AppTheme.Palette.danger.opacity(0.35), lineWidth: 1)
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func ledgerRow(_ label: String, value: String, stacked: Bool = false) -> some View {
+        if stacked {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(label)
+                    .font(AppTheme.Typography.micro)
+                    .foregroundStyle(AppTheme.Palette.textSecondary)
+                Text(value)
+                    .font(AppTheme.Typography.mono(9))
+                    .foregroundStyle(AppTheme.Palette.textSecondary)
+                    .lineLimit(3)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+        } else {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(label)
+                    .font(AppTheme.Typography.micro)
+                    .foregroundStyle(AppTheme.Palette.textSecondary)
+                Spacer(minLength: 8)
+                Text(value)
+                    .font(AppTheme.Typography.mono(9.5))
+                    .foregroundStyle(AppTheme.Palette.text)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+        }
+    }
+
+    private func actionSection(for item: WallpaperItem) -> some View {
+        HStack(spacing: 8) {
+            Button(item.isHidden ? "取消隐藏" : "隐藏壁纸") {
+                model.setHidden(!item.isHidden, for: [item.id])
+            }
+            .buttonStyle(QuietButtonStyle(compact: true))
+
+            if item.availability != .available {
+                Button("重新定位") {
+                    model.relocate(item: item)
+                }
+                .buttonStyle(BrassActionButtonStyle(compact: true))
+                Button("重新扫描") {
+                    model.refreshAvailability(for: item)
+                }
+                .buttonStyle(QuietButtonStyle(compact: true))
+            }
+
+            Spacer(minLength: 4)
+            Button("移除记录") {
+                showingRemoveConfirmation = true
+            }
+            .buttonStyle(QuietButtonStyle(compact: true, tone: AppTheme.Palette.danger))
+        }
+        .padding(.top, 2)
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: AppTheme.Metrics.cardCorner, style: .continuous)
+                    .stroke(AppTheme.Palette.hairline, style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                    .frame(width: 132, height: 74)
+                Image(systemName: "cursorarrow.click")
+                    .font(.system(size: 20, weight: .light))
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
+            }
+            Text("选择一个壁纸")
+                .font(AppTheme.Typography.display(17))
+                .foregroundStyle(AppTheme.Palette.text)
+            Text("预览、分配显示器并查看资源信息")
+                .font(AppTheme.Typography.caption)
+                .foregroundStyle(AppTheme.Palette.textSecondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(20)
     }
 
     private func availabilityLabel(_ availability: WallpaperAvailability) -> String {
@@ -3430,8 +3857,64 @@ private struct InspectorView: View {
         }
     }
 
+    private func availabilityText(for item: WallpaperItem) -> String {
+        if !item.sourceURL.isFileURL && item.availability == .available {
+            return "网址已保存，联网时加载"
+        }
+        return availabilityLabel(item.availability)
+    }
+
     private func typeName(for item: WallpaperItem) -> String {
-        switch item.type { case .image: return "图片壁纸"; case .video: return "视频壁纸"; case .web: return "网页壁纸" }
+        switch item.type {
+        case .image: return "图片壁纸"
+        case .video: return "视频壁纸"
+        case .web: return "网页壁纸"
+        }
+    }
+
+    private func iconName(for item: WallpaperItem) -> String {
+        switch item.type {
+        case .image: return "photo"
+        case .video: return "film"
+        case .web: return "safari"
+        }
+    }
+
+    private func resolutionBadge(for item: WallpaperItem) -> String? {
+        if let width = item.metadata?.pixelWidth,
+           let height = item.metadata?.pixelHeight,
+           width > 0, height > 0 {
+            return "\(width)×\(height)"
+        }
+        if item.type == .web {
+            return item.sourceURL.isFileURL ? "HTML" : "URL"
+        }
+        return nil
+    }
+
+    private func storageModeText(for item: WallpaperItem) -> String {
+        if !item.sourceURL.isFileURL {
+            return "远程网址"
+        }
+        if item.entryURL != nil {
+            return "HTML 项目"
+        }
+        return item.storageMode == .managedCopy ? "应用库副本" : "外部文件引用"
+    }
+
+    private func formatText(for item: WallpaperItem) -> String {
+        if !item.sourceURL.isFileURL {
+            return "远程网页"
+        }
+        if let entryURL = item.entryURL {
+            return entryURL.pathExtension.isEmpty ? "HTML" : entryURL.pathExtension.uppercased()
+        }
+        return metadataValue(item.metadata?.fileExtension?.uppercased(), fallback: "正在读取…")
+    }
+
+    private func sizeText(for item: WallpaperItem) -> String {
+        guard item.sourceURL.isFileURL else { return "不适用" }
+        return fileSizeText(item.metadata?.fileSizeBytes)
     }
 
     private func metadataValue(_ value: String?, fallback: String) -> String {
@@ -3464,27 +3947,5 @@ private struct InspectorView: View {
         formatter.countStyle = .file
         formatter.includesUnit = true
         return formatter.string(fromByteCount: bytes)
-    }
-
-    private func status(for row: DisplayRow, item: WallpaperItem) -> String {
-        guard row.isConnected else { return "已断开，保留原分配" }
-        return model.wallpaperManager.appliedWallpaperIDs[row.id] == item.id ? "当前壁纸" : "未应用"
-    }
-
-    private func statusColor(for row: DisplayRow, item: WallpaperItem) -> Color {
-        guard row.isConnected else { return .orange }
-        return model.wallpaperManager.appliedWallpaperIDs[row.id] == item.id ? .green : .secondary
-    }
-}
-
-private struct InspectorRow: View {
-    let title: String
-    let value: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(title).font(.caption).foregroundStyle(.secondary)
-            Text(value).font(.caption).lineLimit(3).textSelection(.enabled)
-        }
     }
 }

@@ -23,6 +23,7 @@
 ## 发布记录
 
 - [更新记录](../CHANGELOG.md)
+- [0.2.12](release-notes/0.2.12.md)
 - [0.2.11](release-notes/0.2.11.md)
 - [0.2.10](release-notes/0.2.10.md)
 - [0.2.9](release-notes/0.2.9.md)
