@@ -1,21 +1,47 @@
 import AppKit
+import Combine
 import SwiftUI
 import WallpaperMacCore
 
 @MainActor
 final class SettingsWindowController: NSWindowController {
+    private var themeCancellable: AnyCancellable?
+
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 640),
+            contentRect: NSRect(x: 0, y: 0, width: 820, height: 700),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
         window.title = "WallpaperMac 设置"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
         window.isRestorable = false
         window.center()
+        let initialTheme = ThemeStore.shared.activeTheme
+        window.appearance = NSAppearance(named: initialTheme.colorScheme == .light ? .aqua : .darkAqua)
         window.contentView = NSHostingView(rootView: SettingsView())
         super.init(window: window)
+        applyThemeAppearance(ThemeStore.shared.activeTheme)
+        themeCancellable = ThemeStore.shared.$activeTheme
+            .receive(on: RunLoop.main)
+            .sink { [weak self] theme in
+                self?.applyThemeAppearance(theme)
+            }
+    }
+
+    override func showWindow(_ sender: Any?) {
+        super.showWindow(sender)
+        applyThemeAppearance(ThemeStore.shared.activeTheme)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            self?.applyThemeAppearance(ThemeStore.shared.activeTheme)
+        }
+    }
+
+    private func applyThemeAppearance(_ theme: AppThemeDefinition) {
+        window?.appearance = NSAppearance(named: theme.colorScheme == .light ? .aqua : .darkAqua)
+        window?.backgroundColor = NSColor(theme.palette.canvas)
     }
 
     @available(*, unavailable)
@@ -46,6 +72,8 @@ private struct SettingsView: View {
     @State private var launchAtLoginError: String?
     @State private var isSyncingLoginToggle = false
     @ObservedObject private var updateService = UpdateService.shared
+    @ObservedObject private var themeStore = ThemeStore.shared
+    @State private var category: SettingsCategory = .general
 
     private var applicationVersionInfo: ApplicationVersionInfo {
         ApplicationVersionInfo(
@@ -55,101 +83,27 @@ private struct SettingsView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            updateBanner
-            Form {
-            Section("壁纸库") {
-                HStack {
-                    Text(libraryPath)
-                        .font(.caption)
-                        .lineLimit(2)
-                        .truncationMode(.middle)
-                    Spacer()
-                    Button("迁移壁纸库…") { chooseLibraryFolder() }
-                    Button("打开") {
-                        NSWorkspace.shared.open(URL(fileURLWithPath: libraryPath))
+        HStack(spacing: 0) {
+            settingsSidebar
+                .frame(width: 180)
+            ThemeVerticalHairline()
+            VStack(spacing: 0) {
+                updateBanner
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 22) {
+                        contentHeader
+                        content
                     }
+                    .padding(24)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                Picker("默认导入方式", selection: $storageMode) {
-                    Text("复制到应用库").tag(StorageMode.managedCopy.rawValue)
-                    Text("引用原文件").tag(StorageMode.externalReference.rawValue)
-                }
-            }
-            Section("显示器") {
-                Label("每块显示器独立应用壁纸", systemImage: "display.2")
-                Text("请在主窗口的“显示器”分组中为每块屏幕单独选择壁纸。显示器断开后，原分配会保留并在重新连接时尝试恢复。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Section("播放") {
-                Toggle("视频和网页默认静音", isOn: $muted)
-                Toggle("循环播放", isOn: $loops)
-                Toggle("使用电池时暂停动态壁纸", isOn: $pauseOnBattery)
-                Toggle("全屏应用时暂停动态壁纸", isOn: $pauseInFullScreen)
-                Picker("全局适配方式", selection: $fitMode) {
-                    ForEach(WallpaperFitMode.allCases, id: \.self) { mode in
-                        Text(mode.title).tag(mode.rawValue)
-                    }
-                }
-                Text(fitModeDescription)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Section("交互") {
-                Toggle("壁纸点击效果", isOn: $webWallpaperInteractionEnabled)
-                Text("启用后，网页壁纸会移动到桌面图标层上方，以便直接点击网页；图片和视频壁纸仍保持点击穿透。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Section("快捷键") {
-                Label("快捷键设置", systemImage: "command")
-                Text("当前版本通过菜单栏、检查器和显示器分配控制壁纸；全局快捷键将在后续版本加入。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Section("启动") {
-                Toggle("登录时启动", isOn: $launchAtLogin)
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(LoginItemService.isEnabled ? Color.green : Color.secondary)
-                        .frame(width: 7, height: 7)
-                    Text("系统登录项：\(LoginItemService.statusDescription)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                if let launchAtLoginError {
-                    Text(launchAtLoginError)
-                        .font(.caption)
-                        .foregroundStyle(AppTheme.Palette.danger)
-                }
-            }
-            Section("软件更新") {
-                updateSectionContent
-            }
-            Section("关于 WallpaperMac") {
-                HStack(spacing: 12) {
-                    Image(nsImage: NSApplication.shared.applicationIconImage)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(width: 40, height: 40)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("WallpaperMac")
-                            .font(.headline)
-                        Text(applicationVersionInfo.displayText)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                }
-                .padding(.vertical, 2)
             }
         }
-        .formStyle(.grouped)
-        .padding(20)
-        .frame(minWidth: 600, minHeight: 540)
-        .tint(AppTheme.Palette.brass)
+        .id(themeStore.activeTheme.id)
+        .frame(minWidth: 720, minHeight: 560)
         .background(AppTheme.Palette.canvas)
-        }
+        .tint(AppTheme.Palette.accent)
+        .preferredColorScheme(themeStore.activeTheme.colorScheme)
         .onAppear {
             // Reflect external login-item changes without re-applying them.
             isSyncingLoginToggle = true
@@ -174,6 +128,312 @@ private struct SettingsView: View {
         }
     }
 
+    private var settingsSidebar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("设置")
+                    .font(AppTheme.Typography.display(18))
+                    .foregroundStyle(AppTheme.Palette.text)
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .frame(height: 72)
+
+            ThemeHairline()
+
+            VStack(spacing: 2) {
+                ForEach(SettingsCategory.allCases) { item in
+                    SettingsCategoryRow(category: item, isSelected: category == item) {
+                        category = item
+                    }
+                }
+            }
+            .padding(8)
+
+            Spacer()
+
+            Text("WallpaperMac \(applicationVersionInfo.version)")
+                .font(AppTheme.Typography.mono(9))
+                .foregroundStyle(AppTheme.Palette.textTertiary)
+                .padding(16)
+        }
+        .background(AppTheme.Palette.sidebar)
+    }
+
+    private var contentHeader: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(category.title)
+                .font(AppTheme.Typography.display(24))
+                .foregroundStyle(AppTheme.Palette.text)
+            Text(category.subtitle)
+                .font(AppTheme.Typography.caption)
+                .foregroundStyle(AppTheme.Palette.textSecondary)
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch category {
+        case .general:
+            settingsSection("壁纸库") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(libraryPath)
+                        .font(AppTheme.Typography.mono(9))
+                        .foregroundStyle(AppTheme.Palette.textSecondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                    HStack(spacing: 8) {
+                        Button("迁移壁纸库…") { chooseLibraryFolder() }
+                            .buttonStyle(AccentActionButtonStyle(compact: true))
+                        Button("打开") {
+                            NSWorkspace.shared.open(URL(fileURLWithPath: libraryPath))
+                        }
+                        .buttonStyle(QuietButtonStyle(compact: true))
+                    }
+                }
+                ThemeHairline()
+                settingsPickerRow(
+                    "默认导入方式",
+                    description: "复制到应用库会保留独立副本；引用原文件只保存位置。"
+                ) {
+                    Picker("默认导入方式", selection: $storageMode) {
+                        Text("复制到应用库").tag(StorageMode.managedCopy.rawValue)
+                        Text("引用原文件").tag(StorageMode.externalReference.rawValue)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+            }
+
+            settingsSection("显示器") {
+                HStack(spacing: 10) {
+                    Image(systemName: "display.2")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(AppTheme.Palette.accent)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("每块显示器独立应用壁纸")
+                            .font(AppTheme.Typography.body)
+                            .foregroundStyle(AppTheme.Palette.text)
+                        Text("在主窗口的显示器工作区分配壁纸与队列，断开的显示器会保留原记录。")
+                            .font(AppTheme.Typography.micro)
+                            .foregroundStyle(AppTheme.Palette.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Button("打开显示器总览") {
+                        (NSApp.delegate as? AppDelegate)?.showMainWindow()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                            NotificationCenter.default.post(name: .wallpaperMacShowDisplaysOverview, object: nil)
+                        }
+                    }
+                    .buttonStyle(QuietButtonStyle(compact: true))
+                }
+            }
+
+        case .appearance:
+            settingsSection("主题") {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 240), spacing: 12)],
+                    spacing: 12
+                ) {
+                    ForEach(AppThemeDefinition.all) { theme in
+                        ThemePreviewCard(
+                            theme: theme,
+                            isSelected: themeStore.activeTheme.id == theme.id
+                        ) {
+                            themeStore.select(theme)
+                        }
+                    }
+                }
+                Text("主题会立即应用并保存在本机；浅色主题会同时切换窗口和系统控件外观。")
+                    .font(AppTheme.Typography.micro)
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+        case .playback:
+            settingsSection("默认播放") {
+                settingsToggle("视频和网页默认静音", description: "避免动态壁纸意外播放声音。", binding: $muted)
+                ThemeHairline()
+                settingsToggle("循环播放", description: "动态壁纸播放结束后从头开始。", binding: $loops)
+                ThemeHairline()
+                settingsPickerRow("全局适配方式", description: fitModeDescription) {
+                    Picker("全局适配方式", selection: $fitMode) {
+                        ForEach(WallpaperFitMode.allCases, id: \.self) { mode in
+                            Text(mode.title).tag(mode.rawValue)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+            }
+
+            settingsSection("节能与全屏") {
+                settingsToggle("使用电池时暂停动态壁纸", description: "接入电源后恢复播放。", binding: $pauseOnBattery)
+                ThemeHairline()
+                settingsToggle("全屏应用时暂停动态壁纸", description: "只暂停全屏窗口所在的显示器。", binding: $pauseInFullScreen)
+            }
+
+        case .interaction:
+            settingsSection("网页壁纸") {
+                settingsToggle(
+                    "壁纸点击效果",
+                    description: "启用后网页壁纸会移动到桌面图标层上方，以便直接点击网页；图片和视频壁纸保持点击穿透。",
+                    binding: $webWallpaperInteractionEnabled
+                )
+            }
+
+            settingsSection("快捷键") {
+                HStack(alignment: .center, spacing: 10) {
+                    Image(systemName: "command")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(AppTheme.Palette.textSecondary)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("关闭隐藏壁纸")
+                            .font(AppTheme.Typography.body)
+                            .foregroundStyle(AppTheme.Palette.text)
+                        Text("在系统范围内立即重新隐藏隐藏壁纸；重新显示仍需密码。")
+                            .font(AppTheme.Typography.micro)
+                            .foregroundStyle(AppTheme.Palette.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Text("⌃⌥H")
+                        .font(AppTheme.Typography.mono(10, weight: .semibold))
+                        .foregroundStyle(AppTheme.Palette.accent)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .fill(AppTheme.Palette.accentWash)
+                        )
+                }
+            }
+
+        case .startup:
+            settingsSection("启动") {
+                settingsToggle("登录时启动", description: "登录 macOS 后自动打开 WallpaperMac。", binding: $launchAtLogin)
+                HStack(spacing: 8) {
+                    ThemeStatusDot(
+                        color: LoginItemService.isEnabled ? AppTheme.Palette.applied : AppTheme.Palette.textTertiary,
+                        size: 5
+                    )
+                    Text("系统登录项：\(LoginItemService.statusDescription)")
+                        .font(AppTheme.Typography.micro)
+                        .foregroundStyle(AppTheme.Palette.textTertiary)
+                }
+                if let launchAtLoginError {
+                    Text(launchAtLoginError)
+                        .font(AppTheme.Typography.micro)
+                        .foregroundStyle(AppTheme.Palette.danger)
+                }
+            }
+
+            settingsSection("软件更新") {
+                updateSectionContent
+                ThemeHairline()
+                settingsToggle(
+                    "启动时每日检查一次",
+                    description: "每天最多检查一次 GitHub 发布。",
+                    binding: $autoCheckUpdates
+                )
+            }
+
+        case .about:
+            settingsSection("关于 WallpaperMac") {
+                HStack(spacing: 14) {
+                    Image(nsImage: NSApplication.shared.applicationIconImage)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 52, height: 52)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("WallpaperMac")
+                            .font(AppTheme.Typography.display(19))
+                            .foregroundStyle(AppTheme.Palette.text)
+                        Text(applicationVersionInfo.displayText)
+                            .font(AppTheme.Typography.caption)
+                            .foregroundStyle(AppTheme.Palette.textSecondary)
+                    }
+                    Spacer()
+                }
+                ThemeHairline()
+                Text("原生 macOS 壁纸引擎，使用 SwiftUI 与 AppKit 构建。项目以 GPL-3.0-or-later 发布。")
+                    .font(AppTheme.Typography.micro)
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let url = URL(string: "https://github.com/MrLLLLLLLLLL/WallpaperMac") {
+                    Link("打开 GitHub 项目", destination: url)
+                        .font(AppTheme.Typography.caption)
+                        .foregroundStyle(AppTheme.Palette.accent)
+                }
+            }
+        }
+    }
+
+    private func settingsSection<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ThemeSectionHeader(title: title)
+            VStack(alignment: .leading, spacing: 12) {
+                content()
+            }
+            .padding(14)
+            .themeInsetSurface()
+        }
+    }
+
+    private func settingsToggle(
+        _ title: String,
+        description: String? = nil,
+        binding: Binding<Bool>
+    ) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(AppTheme.Typography.body)
+                    .foregroundStyle(AppTheme.Palette.text)
+                if let description {
+                    Text(description)
+                        .font(AppTheme.Typography.micro)
+                        .foregroundStyle(AppTheme.Palette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 8)
+            Toggle(title, isOn: binding)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .tint(AppTheme.Palette.accent)
+        }
+    }
+
+    private func settingsPickerRow<Content: View>(
+        _ title: String,
+        description: String? = nil,
+        @ViewBuilder picker: () -> Content
+    ) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(AppTheme.Typography.body)
+                    .foregroundStyle(AppTheme.Palette.text)
+                if let description {
+                    Text(description)
+                        .font(AppTheme.Typography.micro)
+                        .foregroundStyle(AppTheme.Palette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 8)
+            picker()
+                .frame(width: 180)
+        }
+    }
+
     @ViewBuilder
     private var updateSectionContent: some View {
         HStack {
@@ -192,8 +452,6 @@ private struct SettingsView: View {
                     .disabled(updateService.isBusy)
             }
         }
-        Toggle("启动时每日检查一次", isOn: $autoCheckUpdates)
-
         switch updateService.phase {
         case .idle, .checking:
             EmptyView()
@@ -242,7 +500,7 @@ private struct SettingsView: View {
             .padding(8)
             .background(
                 RoundedRectangle(cornerRadius: 6)
-                    .fill(AppTheme.Palette.brass.opacity(0.08))
+                    .fill(AppTheme.Palette.accent.opacity(0.08))
             )
         case .downloading(let update, let progress):
             VStack(alignment: .leading, spacing: 6) {
@@ -328,7 +586,7 @@ private struct SettingsView: View {
         if case .available(let update) = updateService.phase {
             HStack(spacing: 10) {
                 Image(systemName: "arrow.down.circle.fill")
-                    .foregroundStyle(AppTheme.Palette.brass)
+                    .foregroundStyle(AppTheme.Palette.accent)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("发现新版本 \(update.version)")
                         .font(.headline)
@@ -341,8 +599,8 @@ private struct SettingsView: View {
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 10)
-            .background(AppTheme.Palette.brass.opacity(0.10))
-            Divider()
+            .background(AppTheme.Palette.accent.opacity(0.10))
+            ThemeHairline()
         }
     }
 
@@ -388,6 +646,204 @@ private struct SettingsView: View {
     }
 }
 
+enum SettingsCategory: String, CaseIterable, Identifiable {
+    case general
+    case appearance
+    case playback
+    case interaction
+    case startup
+    case about
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .general: return "通用"
+        case .appearance: return "外观"
+        case .playback: return "播放"
+        case .interaction: return "交互"
+        case .startup: return "启动与更新"
+        case .about: return "关于"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .general: return "壁纸库位置、导入方式与显示器入口"
+        case .appearance: return "六套基于一天光线的界面主题"
+        case .playback: return "静音、循环、适配与节能策略"
+        case .interaction: return "网页壁纸点击与快捷键"
+        case .startup: return "登录项与软件更新"
+        case .about: return "版本、构建与项目信息"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .general: return "slider.horizontal.3"
+        case .appearance: return "circle.lefthalf.filled"
+        case .playback: return "play.circle"
+        case .interaction: return "cursorarrow.click"
+        case .startup: return "arrow.triangle.2.circlepath"
+        case .about: return "info.circle"
+        }
+    }
+}
+
+private struct SettingsCategoryRow: View {
+    let category: SettingsCategory
+    let isSelected: Bool
+    let action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                RoundedRectangle(cornerRadius: 1, style: .continuous)
+                    .fill(isSelected ? AppTheme.Palette.accent : Color.clear)
+                    .frame(width: 2, height: 15)
+                Image(systemName: category.icon)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(isSelected ? AppTheme.Palette.accent : AppTheme.Palette.textSecondary)
+                    .frame(width: 16)
+                Text(category.title)
+                    .font(.system(size: 12.5, weight: isSelected ? .semibold : .regular))
+                    .foregroundStyle(isSelected ? AppTheme.Palette.text : AppTheme.Palette.textSecondary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 4)
+            .padding(.trailing, 8)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(
+                        isSelected
+                            ? AppTheme.Palette.accentWash
+                            : (isHovering ? AppTheme.Palette.raised.opacity(0.55) : Color.clear)
+                    )
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+    }
+}
+
+private struct ThemePreviewCard: View {
+    let theme: AppThemeDefinition
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 8) {
+                ThemeMiniPreview(theme: theme)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(theme.name)
+                            .font(AppTheme.Typography.display(15))
+                            .foregroundStyle(theme.palette.text)
+                        Text(theme.subtitle)
+                            .font(AppTheme.Typography.micro)
+                            .foregroundStyle(theme.palette.textSecondary)
+                            .lineLimit(2)
+                    }
+                    Spacer(minLength: 4)
+                    if isSelected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(theme.palette.accent)
+                    }
+                }
+            }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(theme.palette.panel)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(
+                        isSelected ? theme.palette.accent : theme.palette.hairline,
+                        lineWidth: isSelected ? 1.5 : 1
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .help("切换到\(theme.name)")
+    }
+}
+
+private struct ThemeMiniPreview: View {
+    let theme: AppThemeDefinition
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(theme.palette.canvas)
+            HStack(spacing: 0) {
+                VStack(alignment: .leading, spacing: 5) {
+                    RoundedRectangle(cornerRadius: 1, style: .continuous)
+                        .fill(theme.palette.accent)
+                        .frame(width: 20, height: 2)
+                    ForEach(0..<5, id: \.self) { _ in
+                        RoundedRectangle(cornerRadius: 1, style: .continuous)
+                            .fill(theme.palette.hairline)
+                            .frame(width: 22, height: 2)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(8)
+                .frame(width: 40)
+                .background(theme.palette.sidebar)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 4) {
+                        RoundedRectangle(cornerRadius: 1, style: .continuous)
+                            .fill(theme.palette.text.opacity(0.7))
+                            .frame(width: 48, height: 3)
+                        Spacer(minLength: 0)
+                        Circle()
+                            .fill(theme.palette.accent)
+                            .frame(width: 4, height: 4)
+                    }
+                    HStack(spacing: 5) {
+                        miniCard
+                        miniCard
+                        miniCard
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(8)
+            }
+        }
+        .frame(height: 88)
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(theme.palette.hairline, lineWidth: 1)
+        )
+    }
+
+    private var miniCard: some View {
+        RoundedRectangle(cornerRadius: 2, style: .continuous)
+            .fill(theme.palette.panel)
+            .frame(maxWidth: .infinity)
+            .frame(height: 28)
+            .overlay(
+                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                    .stroke(theme.palette.hairline, lineWidth: 0.5)
+            )
+            .overlay(alignment: .bottomLeading) {
+                RoundedRectangle(cornerRadius: 0.5, style: .continuous)
+                    .fill(theme.palette.accent)
+                    .frame(width: 10, height: 1.5)
+                    .padding(4)
+            }
+    }
+}
+
 enum SettingsKey {
     static let libraryPath = "WallpaperMac.libraryPath"
     static let storageMode = "WallpaperMac.storageMode"
@@ -400,10 +856,12 @@ enum SettingsKey {
     static let launchAtLogin = "WallpaperMac.launchAtLogin"
     static let onboardingCompleted = "WallpaperMac.onboardingCompleted"
     static let autoCheckUpdates = "WallpaperMac.autoCheckUpdates"
+    static let appearanceTheme = "WallpaperMac.appearanceTheme"
     static let lastUpdateCheckDate = "WallpaperMac.lastUpdateCheckDate"
 }
 
 extension Notification.Name {
     static let wallpaperMacSettingsChanged = Notification.Name("WallpaperMacSettingsChanged")
     static let wallpaperMacRequestLibraryMigration = Notification.Name("WallpaperMacRequestLibraryMigration")
+    static let wallpaperMacShowDisplaysOverview = Notification.Name("WallpaperMacShowDisplaysOverview")
 }

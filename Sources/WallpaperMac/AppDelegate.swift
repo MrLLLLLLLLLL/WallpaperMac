@@ -8,6 +8,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusBarController: StatusBarController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Apply the saved app appearance before any window is created so the
+        // titlebar is drawn in the theme's color scheme from the start.
+        _ = ThemeStore.shared
+        GlobalHotKeyService.shared.register {
+            NotificationCenter.default.post(name: .wallpaperMacStatusHideHiddenWallpapers, object: nil)
+        }
         WallpaperVideoCompatibilityService.removeLegacyPlaybackCache()
         statusBarController = StatusBarController(
             showMainWindow: { [weak self] in self?.showMainWindow() },

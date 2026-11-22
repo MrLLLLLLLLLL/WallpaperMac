@@ -11,9 +11,19 @@ enum SidebarDestination: Hashable {
     case web
     case favorites
     case recent
-    case queueLibrary
     case group(UUID)
+    case displaysOverview
     case display(String)
+    case queue(UUID)
+
+    var isLibraryWorkspace: Bool {
+        switch self {
+        case .all, .images, .videos, .web, .favorites, .recent, .group:
+            return true
+        case .displaysOverview, .display, .queue:
+            return false
+        }
+    }
 }
 
 enum WallpaperStatusFilter: String, CaseIterable, Identifiable {
@@ -107,7 +117,6 @@ final class LibraryViewModel: ObservableObject {
     @Published var isNewGroupSheetPresented = false
     @Published var isQueueEditorPresented = false
     @Published var queueEditorDisplayID: String?
-    @Published var isQueueManagementPresented = false
     @Published var isNewQueueSheetPresented = false
     @Published var pendingDeleteIDs: Set<UUID> = []
     @Published var isDeleteConfirmationPresented = false
@@ -214,6 +223,9 @@ final class LibraryViewModel: ObservableObject {
             },
             center.addObserver(forName: .wallpaperMacStatusToggleMute, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor [weak self] in self?.toggleAllMute() }
+            },
+            center.addObserver(forName: .wallpaperMacStatusHideHiddenWallpapers, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.hideHiddenWallpapersFromShortcut() }
             }
         ]
         reload(afterLoad: restoreWallpaperAssignments)
@@ -231,11 +243,18 @@ final class LibraryViewModel: ObservableObject {
     }
 
     private func normalizeDestinationForConnectedDisplays() {
-        guard case .display(let displayID) = destination,
-              !displayService.displays.contains(where: { $0.id == displayID }) else {
-            return
+        switch destination {
+        case .display(let displayID):
+            if !displayService.displays.contains(where: { $0.id == displayID }) {
+                destination = .displaysOverview
+            }
+        case .queue(let queueID):
+            if !queueLibrary.contains(where: { $0.id == queueID }) {
+                destination = .all
+            }
+        default:
+            break
         }
-        destination = .all
     }
 
     deinit {
@@ -336,7 +355,7 @@ final class LibraryViewModel: ObservableObject {
                 matchesDestination = wallpaperManager.displayAssignments.first(where: { $0.id == displayID })?.wallpaperID == item.id
             case .recent:
                 matchesDestination = item.lastUsedAt != nil
-            case .queueLibrary:
+            case .displaysOverview, .queue:
                 matchesDestination = true
             case .group(let groupID):
                 matchesDestination = item.groupID == groupID
@@ -670,6 +689,16 @@ final class LibraryViewModel: ObservableObject {
     func openQueueEditor(for displayID: String) {
         queueEditorDisplayID = displayID
         isQueueEditorPresented = true
+    }
+
+    /// Opens the library queue bound to the display's current mode. Falls back
+    /// to the legacy per-display editor when no library queue is bound.
+    func openQueue(for displayID: String) {
+        if let queueID = wallpaperManager.effectiveQueueID(for: displayID) {
+            destination = .queue(queueID)
+        } else {
+            openQueueEditor(for: displayID)
+        }
     }
 
     func saveQueue(
@@ -1115,6 +1144,13 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
+    /// Re-hides hidden wallpapers from the global shortcut. Enabling hidden
+    /// visibility still requires the password; closing it never does.
+    private func hideHiddenWallpapersFromShortcut() {
+        guard showsHiddenWallpapers else { return }
+        lockHiddenWallpapers()
+    }
+
     private func lockHiddenWallpapers() {
         showsHiddenWallpapers = false
         hiddenAuthRequest = nil
@@ -1372,7 +1408,6 @@ final class LibraryViewModel: ObservableObject {
 
     func beginCreateQueue(for ids: Set<UUID> = []) {
         pendingQueueAssignmentIDs = ids
-        isQueueManagementPresented = true
         isNewQueueSheetPresented = true
     }
 
@@ -1389,7 +1424,8 @@ final class LibraryViewModel: ObservableObject {
         return wallpaperManager.queue(with: queue.id)
     }
 
-    func duplicateQueue(_ queue: PlaybackQueue) {
+    @discardableResult
+    func duplicateQueue(_ queue: PlaybackQueue) -> PlaybackQueue? {
         guard let copy = wallpaperManager.createQueue(
             named: "\(queue.name) 副本",
             playbackMode: queue.playbackMode,
@@ -1399,13 +1435,14 @@ final class LibraryViewModel: ObservableObject {
             transition: queue.transition
         ) else {
             lastError = "无法创建队列副本，请检查名称是否重复。"
-            return
+            return nil
         }
         var duplicate = copy
         duplicate.sortMode = queue.sortMode
         duplicate.itemIntervalOverrides = queue.itemIntervalOverrides
         duplicate.addWallpaperIDs(queue.wallpaperIDs)
         _ = wallpaperManager.updateQueue(duplicate)
+        return wallpaperManager.queue(with: copy.id)
     }
 
     func deleteQueue(_ queue: PlaybackQueue) {
@@ -1516,20 +1553,23 @@ final class LibraryViewModel: ObservableObject {
 
 struct MainView: View {
     @StateObject private var model = LibraryViewModel()
+    @ObservedObject private var themeStore = ThemeStore.shared
     @AppStorage(SettingsKey.onboardingCompleted) private var onboardingCompleted = false
 
     var body: some View {
         Group {
             if onboardingCompleted {
                 mainWorkspace
+                    .id(themeStore.activeTheme.id)
             } else {
                 OnboardingView(model: model) {
                     onboardingCompleted = true
                 }
+                .id(themeStore.activeTheme.id)
             }
         }
-        .preferredColorScheme(.dark)
-        .tint(AppTheme.Palette.brass)
+        .preferredColorScheme(themeStore.activeTheme.colorScheme)
+        .tint(AppTheme.Palette.accent)
         .background(AppTheme.Palette.canvas)
         .sheet(isPresented: $model.isImporting) {
             ImportSheet(model: model)
@@ -1551,9 +1591,12 @@ struct MainView: View {
                     .padding(32)
             }
         }
-        .sheet(isPresented: $model.isQueueManagementPresented) {
-            QueueManagementView(model: model)
-                .frame(minWidth: 760, minHeight: 560)
+        .sheet(isPresented: $model.isNewQueueSheetPresented) {
+            NewQueueSheet { name in
+                if let queue = model.createQueue(named: name) {
+                    model.destination = .queue(queue.id)
+                }
+            }
         }
         .sheet(item: $model.hiddenAuthRequest) { request in
             HiddenWallpaperAuthSheet(model: model, request: request)
@@ -1576,7 +1619,7 @@ struct MainView: View {
                     if model.toastMessage != nil {
                         Button("撤销") { model.undoLastAction() }
                             .buttonStyle(.borderless)
-                            .foregroundStyle(AppTheme.Palette.brass)
+                            .foregroundStyle(AppTheme.Palette.accent)
                     }
                 }
                 .font(.callout)
@@ -1605,6 +1648,9 @@ struct MainView: View {
         // onAppear hook is not reached. Prepare and persist the library on every
         // launch instead of only on first-run.
         .onAppear { model.prepareLibrary() }
+        .onReceive(NotificationCenter.default.publisher(for: .wallpaperMacShowDisplaysOverview)) { _ in
+            model.destination = .displaysOverview
+        }
     }
 
     private var mainWorkspace: some View {
@@ -1612,11 +1658,13 @@ struct MainView: View {
             SidebarView(model: model)
                 .frame(width: MainWindowMetrics.sidebarWidth)
             ThemeVerticalHairline()
-            LibraryContentView(model: model)
+            WorkspaceContentView(model: model)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            ThemeVerticalHairline()
-            InspectorView(model: model)
-                .frame(width: MainWindowMetrics.inspectorWidth)
+            if model.destination.isLibraryWorkspace {
+                ThemeVerticalHairline()
+                InspectorView(model: model)
+                    .frame(width: MainWindowMetrics.inspectorWidth)
+            }
         }
         .background(AppTheme.Palette.canvas)
         .disabled(model.isMigratingLibrary)
@@ -1672,49 +1720,42 @@ private struct OnboardingView: View {
     @AppStorage(SettingsKey.pauseInFullScreen) private var pauseInFullScreen = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            Spacer()
-            VStack(spacing: 18) {
-                Image(systemName: icon)
-                    .font(.system(size: 54, weight: .light))
-                    .foregroundStyle(AppTheme.Palette.brass)
-                Text(title)
-                    .font(AppTheme.Typography.display(28))
-                    .foregroundStyle(AppTheme.Palette.text)
-                Text(message)
-                    .font(AppTheme.Typography.caption)
-                    .foregroundStyle(AppTheme.Palette.textSecondary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 520)
-                content
-                    .frame(maxWidth: 560)
-            }
-            Spacer()
-            HStack {
-                if step > 0 {
-                    Button("上一步") { step -= 1 }
-                        .buttonStyle(QuietButtonStyle())
-                }
-                Spacer()
-                Text("第 \(step + 1) / 4 步")
-                    .font(AppTheme.Typography.mono(9.5))
-                    .foregroundStyle(AppTheme.Palette.textTertiary)
-                Button(step == 3 ? "完成并进入壁纸库" : "继续") {
-                    if step == 3 {
-                        NotificationCenter.default.post(name: .wallpaperMacSettingsChanged, object: nil)
-                        model.prepareLibrary()
-                        finish()
-                    } else {
-                        step += 1
+        HStack(spacing: 0) {
+            onboardingSidebar
+                .frame(width: 220)
+            ThemeVerticalHairline()
+            VStack(spacing: 0) {
+                header
+                ThemeHairline()
+                GeometryReader { proxy in
+                    ScrollView {
+                        VStack(spacing: 0) {
+                            Spacer(minLength: 24)
+                            HStack(alignment: .top, spacing: 18) {
+                                Image(systemName: icon)
+                                    .font(.system(size: 44, weight: .light))
+                                    .foregroundStyle(AppTheme.Palette.accent)
+                                    .frame(width: 54, alignment: .leading)
+                                VStack(alignment: .leading, spacing: 16) {
+                                    Text(message)
+                                        .font(AppTheme.Typography.body)
+                                        .foregroundStyle(AppTheme.Palette.textSecondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    content
+                                        .frame(maxWidth: 760, alignment: .leading)
+                                }
+                            }
+                            .frame(maxWidth: 820, alignment: .leading)
+                            .padding(.horizontal, 28)
+                            Spacer(minLength: 24)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: proxy.size.height, alignment: .center)
                     }
                 }
-                .buttonStyle(BrassActionButtonStyle())
+                ThemeHairline()
+                footer
             }
-            .frame(maxWidth: 700)
-            .padding(.horizontal, 36)
-            .padding(.bottom, 30)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(AppTheme.Palette.canvas)
         .onAppear { model.prepareLibrary() }
         .onChange(of: launchAtLogin) { enabled in
@@ -1724,6 +1765,83 @@ private struct OnboardingView: View {
                 model.lastError = "登录项设置失败：\(error.localizedDescription)"
             }
         }
+    }
+
+    private var onboardingSidebar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("WallpaperMac")
+                    .font(AppTheme.Typography.display(19))
+                    .foregroundStyle(AppTheme.Palette.text)
+                Text("首次设置")
+                    .font(AppTheme.Typography.caption)
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
+            }
+            .padding(.horizontal, 16)
+            .frame(height: MainWindowMetrics.libraryHeaderHeight, alignment: .center)
+
+            ThemeHairline()
+
+            VStack(spacing: 2) {
+                ForEach(Array(stepTitles.enumerated()), id: \.offset) { index, item in
+                    OnboardingStepRow(
+                        index: index,
+                        title: item,
+                        isSelected: step == index
+                    ) {
+                        step = index
+                    }
+                }
+            }
+            .padding(8)
+
+            Spacer()
+            Text("第 \(step + 1) / 4 步")
+                .font(AppTheme.Typography.mono(9.5))
+                .foregroundStyle(AppTheme.Palette.textTertiary)
+                .padding(16)
+        }
+        .background(AppTheme.Palette.sidebar)
+    }
+
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title)
+                .font(AppTheme.Typography.pageTitle)
+                .foregroundStyle(AppTheme.Palette.text)
+            Spacer()
+            Text(stepTitles[step])
+                .font(AppTheme.Typography.mono(9.5))
+                .foregroundStyle(AppTheme.Palette.textTertiary)
+        }
+        .padding(.horizontal, 24)
+        .frame(height: MainWindowMetrics.libraryHeaderHeight)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 10) {
+            if step > 0 {
+                Button("上一步") { step -= 1 }
+                    .buttonStyle(QuietButtonStyle())
+            }
+            Spacer()
+            Button(step == 3 ? "完成并进入壁纸库" : "继续") {
+                if step == 3 {
+                    NotificationCenter.default.post(name: .wallpaperMacSettingsChanged, object: nil)
+                    model.prepareLibrary()
+                    finish()
+                } else {
+                    step += 1
+                }
+            }
+            .buttonStyle(AccentActionButtonStyle())
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 14)
+    }
+
+    private var stepTitles: [String] {
+        ["欢迎", "壁纸库", "后台行为", "权限检查"]
     }
 
     private var icon: String {
@@ -1780,12 +1898,26 @@ private struct OnboardingView: View {
             .padding(16)
             .themeInsetSurface()
         case 2:
-            VStack(alignment: .leading, spacing: 10) {
-                Toggle("登录时启动", isOn: $launchAtLogin)
-                Toggle("使用电池时暂停动态壁纸", isOn: $pauseOnBattery)
-                Toggle("全屏应用时暂停动态壁纸", isOn: $pauseInFullScreen)
+            VStack(spacing: 0) {
+                OnboardingToggleRow(
+                    title: "登录时启动",
+                    detail: "登录 macOS 后自动打开 WallpaperMac。",
+                    isOn: $launchAtLogin
+                )
+                ThemeHairline()
+                OnboardingToggleRow(
+                    title: "使用电池时暂停动态壁纸",
+                    detail: "节省电量，接入电源后恢复。",
+                    isOn: $pauseOnBattery
+                )
+                ThemeHairline()
+                OnboardingToggleRow(
+                    title: "全屏应用时暂停动态壁纸",
+                    detail: "只暂停全屏窗口所在的显示器。",
+                    isOn: $pauseInFullScreen
+                )
             }
-            .padding(16)
+            .padding(14)
             .themeInsetSurface()
         default:
             let permission = model.libraryPermissionState
@@ -1804,6 +1936,72 @@ private struct OnboardingView: View {
     }
 }
 
+private struct OnboardingStepRow: View {
+    let index: Int
+    let title: String
+    let isSelected: Bool
+    let action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                RoundedRectangle(cornerRadius: 1, style: .continuous)
+                    .fill(isSelected ? AppTheme.Palette.accent : Color.clear)
+                    .frame(width: 2, height: 15)
+                Text(String(format: "%02d", index + 1))
+                    .font(AppTheme.Typography.mono(9, weight: .medium))
+                    .foregroundStyle(isSelected ? AppTheme.Palette.accent : AppTheme.Palette.textTertiary)
+                    .frame(width: 18, alignment: .leading)
+                Text(title)
+                    .font(.system(size: 12.5, weight: isSelected ? .semibold : .regular))
+                    .foregroundStyle(isSelected ? AppTheme.Palette.text : AppTheme.Palette.textSecondary)
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 4)
+            .padding(.trailing, 8)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(
+                        isSelected
+                            ? AppTheme.Palette.accentWash
+                            : (isHovering ? AppTheme.Palette.raised.opacity(0.55) : Color.clear)
+                    )
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+    }
+}
+
+private struct OnboardingToggleRow: View {
+    let title: String
+    let detail: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(AppTheme.Typography.body)
+                    .foregroundStyle(AppTheme.Palette.text)
+                Text(detail)
+                    .font(AppTheme.Typography.micro)
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
+            }
+            Spacer(minLength: 8)
+            Toggle(title, isOn: $isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .tint(AppTheme.Palette.accent)
+        }
+        .padding(.vertical, 9)
+    }
+}
+
 private struct OnboardingFeature: View {
     let title: String
     let icon: String
@@ -1811,7 +2009,7 @@ private struct OnboardingFeature: View {
         VStack(spacing: 8) {
             Image(systemName: icon)
                 .font(.system(size: 18, weight: .light))
-                .foregroundStyle(AppTheme.Palette.brass)
+                .foregroundStyle(AppTheme.Palette.accent)
             Text(title)
                 .font(AppTheme.Typography.body)
                 .foregroundStyle(AppTheme.Palette.text)
@@ -2131,7 +2329,51 @@ private struct SidebarView: View {
                     SidebarRow(title: "网页", icon: "safari", isSelected: model.destination == .web, trailing: "\(count(of: .web))") { model.destination = .web }
                     SidebarRow(title: "收藏", icon: "star", isSelected: model.destination == .favorites, trailing: "\(visibleItems.filter(\.isFavorite).count)") { model.destination = .favorites }
                     SidebarRow(title: "最近使用", icon: "clock", isSelected: model.destination == .recent) { model.destination = .recent }
-                    SidebarRow(title: "播放队列", icon: "list.bullet.rectangle", isSelected: model.destination == .queueLibrary, trailing: "\(model.queueLibrary.count)") { model.destination = .queueLibrary }
+
+                    if !model.displayRows.isEmpty {
+                        sectionHeader("显示器")
+                        SidebarRow(
+                            title: "总览",
+                            icon: "rectangle.grid.2x2",
+                            isSelected: model.destination == .displaysOverview,
+                            trailing: "\(model.displayRows.count)"
+                        ) {
+                            model.destination = .displaysOverview
+                        }
+                        ForEach(model.displayRows) { display in
+                            SidebarRow(
+                                title: display.name,
+                                icon: display.isConnected ? "display" : "display.trianglebadge.exclamationmark",
+                                isSelected: model.destination == .display(display.id),
+                                trailing: display.isConnected ? nil : "断开",
+                                trailingColor: AppTheme.Palette.warning,
+                                statusDot: display.isConnected ? AppTheme.Palette.applied : AppTheme.Palette.warning
+                            ) {
+                                model.destination = .display(display.id)
+                            }
+                        }
+                    }
+
+                    sectionHeader("播放队列") {
+                        Button { model.beginCreateQueue() } label: {
+                            Image(systemName: "plus")
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(AppTheme.Palette.textSecondary)
+                        .help("新建播放队列")
+                    }
+
+                    ForEach(model.queueLibrary) { queue in
+                        SidebarRow(
+                            title: queue.name,
+                            icon: queueIcon(queue),
+                            isSelected: model.destination == .queue(queue.id),
+                            trailing: "\(visibleWallpaperCount(queue))"
+                        ) {
+                            model.destination = .queue(queue.id)
+                        }
+                    }
 
                     sectionHeader("分组") {
                         Button { model.isNewGroupSheetPresented = true } label: {
@@ -2153,21 +2395,6 @@ private struct SidebarView: View {
                             model.destination = .group(group.id)
                         }
                     }
-
-                    if !model.displayRows.isEmpty {
-                        sectionHeader("显示器")
-                        ForEach(model.displayRows) { display in
-                            SidebarRow(
-                                title: display.name,
-                                icon: display.isConnected ? "display" : "display.trianglebadge.exclamationmark",
-                                isSelected: model.destination == .display(display.id),
-                                trailing: display.isConnected ? nil : "断开",
-                                trailingColor: AppTheme.Palette.warning
-                            ) {
-                                model.destination = .display(display.id)
-                            }
-                        }
-                    }
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 10)
@@ -2175,6 +2402,32 @@ private struct SidebarView: View {
 
             Spacer(minLength: 8)
             ThemeHairline()
+            HStack(spacing: 6) {
+                Image(systemName: model.showsHiddenWallpapers ? "eye" : "eye.slash")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(model.showsHiddenWallpapers ? AppTheme.Palette.accent : AppTheme.Palette.textTertiary)
+                    .frame(width: 14)
+                Text("显示隐藏壁纸")
+                    .font(AppTheme.Typography.micro)
+                    .foregroundStyle(AppTheme.Palette.textSecondary)
+                Spacer(minLength: 4)
+                Toggle("显示隐藏壁纸", isOn: Binding(
+                    get: { model.showsHiddenWallpapers },
+                    set: { model.requestSetShowsHiddenWallpapers($0) }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .tint(AppTheme.Palette.accent)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .help("隐藏壁纸默认不显示；打开需要密码")
+            .accessibilityLabel("显示隐藏壁纸")
+
+            ThemeHairline()
+                .padding(.horizontal, 10)
+
             HStack(spacing: 6) {
                 ThemeIconButton(systemName: "folder", help: "迁移壁纸库") {
                     model.chooseLibraryForMigration()
@@ -2185,7 +2438,10 @@ private struct SidebarView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(model.libraryURL.path)
-                Spacer(minLength: 0)
+                Spacer(minLength: 4)
+                ThemeIconButton(systemName: "gearshape", help: "设置") {
+                    (NSApp.delegate as? AppDelegate)?.showSettingsWindow()
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
@@ -2203,6 +2459,17 @@ private struct SidebarView: View {
 
     private func groupCount(_ groupID: UUID) -> Int {
         visibleItems.filter { $0.groupID == groupID }.count
+    }
+
+    private func visibleWallpaperCount(_ queue: PlaybackQueue) -> Int {
+        queue.wallpaperIDs.filter { id in
+            model.wallpapers.first(where: { $0.id == id }).map(model.isWallpaperVisible) ?? false
+        }.count
+    }
+
+    private func queueIcon(_ queue: PlaybackQueue) -> String {
+        if queue.isDefault { return "star" }
+        return model.queueKind(queue) == .hidden ? "eye.slash" : "list.bullet.rectangle"
     }
 
     private func sectionHeader<Accessory: View>(
@@ -2234,6 +2501,7 @@ private struct SidebarRow: View {
     let isSelected: Bool
     var trailing: String? = nil
     var trailingColor: Color = AppTheme.Palette.textTertiary
+    var statusDot: Color? = nil
     let action: () -> Void
     @State private var isHovering = false
 
@@ -2241,22 +2509,27 @@ private struct SidebarRow: View {
         Button(action: action) {
             HStack(spacing: 8) {
                 RoundedRectangle(cornerRadius: 1, style: .continuous)
-                    .fill(isSelected ? AppTheme.Palette.brass : Color.clear)
+                    .fill(isSelected ? AppTheme.Palette.accent : Color.clear)
                     .frame(width: 2, height: 15)
                 Image(systemName: icon)
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(isSelected ? AppTheme.Palette.brass : AppTheme.Palette.textSecondary)
+                    .foregroundStyle(isSelected ? AppTheme.Palette.accent : AppTheme.Palette.textSecondary)
                     .frame(width: 16)
                 Text(title)
                     .font(.system(size: 12.5, weight: isSelected ? .semibold : .regular))
                     .foregroundStyle(isSelected ? AppTheme.Palette.text : AppTheme.Palette.textSecondary)
                     .lineLimit(1)
                 Spacer(minLength: 4)
+                if let statusDot {
+                    Circle()
+                        .fill(statusDot)
+                        .frame(width: 4, height: 4)
+                }
                 if let trailing {
                     Text(trailing)
                         .font(AppTheme.Typography.mono(9.5))
                         .monospacedDigit()
-                        .foregroundStyle(isSelected ? AppTheme.Palette.brass : trailingColor)
+                        .foregroundStyle(isSelected ? AppTheme.Palette.accent : trailingColor)
                 }
             }
             .padding(.leading, 4)
@@ -2266,7 +2539,7 @@ private struct SidebarRow: View {
                 RoundedRectangle(cornerRadius: 5, style: .continuous)
                     .fill(
                         isSelected
-                            ? AppTheme.Palette.brassWash
+                            ? AppTheme.Palette.accentWash
                             : (isHovering ? AppTheme.Palette.raised.opacity(0.55) : Color.clear)
                     )
             )
@@ -2274,6 +2547,23 @@ private struct SidebarRow: View {
         }
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
+    }
+}
+
+private struct WorkspaceContentView: View {
+    @ObservedObject var model: LibraryViewModel
+
+    var body: some View {
+        switch model.destination {
+        case .displaysOverview:
+            DisplaysOverviewView(model: model)
+        case .display(let displayID):
+            DisplayWorkspaceView(model: model, displayID: displayID)
+        case .queue(let queueID):
+            QueueWorkspaceView(model: model, queueID: queueID)
+        default:
+            LibraryContentView(model: model)
+        }
     }
 }
 
@@ -2293,13 +2583,7 @@ private struct LibraryContentView: View {
     }
 
     var body: some View {
-        Group {
-            if model.destination == .queueLibrary {
-                QueueManagementView(model: model)
-            } else {
-                libraryBody
-            }
-        }
+        libraryBody
     }
 
     @ViewBuilder
@@ -2407,7 +2691,7 @@ private struct LibraryContentView: View {
         .overlay {
             if isDropTargeted {
                 RoundedRectangle(cornerRadius: 12)
-                    .stroke(AppTheme.Palette.brass, style: StrokeStyle(lineWidth: 2, dash: [8]))
+                    .stroke(AppTheme.Palette.accent, style: StrokeStyle(lineWidth: 2, dash: [8]))
                     .padding(10)
                     .overlay {
                         Text("松开以导入壁纸")
@@ -2509,7 +2793,7 @@ private struct LibraryContentView: View {
             model.clearSelection()
             model.isSelectionMode = false
         }
-        .buttonStyle(BrassActionButtonStyle(compact: true))
+        .buttonStyle(AccentActionButtonStyle(compact: true))
         .fixedSize()
     }
 
@@ -2523,7 +2807,6 @@ private struct LibraryContentView: View {
             ThemeMenuLabel(title: model.sortOrder.title, systemImage: "arrow.up.arrow.down")
         }
         ThemeViewModeSwitch(layout: $model.layout)
-        hiddenWallpaperToggle
         Button { model.isSelectionMode = true } label: {
             Label("批量管理", systemImage: "checklist")
                 .font(AppTheme.Typography.caption)
@@ -2532,7 +2815,6 @@ private struct LibraryContentView: View {
         .foregroundStyle(AppTheme.Palette.textSecondary)
         .fixedSize()
         addWallpaperMenu(compact: false)
-        settingsButton
     }
 
     @ViewBuilder
@@ -2545,12 +2827,10 @@ private struct LibraryContentView: View {
             ThemeMenuLabel(title: nil, systemImage: "arrow.up.arrow.down")
         }
         ThemeViewModeSwitch(layout: $model.layout)
-        hiddenWallpaperToggle
         ThemeIconButton(systemName: "checklist", help: "批量管理") {
             model.isSelectionMode = true
         }
         addWallpaperMenu(compact: true)
-        settingsButton
     }
 
     private func addWallpaperMenu(compact: Bool) -> some View {
@@ -2565,7 +2845,7 @@ private struct LibraryContentView: View {
                     .frame(width: 24, height: 24)
                     .background(
                         RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .fill(AppTheme.Palette.brass)
+                            .fill(AppTheme.Palette.accent)
                     )
             } else {
                 HStack(spacing: 5) {
@@ -2582,7 +2862,7 @@ private struct LibraryContentView: View {
                 .padding(.vertical, 5)
                 .background(
                     RoundedRectangle(cornerRadius: AppTheme.Metrics.controlCorner, style: .continuous)
-                        .fill(AppTheme.Palette.brass)
+                        .fill(AppTheme.Palette.accent)
                 )
             }
         }
@@ -2629,31 +2909,6 @@ private struct LibraryContentView: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help("排序：\(model.sortOrder.title)")
-    }
-
-    private var hiddenWallpaperToggle: some View {
-        HStack(spacing: 6) {
-            Image(systemName: model.showsHiddenWallpapers ? "eye" : "eye.slash")
-                .foregroundStyle(model.showsHiddenWallpapers ? AppTheme.Palette.brass : AppTheme.Palette.textSecondary)
-                .frame(width: 16)
-            Toggle("显示隐藏壁纸", isOn: Binding(
-                get: { model.showsHiddenWallpapers },
-                set: { model.requestSetShowsHiddenWallpapers($0) }
-            ))
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .controlSize(.mini)
-            .tint(AppTheme.Palette.brass)
-        }
-        .fixedSize()
-        .help("隐藏壁纸默认不显示；打开需要密码")
-        .accessibilityLabel("显示隐藏壁纸")
-    }
-
-    private var settingsButton: some View {
-        ThemeIconButton(systemName: "gearshape", help: "设置") {
-            (NSApp.delegate as? AppDelegate)?.showSettingsWindow()
-        }
     }
 
     private func updatePagination(for size: CGSize) {
@@ -2753,9 +3008,10 @@ private struct LibraryContentView: View {
         case .web: return "网页"
         case .favorites: return "收藏"
         case .recent: return "最近使用"
-        case .queueLibrary: return "播放队列"
         case .group(let id): return model.groups.first(where: { $0.id == id })?.name ?? "分组"
+        case .displaysOverview: return "显示器"
         case .display(let id): return model.displayRows.first(where: { $0.id == id })?.name ?? "显示器"
+        case .queue(let id): return model.queueLibrary.first(where: { $0.id == id })?.name ?? "播放队列"
         }
     }
 }
@@ -2770,15 +3026,15 @@ private struct PageNumberButton: View {
             Text("\(page)")
                 .font(AppTheme.Typography.mono(10, weight: isCurrent ? .semibold : .regular))
                 .frame(width: 26, height: 24)
-                .foregroundStyle(isCurrent ? AppTheme.Palette.brass : AppTheme.Palette.textSecondary)
+                .foregroundStyle(isCurrent ? AppTheme.Palette.accent : AppTheme.Palette.textSecondary)
                 .background(
                     RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .fill(isCurrent ? AppTheme.Palette.brassWash : Color.clear)
+                        .fill(isCurrent ? AppTheme.Palette.accentWash : Color.clear)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 5, style: .continuous)
                         .stroke(
-                            isCurrent ? AppTheme.Palette.brass.opacity(0.45) : Color.clear,
+                            isCurrent ? AppTheme.Palette.accent.opacity(0.45) : Color.clear,
                             lineWidth: 1
                         )
                 )
@@ -2801,7 +3057,7 @@ private struct WallpaperListRow: View {
         HStack(spacing: 12) {
             if isSelected {
                 RoundedRectangle(cornerRadius: 1, style: .continuous)
-                    .fill(AppTheme.Palette.brass)
+                    .fill(AppTheme.Palette.accent)
                     .frame(width: 2, height: 32)
             }
             if selectionMode {
@@ -2809,7 +3065,7 @@ private struct WallpaperListRow: View {
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(
                         isSelected
-                            ? AppTheme.Palette.brass
+                            ? AppTheme.Palette.accent
                             : AppTheme.Palette.textSecondary
                     )
             }
@@ -2845,7 +3101,7 @@ private struct WallpaperListRow: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(
                         item.isFavorite
-                            ? AppTheme.Palette.brass
+                            ? AppTheme.Palette.accent
                             : AppTheme.Palette.textSecondary
                     )
                     .frame(width: 24, height: 24)
@@ -2858,7 +3114,7 @@ private struct WallpaperListRow: View {
         .contentShape(Rectangle())
         .background(
             RoundedRectangle(cornerRadius: 5, style: .continuous)
-                .fill(isSelected ? AppTheme.Palette.brassWash : Color.clear)
+                .fill(isSelected ? AppTheme.Palette.accentWash : Color.clear)
         )
         .onTapGesture(perform: selectAction)
     }
@@ -2948,7 +3204,7 @@ private struct WallpaperCard: View {
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundStyle(
                                 isSelected
-                                    ? AppTheme.Palette.brass
+                                    ? AppTheme.Palette.accent
                                     : AppTheme.Palette.text.opacity(0.85)
                             )
                             .background(
@@ -2964,7 +3220,7 @@ private struct WallpaperCard: View {
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(
                             item.isFavorite
-                                ? AppTheme.Palette.brass
+                                ? AppTheme.Palette.accent
                                 : AppTheme.Palette.textSecondary
                         )
                         .frame(width: 22, height: 22)
@@ -3066,7 +3322,7 @@ private struct WallpaperCard: View {
     }
 }
 
-private struct WallpaperPreviewFrame<Content: View>: View {
+struct WallpaperPreviewFrame<Content: View>: View {
     private let content: Content
 
     init(@ViewBuilder content: () -> Content) {
@@ -3088,7 +3344,7 @@ private struct WallpaperPreviewFrame<Content: View>: View {
     }
 }
 
-private struct ThumbnailView: View {
+struct ThumbnailView: View {
     let item: WallpaperItem
 
     var body: some View {
@@ -3369,7 +3625,7 @@ private struct EmptyLibraryView: View {
                     .foregroundStyle(
                         hasItems
                             ? AppTheme.Palette.textTertiary
-                            : AppTheme.Palette.brass
+                            : AppTheme.Palette.accent
                     )
             }
             VStack(spacing: 6) {
@@ -3403,7 +3659,7 @@ private struct EmptyLibraryView: View {
                     .padding(.vertical, 7)
                     .background(
                         RoundedRectangle(cornerRadius: AppTheme.Metrics.controlCorner, style: .continuous)
-                            .fill(AppTheme.Palette.brass)
+                            .fill(AppTheme.Palette.accent)
                     )
                 }
                 .menuStyle(.borderlessButton)
@@ -3425,7 +3681,7 @@ private struct InspectorView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .center, spacing: 8) {
-                Text("检查器")
+                Text("壁纸详情")
                     .font(AppTheme.Typography.display(18))
                     .foregroundStyle(AppTheme.Palette.text)
                 Spacer(minLength: 8)
@@ -3437,13 +3693,13 @@ private struct InspectorView: View {
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(
                                 item.isFavorite
-                                    ? AppTheme.Palette.brass
+                                    ? AppTheme.Palette.accent
                                     : AppTheme.Palette.textSecondary
                             )
                             .frame(width: 24, height: 24)
                             .background(
                                 Circle()
-                                    .fill(item.isFavorite ? AppTheme.Palette.brassWash : Color.clear)
+                                    .fill(item.isFavorite ? AppTheme.Palette.accentWash : Color.clear)
                             )
                     }
                     .buttonStyle(.plain)
@@ -3595,10 +3851,10 @@ private struct InspectorView: View {
                     Button(applied ? "已应用" : "应用") {
                         model.apply(item: item, to: display)
                     }
-                    .buttonStyle(BrassActionButtonStyle(compact: true))
+                    .buttonStyle(AccentActionButtonStyle(compact: true))
                     .disabled(item.availability != .available || applied)
                     Button("队列") {
-                        model.openQueueEditor(for: display.id)
+                        model.openQueue(for: display.id)
                     }
                     .buttonStyle(QuietButtonStyle(compact: true))
                 }
@@ -3622,7 +3878,7 @@ private struct InspectorView: View {
                     } label: {
                         Label(model.isPlaying(item) ? "暂停" : "播放", systemImage: model.isPlaying(item) ? "pause.fill" : "play.fill")
                     }
-                    .buttonStyle(BrassActionButtonStyle(compact: true))
+                    .buttonStyle(AccentActionButtonStyle(compact: true))
                     .disabled(!hasDisplay)
 
                     Button {
@@ -3673,7 +3929,7 @@ private struct InspectorView: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
-                .tint(AppTheme.Palette.brass)
+                .tint(AppTheme.Palette.accent)
                 .fixedSize()
                 Spacer(minLength: 0)
                 Text(item.fitModeOverride == nil ? "跟随全局" : "仅此壁纸")
@@ -3799,7 +4055,7 @@ private struct InspectorView: View {
                 Button("重新定位") {
                     model.relocate(item: item)
                 }
-                .buttonStyle(BrassActionButtonStyle(compact: true))
+                .buttonStyle(AccentActionButtonStyle(compact: true))
                 Button("重新扫描") {
                     model.refreshAvailability(for: item)
                 }

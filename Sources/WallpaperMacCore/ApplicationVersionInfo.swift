@@ -6,7 +6,7 @@ public struct ApplicationVersionInfo: Equatable, Sendable {
     /// Version shown when the app runs outside a packaged bundle (no
     /// `Info.plist`). Keep this in sync with the repository `VERSION` file;
     /// it is the single source the app layer reads during development.
-    public static let developmentFallbackVersion = "0.2.12"
+    public static let developmentFallbackVersion = "0.2.13"
 
     public let version: String
     public let build: String?

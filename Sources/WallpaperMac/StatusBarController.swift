@@ -94,6 +94,15 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         toggleMuteItem.target = self
         menu.addItem(toggleMuteItem)
 
+        let hideHiddenItem = NSMenuItem(
+            title: "关闭隐藏壁纸",
+            action: #selector(hideHiddenWallpapersAction),
+            keyEquivalent: "h"
+        )
+        hideHiddenItem.keyEquivalentModifierMask = [.control, .option]
+        hideHiddenItem.target = self
+        menu.addItem(hideHiddenItem)
+
         menu.addItem(.separator())
         let libraryItem = NSMenuItem(title: "打开壁纸库", action: #selector(openLibraryAction), keyEquivalent: "")
         libraryItem.target = self
@@ -189,6 +198,10 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         NotificationCenter.default.post(name: .wallpaperMacStatusToggleMute, object: nil)
     }
 
+    @objc private func hideHiddenWallpapersAction() {
+        NotificationCenter.default.post(name: .wallpaperMacStatusHideHiddenWallpapers, object: nil)
+    }
+
     @objc private func openLibraryAction() {
         openLibrary()
     }
@@ -205,5 +218,6 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 extension Notification.Name {
     static let wallpaperMacStatusTogglePlayback = Notification.Name("WallpaperMacStatusTogglePlayback")
     static let wallpaperMacStatusToggleMute = Notification.Name("WallpaperMacStatusToggleMute")
+    static let wallpaperMacStatusHideHiddenWallpapers = Notification.Name("WallpaperMacStatusHideHiddenWallpapers")
     static let wallpaperMacPlaybackStateChanged = Notification.Name("WallpaperMacPlaybackStateChanged")
 }

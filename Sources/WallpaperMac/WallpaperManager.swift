@@ -1800,6 +1800,13 @@ final class WallpaperManager: ObservableObject {
         )
     }
 
+    /// Advances the active queue by one item. Used by the display overview
+    /// and display workspace controls; fixed wallpapers ignore it.
+    func skipToNextQueueItem(displayID: String) {
+        guard connectedDisplays[displayID] != nil else { return }
+        advanceQueue(for: displayID)
+    }
+
     private func advanceQueue(for displayID: String, generation: Int? = nil) {
         if let generation, generation != queueTimerGenerations[displayID] { return }
         guard let binding = bindings[displayID],
@@ -2014,6 +2021,8 @@ private final class WallpaperWindowController: NSWindowController {
             screen: screen,
             allowsMouseEvents: item.type == .web && policy.webWallpaperInteractionEnabled
         )
+        // Wallpaper content follows the system appearance, not the app chrome theme.
+        window.appearance = SystemAppearance.current
         let contentView = try WallpaperContentView(
             item: item,
             policy: policy,
