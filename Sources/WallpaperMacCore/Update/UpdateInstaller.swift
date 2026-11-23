@@ -147,14 +147,16 @@ public enum UpdateInstaller {
         )
     }
 
-    /// Spawns the detached installer script and returns once it is running.
-    /// The caller should quit the application immediately afterwards.
+    /// Spawns the detached installer script and waits until it reports that it
+    /// is alive. The caller should quit the application only after this returns;
+    /// if the script cannot start, the app stays open and the error is shown.
     public static func launchDetachedInstall(
         of prepared: PreparedUpdateInstall,
         currentProcessID: Int32 = ProcessInfo.processInfo.processIdentifier,
         installLock: UpdateInstallLock? = nil,
+        resultFile: URL? = UpdateInstallJournal.failureFileURL,
         fileManager: FileManager = .default
-    ) throws {
+    ) async throws {
         let scriptURL = prepared.stagingDirectory.appendingPathComponent("install.sh")
         let script = installScript(
             parentPID: currentProcessID,
@@ -163,7 +165,8 @@ public enum UpdateInstaller {
             stagingPath: prepared.stagingDirectory.path,
             expectedVersion: prepared.version,
             lockPath: installLock?.lockURL.path,
-            lockToken: installLock?.ownerToken
+            lockToken: installLock?.ownerToken,
+            resultFile: resultFile?.path
         )
         do {
             try script.write(to: scriptURL, atomically: true, encoding: .utf8)
@@ -189,6 +192,65 @@ public enum UpdateInstaller {
         } catch {
             throw UpdateInstallError.scriptFailed(error.localizedDescription)
         }
+
+        // The generated script publishes this marker once its logging is
+        // active and immediately before it starts waiting for this process.
+        // Without the handshake, a syntax or setup failure would quit the app
+        // and leave the user with nothing running.
+        let markerURL = prepared.stagingDirectory
+            .appendingPathComponent("installer-started", isDirectory: false)
+        do {
+            try await waitForInstallerStart(
+                markerURL: markerURL,
+                process: process,
+                fileManager: fileManager
+            )
+        } catch {
+            // The app is still alive and reports this failure itself. The
+            // aborted script may have raced a journal write; drop it so the
+            // next launch does not show a second alert with a dead log path.
+            if let resultFile {
+                try? fileManager.removeItem(at: resultFile)
+            }
+            throw error
+        }
+    }
+
+    /// Waits until a detached installer reports that it is running. A process
+    /// that exits before publishing the marker aborts the update so the app
+    /// can stay open and report the failure instead of quitting into nothing.
+    public static func waitForInstallerStart(
+        markerURL: URL,
+        process: Process,
+        timeout: TimeInterval = 5,
+        fileManager: FileManager = .default
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if fileManager.fileExists(atPath: markerURL.path) {
+                // The installer cannot legitimately finish before this process
+                // exits, so a marker with a dead script means it aborted.
+                guard process.isRunning else {
+                    throw UpdateInstallError.scriptFailed("安装脚本提前退出")
+                }
+                return
+            }
+            guard process.isRunning else { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        if process.isRunning {
+            process.terminate()
+            // Give the exit trap time to finish before the caller removes the
+            // staging directory the script's log lives in.
+            let exitDeadline = Date().addingTimeInterval(2)
+            while process.isRunning && Date() < exitDeadline {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
+        throw UpdateInstallError.scriptFailed("安装脚本未能启动")
     }
 
     /// Verifies that the inherited descriptor is the same lock inode and that
@@ -223,15 +285,24 @@ public enum UpdateInstaller {
         targetAppURL: URL,
         fileManager: FileManager = .default
     ) throws {
-        guard pendingAppURL.pathExtension == "app",
-              targetAppURL.pathExtension == "app",
+        // The pending copy intentionally uses an installer temporary name
+        // (WallpaperMac.app.installing.<pid> or WallpaperMac.app.previous).
+        // Only the target must be a standard .app; the pending operand must
+        // still be a complete bundle in the same directory.
+        guard targetAppURL.pathExtension == "app",
               pendingAppURL.deletingLastPathComponent().standardizedFileURL
                 == targetAppURL.deletingLastPathComponent().standardizedFileURL else {
-            throw UpdateInstallError.scriptFailed("更新交换要求同目录的两个 .app Bundle")
+            throw UpdateInstallError.scriptFailed("更新交换要求目标为 .app 且两个 Bundle 位于同一目录")
         }
-        guard fileManager.fileExists(atPath: pendingAppURL.path),
-              fileManager.fileExists(atPath: targetAppURL.path) else {
-            throw UpdateInstallError.scriptFailed("交换前后的 App 必须同时存在")
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: pendingAppURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue,
+              fileManager.fileExists(atPath: targetAppURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue,
+              let pendingBundle = Bundle(url: pendingAppURL),
+              let pendingExecutable = pendingBundle.executableURL,
+              fileManager.fileExists(atPath: pendingExecutable.path) else {
+            throw UpdateInstallError.scriptFailed("待交换的 App Bundle 不完整或不存在")
         }
         if renamex_np(pendingAppURL.path, targetAppURL.path, UInt32(RENAME_SWAP)) != 0 {
             throw UpdateInstallError.scriptFailed(
@@ -242,6 +313,11 @@ public enum UpdateInstaller {
 
     /// Generated installer. Kept as plain shell so it survives the app going
     /// away mid-update and can be inspected in the staging directory.
+    ///
+    /// This script is compiled into the running build. Releases 0.2.8 through
+    /// 0.2.13 emitted scripts whose swap helper rejected the installer's own
+    /// `.installing.<pid>` name, so those versions cannot auto-update; users
+    /// on them need one manual install before this script can take effect.
     public static func installScript(
         parentPID: Int32,
         sourceAppPath: String,
@@ -249,11 +325,13 @@ public enum UpdateInstaller {
         stagingPath: String,
         expectedVersion: String? = nil,
         lockPath: String? = nil,
-        lockToken: String? = nil
+        lockToken: String? = nil,
+        resultFile: String? = nil
     ) -> String {
         """
         #!/bin/zsh
         set -euo pipefail
+        setopt nonomatch
 
         PARENT_PID=\(parentPID)
         SOURCE_APP=\(shellQuote(sourceAppPath))
@@ -266,37 +344,87 @@ public enum UpdateInstaller {
         CODESIGN="${WALLPAPERMAC_CODESIGN:-/usr/bin/codesign}"
         LOCK_PATH=\(shellQuote(lockPath ?? ""))
         LOCK_TOKEN=\(shellQuote(lockToken ?? ""))
-        SWAPPER="${WALLPAPERMAC_UPDATE_SWAPPER:-$TARGET_APP/Contents/MacOS/WallpaperMac}"
+        RESULT_FILE=\(shellQuote(resultFile ?? ""))
+        LOCK_CHECKER="${WALLPAPERMAC_UPDATE_SWAPPER:-$TARGET_APP/Contents/MacOS/WallpaperMac}"
+        SWAPPER="$LOCK_CHECKER"
         TARGET_PREVIOUS="${TARGET_APP}.previous"
         TARGET_PENDING="${TARGET_APP}.installing.$$"
         BACKUP_APP="$TARGET_PENDING"
         SWAPPED=0
         SWAP_STARTED=0
+        PARENT_EXITED=0
+        FAILURE_RECORDED=0
 
-        # Keep the detached installer diagnosable even though the app launches
-        # it with no console attached. A successful install removes staging;
-        # a failed one leaves this log beside the generated script.
-        mkdir -p "$STAGING_DIR"
         LOG_FILE="$STAGING_DIR/install.log"
-        exec >>"$LOG_FILE" 2>&1
-        echo "== WallpaperMac install started: $(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
 
         launch_app() {
             local app="$1"
             local executable
             executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist" 2>/dev/null || true)"
             if [[ -n "$executable" && -x "$app/Contents/MacOS/$executable" ]]; then
-                "$app/Contents/MacOS/$executable" >/dev/null 2>&1 &
+                "$app/Contents/MacOS/$executable" </dev/null >/dev/null 2>&1 &
                 return 0
             fi
-            "$OPEN" "$app" || true
+            "$OPEN" "$app" </dev/null >/dev/null 2>&1 || true
+        }
+
+        write_failure() {
+            local message="$1"
+            if (( FAILURE_RECORDED == 1 )); then
+                return 0
+            fi
+            FAILURE_RECORDED=1
+            if [[ -n "$RESULT_FILE" ]]; then
+                /bin/mkdir -p "$(/usr/bin/dirname "$RESULT_FILE")" 2>/dev/null || true
+                # The app consumes this record on its next launch. Publish it
+                # atomically so a concurrent launch never reads half a file.
+                local temporary="$RESULT_FILE.tmp.$$"
+                if {
+                    printf 'state=failed\n'
+                    printf 'version=%s\n' "$EXPECTED_VERSION"
+                    printf 'message=%s\n' "$message"
+                    printf 'log=%s\n' "$LOG_FILE"
+                    printf 'date=%s\n' "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
+                } > "$temporary" 2>/dev/null; then
+                    /bin/mv -f "$temporary" "$RESULT_FILE" 2>/dev/null \
+                        || /bin/rm -f "$temporary" 2>/dev/null || true
+                else
+                    /bin/rm -f "$temporary" 2>/dev/null || true
+                fi
+            fi
         }
 
         restore_previous() {
             if (( SWAPPED == 1 )) && [[ -d "$BACKUP_APP" ]]; then
-                ROLLBACK_SWAPPER="${WALLPAPERMAC_UPDATE_SWAPPER:-$BACKUP_APP/Contents/MacOS/WallpaperMac}"
-                if ! "$ROLLBACK_SWAPPER" --update-swap "$BACKUP_APP" "$TARGET_APP"; then
-                    echo "rollback swap failed; preserving the backup for manual recovery" >&2
+                # Prefer the freshly installed helper, then fall back to the
+                # preserved old bundle. This keeps rollback independent of
+                # defects in the previous build's swap helper.
+                ROLLBACK_SWAPPER="${WALLPAPERMAC_UPDATE_SWAPPER:-$TARGET_APP/Contents/MacOS/$EXECUTABLE_NAME}"
+                ROLLED_BACK=0
+                if "$ROLLBACK_SWAPPER" --update-swap "$BACKUP_APP" "$TARGET_APP"; then
+                    ROLLED_BACK=1
+                fi
+                if (( ROLLED_BACK == 0 )); then
+                    # A helper can exit nonzero after completing the exchange.
+                    # Check the target version before swapping a second time.
+                    CURRENT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$TARGET_APP/Contents/Info.plist" 2>/dev/null || true)"
+                    if [[ -n "$EXPECTED_VERSION" && -n "$CURRENT_VERSION" && "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]]; then
+                        ROLLED_BACK=1
+                    fi
+                fi
+                if (( ROLLED_BACK == 0 )); then
+                    FALLBACK_SWAPPER="${WALLPAPERMAC_UPDATE_SWAPPER:-$BACKUP_APP/Contents/MacOS/$EXECUTABLE_NAME}"
+                    if [[ "$FALLBACK_SWAPPER" != "$ROLLBACK_SWAPPER" ]] \
+                        && "$FALLBACK_SWAPPER" --update-swap "$BACKUP_APP" "$TARGET_APP"; then
+                        ROLLED_BACK=1
+                    fi
+                fi
+                if (( ROLLED_BACK == 0 )); then
+                    # Both helpers failed to exchange the bundles. The backup
+                    # is still complete, so launch it directly: leaving the user
+                    # without any running app is worse than a non-standard path.
+                    echo "rollback swap failed; launching the preserved backup" >&2
+                    launch_app "$BACKUP_APP"
                     return 1
                 fi
                 launch_app "$TARGET_APP"
@@ -307,25 +435,58 @@ public enum UpdateInstaller {
             STATUS=$?
             set +e
             if (( STATUS != 0 )); then
-                restore_previous
+                write_failure "installer exited with status $STATUS"
+                if (( SWAPPED == 1 )); then
+                    restore_previous
+                elif [[ -d "$TARGET_APP" ]]; then
+                    # A setup failure can race the app's own termination.
+                    # Relaunch whenever the old process is gone; a still-running
+                    # parent (the stuck 30s case) already leaves an app behind.
+                    if (( PARENT_EXITED == 1 )) || ! kill -0 "$PARENT_PID" 2>/dev/null; then
+                        echo "install failed before swap; relaunching current app" >&2
+                        "$OPEN" -n "$TARGET_APP" </dev/null >/dev/null 2>&1 \
+                            || launch_app "$TARGET_APP"
+                    fi
+                fi
             fi
-            # A failed rollback may still have its only complete old app in
-            # pending. Never delete that backup in the EXIT cleanup.
-            if (( SWAPPED == 0 && SWAP_STARTED == 0 )); then
-                rm -rf "$TARGET_PENDING"
+            # If the swap never moved the old app, the pending copy is only a
+            # failed new generation and can be removed. When the target already
+            # carries the expected version it is the rollback backup: keep it.
+            if (( SWAPPED == 0 )); then
+                TARGET_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$TARGET_APP/Contents/Info.plist" 2>/dev/null || true)"
+                if [[ -z "$EXPECTED_VERSION" || "$TARGET_VERSION" != "$EXPECTED_VERSION" ]]; then
+                    rm -rf "$TARGET_PENDING"
+                fi
             fi
             exit $STATUS
         }
+        # Install the cleanup trap before touching the filesystem: any later
+        # setup failure must still leave a durable failure record.
         trap finish EXIT
         trap 'exit 1' INT TERM HUP
+
+        # Keep the detached installer diagnosable even though the app launches
+        # it with no console attached. A successful install removes staging;
+        # a failed one leaves this log beside the generated script.
+        mkdir -p "$STAGING_DIR"
+        exec >>"$LOG_FILE" 2>&1
+        echo "== WallpaperMac install started: $(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
+        if [[ -n "$RESULT_FILE" ]]; then
+            rm -f "$RESULT_FILE"
+        fi
+        # The app waits for this marker before quitting, so an installer that
+        # cannot start never leaves the user without a running application.
+        : > "$STAGING_DIR/installer-started"
+
         fail() {
             echo "$1" >&2
+            write_failure "$1"
             exit 1
         }
         verify_lock() {
             if [[ -n "$LOCK_PATH" ]]; then
                 [[ -f "$LOCK_PATH" ]] || fail "update lock is missing"
-                "$SWAPPER" --update-lock-check "$LOCK_PATH" "$LOCK_TOKEN" || fail "update lock verification failed"
+                "$LOCK_CHECKER" --update-lock-check "$LOCK_PATH" "$LOCK_TOKEN" || fail "update lock verification failed"
                 [[ "$(head -n 1 "$LOCK_PATH")" == "$LOCK_TOKEN" ]] || fail "update lock ownership mismatch"
             fi
         }
@@ -345,10 +506,16 @@ public enum UpdateInstaller {
                 exit 2
             fi
         done
+        PARENT_EXITED=1
 
         # Build the complete replacement beside the target while the known-good
         # app remains in place. A partial copy never becomes the target.
         verify_lock
+        for stale in "${TARGET_APP}".installing.*; do
+            [[ -e "$stale" ]] || continue
+            [[ "$stale" == "$TARGET_PENDING" ]] && continue
+            rm -rf "$stale"
+        done
         rm -rf "$TARGET_PENDING"
         if ! "$DITTO" "$SOURCE_APP" "$TARGET_PENDING"; then
             fail "unable to copy the replacement app"
@@ -363,6 +530,9 @@ public enum UpdateInstaller {
         EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PENDING_PLIST" 2>/dev/null || true)"
         [[ -n "$EXECUTABLE_NAME" && -x "$TARGET_PENDING/Contents/MacOS/$EXECUTABLE_NAME" ]] || fail "replacement executable is missing"
         "$CODESIGN" --verify --deep --strict "$TARGET_PENDING" || fail "replacement signature verification failed"
+        # Let the verified new build perform the swap. A defect in the old
+        # build's helper can then no longer block updates after bootstrap.
+        SWAPPER="${WALLPAPERMAC_UPDATE_SWAPPER:-$TARGET_PENDING/Contents/MacOS/$EXECUTABLE_NAME}"
         [[ -x "$SWAPPER" ]] || fail "update swap helper is unavailable"
 
         # RENAME_SWAP exchanges the complete old and new apps atomically. The
@@ -413,7 +583,7 @@ public enum UpdateInstaller {
         if [[ -n "$EXECUTABLE_NAME" && -x "$TARGET_EXECUTABLE" ]]; then
             echo "launching replacement executable directly"
             "$TARGET_EXECUTABLE" --update-health-token "$HEALTH_TOKEN" \
-                --update-health-file "$HEALTH_ACK" >/dev/null 2>&1 &
+                --update-health-file "$HEALTH_ACK" </dev/null >/dev/null 2>&1 &
             DIRECT_PID=$!
             wait_for_health "$HEALTH_WAIT_STEPS" || true
         fi
@@ -423,7 +593,7 @@ public enum UpdateInstaller {
             echo "direct launch did not acknowledge; retrying through open"
             if "$OPEN" -n "$TARGET_APP" --args \
                 --update-health-token "$HEALTH_TOKEN" \
-                --update-health-file "$HEALTH_ACK"; then
+                --update-health-file "$HEALTH_ACK" </dev/null; then
                 wait_for_health "$HEALTH_WAIT_STEPS" || true
             fi
         fi
@@ -446,6 +616,36 @@ public enum UpdateInstaller {
         [[ -z "$DIRECT_PID" ]] || kill "$DIRECT_PID" 2>/dev/null || true
         fail "replacement did not become healthy"
         """
+    }
+
+    /// Removes abandoned `.installing.<pid>` copies left by failed swaps.
+    /// Callers must hold the target update lock; `...IfUnlocked` does that.
+    /// `.previous` is intentionally preserved as a manual rollback backup.
+    public static func removeStaleInstallerBackups(
+        targetAppURL: URL,
+        fileManager: FileManager = .default
+    ) {
+        let parent = targetAppURL.deletingLastPathComponent()
+        let prefix = targetAppURL.lastPathComponent + ".installing."
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: parent,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        for entry in entries where entry.lastPathComponent.hasPrefix(prefix) {
+            try? fileManager.removeItem(at: entry)
+        }
+    }
+
+    /// Best-effort launch cleanup: skips when another installer holds the
+    /// target lock, so an in-flight update is never disturbed.
+    public static func removeStaleInstallerBackupsIfUnlocked(
+        targetAppURL: URL,
+        fileManager: FileManager = .default
+    ) {
+        guard let lock = try? UpdateInstallLock(targetAppURL: targetAppURL) else { return }
+        removeStaleInstallerBackups(targetAppURL: targetAppURL, fileManager: fileManager)
+        _ = lock
     }
 
     // MARK: - Helpers

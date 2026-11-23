@@ -555,7 +555,7 @@ private struct SettingsView: View {
                     .foregroundStyle(AppTheme.Palette.danger)
                 Spacer()
                 if updateService.canRetryDownload {
-                    Button("重试下载") { updateService.retryDownload() }
+                    Button("重试更新") { updateService.retryDownload() }
                         .disabled(updateService.isBusy)
                 }
             }

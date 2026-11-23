@@ -923,10 +923,18 @@ let tests: [(String, () throws -> Void)] = [
     ("quotes shell paths safely", testUpdateShellQuotingSurvivesApostrophes),
     ("waits for parent and rolls back install", testUpdateInstallScriptWaitsForParentAndRollsBack),
     ("copy failure leaves original app untouched", testUpdateCopyFailureLeavesOriginalAppUntouched),
+    ("writes failure journal and relaunches old app", testUpdateFailureWritesJournalAndRelaunchesOldApp),
+    ("installer startup handshake detects live and dead scripts", testInstallerStartupHandshakeDetectsLiveAndDeadScripts),
+    ("generated installer uses the verified pending helper", testGeneratedInstallerUsesVerifiedPendingSwapHelper),
+    ("health failure rolls back through the real helper", testHealthFailureRollsBackWithRealHelperAndJournal),
+    ("failed rollback launches the preserved backup", testFailedRollbackLaunchesPreservedBackup),
     ("relaunch failure restores original app", testUpdateRelaunchFailureRestoresOriginalApp),
     ("validated sibling installs successfully", testUpdateSuccessfulInstallUsesValidatedSibling),
     ("wrong pending version aborts before swap", testUpdateRejectsWrongPendingVersionBeforeSwap),
     ("atomic swap keeps a complete app at target", testAtomicSwapKeepsCompleteAppAtTarget),
+    ("atomic swap accepts installer temporary names", testAtomicSwapAcceptsInstallerTemporaryNames),
+    ("removes stale installer backups but keeps previous", testRemoveStaleInstallerBackupsKeepsPrevious),
+    ("round trips failed-install journal", testUpdateInstallJournalRoundTripsFailure),
     ("reads installed version from the app on disk", testInstalledVersionReadsBundlePlist),
     ("skips installing a version already on disk", testUpdateVersionGuardUsesDiskVersion),
     ("launches the replacement directly when open drops arguments", testInstallScriptUsesDirectLaunch),
@@ -965,6 +973,25 @@ let tests: [(String, () throws -> Void)] = [
     ("keeps deleted placeholders across reorder", testQueueReorderKeepsDeletedPlaceholders)
 ]
 
+// Prints the generated installer for the end-to-end update smoke test.
+if CommandLine.arguments.count >= 8, CommandLine.arguments[1] == "--print-install-script" {
+    guard let parentPID = Int32(CommandLine.arguments[2]) else {
+        FileHandle.standardError.write(Data("invalid parent pid\n".utf8))
+        exit(2)
+    }
+    let resultArgument = CommandLine.arguments[7]
+    let script = UpdateInstaller.installScript(
+        parentPID: parentPID,
+        sourceAppPath: CommandLine.arguments[3],
+        targetAppPath: CommandLine.arguments[4],
+        stagingPath: CommandLine.arguments[5],
+        expectedVersion: CommandLine.arguments[6],
+        resultFile: resultArgument == "-" ? nil : resultArgument
+    )
+    print(script, terminator: "")
+    exit(0)
+}
+
 // Limited integration probe used by scripts/update-install-lock-smoke.sh.
 // It exercises a real process/descriptor boundary without starting the app.
 if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--update-lock-probe" {
@@ -980,6 +1007,69 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--update-lock-
         FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
         exit(1)
     }
+}
+
+// Shipping swap helper, exposed so generated-script tests can exercise the
+// real producer/consumer contract instead of a permissive fake swapper.
+if CommandLine.arguments.count == 4, CommandLine.arguments[1] == "--update-swap" {
+    do {
+        try UpdateInstaller.atomicSwap(
+            pendingAppURL: URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true),
+            targetAppURL: URL(fileURLWithPath: CommandLine.arguments[3], isDirectory: true)
+        )
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
+        exit(1)
+    }
+}
+if CommandLine.arguments.count == 4, CommandLine.arguments[1] == "--update-lock-check" {
+    do {
+        try UpdateInstaller.verifyInheritedLock(
+            lockURL: URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: false),
+            expectedToken: CommandLine.arguments[3]
+        )
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
+        exit(1)
+    }
+}
+
+// Production launch handoff, exposed for the end-to-end smoke test: acquire
+// the target lock, write and spawn the generated script, wait for its startup
+// marker, then exit so the script can proceed. Mirrors UpdateService exactly.
+if CommandLine.arguments.count == 7, CommandLine.arguments[1] == "--launch-detached-probe" {
+    let target = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+    let source = URL(fileURLWithPath: CommandLine.arguments[3], isDirectory: true)
+    let staging = URL(fileURLWithPath: CommandLine.arguments[4], isDirectory: true)
+    let version = CommandLine.arguments[5]
+    let resultFile = URL(fileURLWithPath: CommandLine.arguments[6], isDirectory: false)
+    let semaphore = DispatchSemaphore(value: 0)
+    Task {
+        do {
+            let lock = try UpdateInstallLock(targetAppURL: target)
+            let prepared = PreparedUpdateInstall(
+                appBundleURL: source,
+                version: version,
+                targetAppURL: target,
+                stagingDirectory: staging
+            )
+            try await UpdateInstaller.launchDetachedInstall(
+                of: prepared,
+                installLock: lock,
+                resultFile: resultFile
+            )
+            print("DETACHED_STARTED")
+            fflush(stdout)
+            semaphore.signal()
+        } catch {
+            FileHandle.standardError.write(Data("DETACHED_FAILED: \(error.localizedDescription)\n".utf8))
+            exit(1)
+        }
+    }
+    semaphore.wait()
+    exit(0)
 }
 
 var failures = 0
@@ -2255,6 +2345,34 @@ private func writeMiniApp(at app: URL, version: String, marker: String) throws {
     try data.write(to: app.appendingPathComponent("Contents/Info.plist"))
 }
 
+/// A mini app whose executable forwards the shipping update helper commands to
+/// the test binary. This lets generated-script tests exercise the real swap
+/// validation without overriding WALLPAPERMAC_UPDATE_SWAPPER.
+private func writeShimApp(at app: URL, version: String, probe: String) throws {
+    let executable = app.appendingPathComponent("Contents/MacOS/WallpaperMac")
+    try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let quotedProbe = UpdateInstaller.shellQuote(probe)
+    let script = """
+    #!/bin/zsh
+    if [[ "$1" == "--update-swap" ]]; then
+        exec \(quotedProbe) --update-swap "$2" "$3"
+    fi
+    if [[ "$1" == "--update-lock-check" ]]; then
+        exec \(quotedProbe) --update-lock-check "$2" "$3"
+    fi
+    exit 1
+    """
+    try script.write(to: executable, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+    let plist: [String: Any] = [
+        "CFBundleShortVersionString": version,
+        "CFBundleVersion": version,
+        "CFBundleExecutable": "WallpaperMac",
+    ]
+    let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+    try data.write(to: app.appendingPathComponent("Contents/Info.plist"))
+}
+
 private func makeUpdateScriptFixture(expectedVersion: String = "9.9.9") throws -> UpdateScriptFixture {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("WallpaperMacUpdateScriptTests", isDirectory: true)
@@ -2282,11 +2400,11 @@ private func makeUpdateScriptFixture(expectedVersion: String = "9.9.9") throws -
     )
 }
 
-private func runUpdateScript(_ fixture: UpdateScriptFixture, ditto: String, openStatus: Int32, healthAck: Bool = true, healthWaitSteps: Int = 2, installLock: UpdateInstallLock? = nil, failRollback: Bool = false) throws -> Int32 {
+private func runUpdateScript(_ fixture: UpdateScriptFixture, ditto: String, openStatus: Int32, healthAck: Bool = true, healthWaitSteps: Int = 2, installLock: UpdateInstallLock? = nil, failRollback: Bool = false, realPendingHelper: Bool = false) throws -> Int32 {
     let fakeOpen = fixture.root.appendingPathComponent("fake-open.sh")
     let script = """
     #!/bin/zsh
-    print -r -- "$1" >> "$OPEN_LOG"
+    print -r -- "$@" >> "$OPEN_LOG"
     TOKEN=""
     ACK=""
     NEXT=""
@@ -2345,13 +2463,12 @@ private func runUpdateScript(_ fixture: UpdateScriptFixture, ditto: String, open
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/bin/zsh")
     process.arguments = [fixture.script.path]
-    process.environment = [
+    var environment: [String: String] = [
         "PATH": "/bin:/usr/bin",
         "WALLPAPERMAC_DITTO": ditto,
         "WALLPAPERMAC_OPEN": fakeOpen.path,
         "WALLPAPERMAC_XATTR": "/usr/bin/xattr",
         "WALLPAPERMAC_CODESIGN": "/usr/bin/true",
-        "WALLPAPERMAC_UPDATE_SWAPPER": fakeSwapper.path,
         "WALLPAPERMAC_HEALTH_WAIT_STEPS": String(healthWaitSteps),
         "WALLPAPERMAC_HEALTH_ACK": healthAck ? "1" : "0",
         "WALLPAPERMAC_HEALTH_VERSION": "9.9.9",
@@ -2360,6 +2477,10 @@ private func runUpdateScript(_ fixture: UpdateScriptFixture, ditto: String, open
         "OPEN_LOG": fixture.openLog.path,
         "OPEN_STATUS": String(openStatus),
     ]
+    if !realPendingHelper {
+        environment["WALLPAPERMAC_UPDATE_SWAPPER"] = fakeSwapper.path
+    }
+    process.environment = environment
     process.standardOutput = FileHandle.nullDevice
     let errorLog = fixture.root.appendingPathComponent("script-error.log")
     FileManager.default.createFile(atPath: errorLog.path, contents: nil)
@@ -2395,8 +2516,199 @@ func testUpdateCopyFailureLeavesOriginalAppUntouched() throws {
     let status = try runUpdateScript(fixture, ditto: failingDitto.path, openStatus: 0)
     try expect(status, equals: 1, "a partial copy must fail the install")
     try expect(appMarker(fixture.targetApp), equals: "old-complete", "copy failure must leave the old app in place")
+    let openLog = (try? String(contentsOf: fixture.openLog, encoding: .utf8)) ?? ""
+    try expect(openLog.contains(fixture.targetApp.path), "a pre-swap failure must relaunch the existing app")
     try expect(!FileManager.default.fileExists(atPath: fixture.targetApp.appendingPathComponent("WallpaperMac.app.previous").path), "rollback must never nest the previous app")
     try expect(!FileManager.default.fileExists(atPath: fixture.targetApp.appendingPathComponent("Contents/MacOS/WallpaperMac.installing").path), "partial content must not reach the real executable path")
+}
+
+func testUpdateFailureWritesJournalAndRelaunchesOldApp() throws {
+    let fixture = try makeUpdateScriptFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let failureFile = fixture.root.appendingPathComponent("last-install-failure.txt")
+    let script = UpdateInstaller.installScript(
+        parentPID: 999_999_999,
+        sourceAppPath: fixture.sourceApp.path,
+        targetAppPath: fixture.targetApp.path,
+        stagingPath: fixture.staging.path,
+        expectedVersion: "9.9.9",
+        resultFile: failureFile.path
+    )
+    try script.write(to: fixture.script, atomically: true, encoding: .utf8)
+    let failingDitto = fixture.root.appendingPathComponent("failing-ditto.sh")
+    try makeFailingDitto(at: failingDitto)
+
+    let status = try runUpdateScript(fixture, ditto: failingDitto.path, openStatus: 0)
+    try expect(status, equals: 1, "the failing copy should abort the install")
+    let failure = UpdateInstallJournal.takeFailure(directory: fixture.root)
+    try expect(failure?.version, equals: "9.9.9", "the journal should record the target version")
+    try expect(failure?.message.contains("unable to copy") == true, "the journal should carry the installer error")
+    try expect(failure?.logPath?.hasSuffix("install.log") == true, "the journal should point at the install log")
+    let openLog = (try? String(contentsOf: fixture.openLog, encoding: .utf8)) ?? ""
+    try expect(openLog.contains(fixture.targetApp.path), "a failed install must relaunch the old app")
+}
+
+func testGeneratedInstallerUsesVerifiedPendingSwapHelper() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WallpaperMacPendingHelperTests", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let staging = root.appendingPathComponent("staging")
+    let sourceApp = staging.appendingPathComponent("extracted/WallpaperMac.app")
+    let targetApp = root.appendingPathComponent("Applications/WallpaperMac.app")
+    let probe = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path
+    try writeShimApp(at: sourceApp, version: "9.9.9", probe: probe)
+    try writeMiniApp(at: targetApp, version: "0.1.0", marker: "old-complete")
+    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+    let scriptURL = staging.appendingPathComponent("install.sh")
+    let script = UpdateInstaller.installScript(
+        parentPID: 999_999_999,
+        sourceAppPath: sourceApp.path,
+        targetAppPath: targetApp.path,
+        stagingPath: staging.path,
+        expectedVersion: "9.9.9"
+    )
+    try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+    let fixture = UpdateScriptFixture(
+        root: root,
+        sourceApp: sourceApp,
+        targetApp: targetApp,
+        staging: staging,
+        script: scriptURL,
+        openLog: root.appendingPathComponent("open.log")
+    )
+
+    let status = try runUpdateScript(
+        fixture,
+        ditto: "/usr/bin/ditto",
+        openStatus: 0,
+        realPendingHelper: true
+    )
+    try expect(status, equals: 0, "the verified pending build should perform the swap")
+    try expect(
+        UpdateInstaller.installedVersion(at: targetApp),
+        equals: "9.9.9",
+        "the generated installer must accept its own .installing.<pid> name"
+    )
+    try expect(
+        UpdateInstaller.installedVersion(at: targetApp.appendingPathExtension("previous")),
+        equals: "0.1.0",
+        "the outgoing app should be retained for rollback"
+    )
+    try expect(!FileManager.default.fileExists(atPath: staging.path), "a successful install should clean staging")
+}
+
+func testHealthFailureRollsBackWithRealHelperAndJournal() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WallpaperMacRealRollbackTests", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let staging = root.appendingPathComponent("staging")
+    let sourceApp = staging.appendingPathComponent("extracted/WallpaperMac.app")
+    let targetApp = root.appendingPathComponent("Applications/WallpaperMac.app")
+    let failureFile = root.appendingPathComponent("last-install-failure.txt")
+    let probe = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path
+    try writeShimApp(at: sourceApp, version: "9.9.9", probe: probe)
+    try writeMiniApp(at: targetApp, version: "0.1.0", marker: "old-complete")
+    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+    let scriptURL = staging.appendingPathComponent("install.sh")
+    let script = UpdateInstaller.installScript(
+        parentPID: 999_999_999,
+        sourceAppPath: sourceApp.path,
+        targetAppPath: targetApp.path,
+        stagingPath: staging.path,
+        expectedVersion: "9.9.9",
+        resultFile: failureFile.path
+    )
+    try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+    let fixture = UpdateScriptFixture(
+        root: root,
+        sourceApp: sourceApp,
+        targetApp: targetApp,
+        staging: staging,
+        script: scriptURL,
+        openLog: root.appendingPathComponent("open.log")
+    )
+
+    let status = try runUpdateScript(
+        fixture,
+        ditto: "/usr/bin/ditto",
+        openStatus: 0,
+        healthAck: false,
+        healthWaitSteps: 2,
+        realPendingHelper: true
+    )
+    try expect(status, equals: 1, "a new build that never becomes healthy must fail the install")
+    try expect(
+        UpdateInstaller.installedVersion(at: targetApp),
+        equals: "0.1.0",
+        "the real .previous operand must roll back to the old app"
+    )
+    try expect(
+        UpdateInstaller.installedVersion(at: targetApp.appendingPathExtension("previous")),
+        equals: "9.9.9",
+        "the failed new generation should remain in the backup"
+    )
+    let failure = UpdateInstallJournal.takeFailure(directory: root)
+    try expect(
+        failure?.message.contains("did not become healthy") == true,
+        "the journal should record the health failure"
+    )
+    try expect(
+        FileManager.default.fileExists(atPath: staging.appendingPathComponent("install.log").path),
+        "a failed install should preserve its log"
+    )
+}
+
+func testInstallerStartupHandshakeDetectsLiveAndDeadScripts() throws {
+    try runAsyncTest {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WallpaperMacInstallerStartupTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let marker = root.appendingPathComponent("installer-started")
+
+        let readyScript = root.appendingPathComponent("ready.sh")
+        try "#!/bin/zsh\n: > \"$1\"\nsleep 5\n".write(to: readyScript, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: readyScript.path)
+        let ready = Process()
+        ready.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        ready.arguments = [readyScript.path, marker.path]
+        ready.standardOutput = FileHandle.nullDevice
+        ready.standardError = FileHandle.nullDevice
+        try ready.run()
+        defer {
+            if ready.isRunning { ready.terminate() }
+            ready.waitUntilExit()
+        }
+
+        try await UpdateInstaller.waitForInstallerStart(markerURL: marker, process: ready, timeout: 5)
+        try expect(
+            FileManager.default.fileExists(atPath: marker.path),
+            "a live installer publishing its startup marker should be accepted"
+        )
+
+        try FileManager.default.removeItem(at: marker)
+        let deadScript = root.appendingPathComponent("dead.sh")
+        try "#!/bin/zsh\nexit 1\n".write(to: deadScript, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: deadScript.path)
+        let dead = Process()
+        dead.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        dead.arguments = [deadScript.path]
+        dead.standardOutput = FileHandle.nullDevice
+        dead.standardError = FileHandle.nullDevice
+        try dead.run()
+        dead.waitUntilExit()
+
+        var aborted = false
+        do {
+            try await UpdateInstaller.waitForInstallerStart(markerURL: marker, process: dead, timeout: 1)
+        } catch {
+            aborted = true
+        }
+        try expect(aborted, "an installer that exits before publishing its marker must abort the update")
+    }
 }
 
 func testUpdateRelaunchFailureRestoresOriginalApp() throws {
@@ -2435,6 +2747,65 @@ func testUpdateRejectsWrongPendingVersionBeforeSwap() throws {
     try expect(status, equals: 1, "a wrong pending version must abort the install")
     try expect(appMarker(fixture.targetApp), equals: "old-complete", "version rejection must not move the old app")
     try expect(!FileManager.default.fileExists(atPath: fixture.targetApp.appendingPathExtension("previous").path), "version rejection must happen before backup/swap")
+}
+
+func testAtomicSwapAcceptsInstallerTemporaryNames() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WallpaperMacAtomicSwapNameTests", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let target = root.appendingPathComponent("WallpaperMac.app")
+    let pending = root.appendingPathComponent("WallpaperMac.app.installing.12345")
+    let previous = root.appendingPathComponent("WallpaperMac.app.previous")
+    try writeMiniApp(at: target, version: "1.0.0", marker: "old-complete")
+    try writeMiniApp(at: pending, version: "2.0.0", marker: "new-complete")
+
+    try UpdateInstaller.atomicSwap(pendingAppURL: pending, targetAppURL: target)
+    try expect(appMarker(target), equals: "new-complete", "an .installing.<pid> sibling should be swapable")
+    try expect(appMarker(pending), equals: "old-complete", "the old app should move into the pending slot")
+
+    try FileManager.default.moveItem(at: pending, to: previous)
+    try UpdateInstaller.atomicSwap(pendingAppURL: previous, targetAppURL: target)
+    try expect(appMarker(target), equals: "old-complete", "an .previous backup should be swapable for rollback")
+    try expect(appMarker(previous), equals: "new-complete", "rollback should preserve the failed new app")
+}
+
+func testRemoveStaleInstallerBackupsKeepsPrevious() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WallpaperMacStaleBackupTests", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let target = root.appendingPathComponent("WallpaperMac.app")
+    try writeMiniApp(at: target, version: "1.0.0", marker: "current")
+    let staleOne = root.appendingPathComponent("WallpaperMac.app.installing.1")
+    let staleTwo = root.appendingPathComponent("WallpaperMac.app.installing.2")
+    let previous = root.appendingPathComponent("WallpaperMac.app.previous")
+    try FileManager.default.createDirectory(at: staleOne, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: staleTwo, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: previous, withIntermediateDirectories: true)
+
+    UpdateInstaller.removeStaleInstallerBackups(targetAppURL: target)
+    try expect(!FileManager.default.fileExists(atPath: staleOne.path), "stale .installing backups should be removed")
+    try expect(!FileManager.default.fileExists(atPath: staleTwo.path), "all stale .installing backups should be removed")
+    try expect(FileManager.default.fileExists(atPath: previous.path), "the .previous rollback backup must be retained")
+    try expect(appMarker(target), equals: "current", "the current app must not be touched")
+}
+
+func testUpdateInstallJournalRoundTripsFailure() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WallpaperMacInstallJournalTests", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let failure = UpdateInstallFailure(
+        version: "9.9.9",
+        message: "atomic replacement failed",
+        logPath: "/tmp/WallpaperMacUpdate/install.log",
+        recordedAt: "2026-11-24T00:00:00Z"
+    )
+    try UpdateInstallJournal.writeFailure(failure, directory: root)
+    let taken = UpdateInstallJournal.takeFailure(directory: root)
+    try expect(taken, equals: failure, "the failed-install journal should round-trip")
+    try expect(UpdateInstallJournal.takeFailure(directory: root) == nil, "taking a failure should remove it")
 }
 
 func testAtomicSwapKeepsCompleteAppAtTarget() throws {
@@ -2533,6 +2904,52 @@ func testUpdateRollbackFailurePreservesBackupAndDoesNotOpenBrokenTarget() throws
     try expect(!FileManager.default.fileExists(atPath: fixture.targetApp.appendingPathComponent("WallpaperMac.app.previous").path), "no nested backup may be created")
 }
 
+func testFailedRollbackLaunchesPreservedBackup() throws {
+    let fixture = try makeUpdateScriptFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let launchLog = fixture.root.appendingPathComponent("backup-launch.log")
+    let executable = fixture.targetApp.appendingPathComponent("Contents/MacOS/WallpaperMac")
+    let stub = """
+    #!/bin/zsh
+    if [[ "$1" == "--update-swap" ]]; then
+        exit 1
+    fi
+    print -r -- 'launched-backup' >> \(UpdateInstaller.shellQuote(launchLog.path))
+    exit 0
+    """
+    try stub.write(to: executable, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+    let status = try runUpdateScript(
+        fixture,
+        ditto: "/usr/bin/ditto",
+        openStatus: 0,
+        healthAck: false,
+        failRollback: true
+    )
+    try expect(status, equals: 1, "a failed rollback must still fail the install")
+    var launchOutput = ""
+    for _ in 0..<40 {
+        launchOutput = (try? String(contentsOf: launchLog, encoding: .utf8)) ?? ""
+        if launchOutput.contains("launched-backup") { break }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    try expect(
+        launchOutput.contains("launched-backup"),
+        "the complete old app must be launched when rollback cannot swap"
+    )
+    try expect(
+        UpdateInstaller.installedVersion(at: fixture.targetApp),
+        equals: "9.9.9",
+        "the unhealthy new app must remain at the target"
+    )
+    try expect(
+        UpdateInstaller.installedVersion(at: fixture.targetApp.appendingPathExtension("previous")),
+        equals: "0.1.0",
+        "the complete old app must remain in the backup"
+    )
+}
+
 func testUpdateHealthHandshakeWritesMatchingTokenAtomically() throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("WallpaperMacHealthTests", isDirectory: true)
@@ -2568,7 +2985,18 @@ func testUpdateInstallScriptWaitsForParentAndRollsBack() throws {
     try expect(script.contains("\"$DITTO\" \"$SOURCE_APP\" \"$TARGET_PENDING\""), "new bundle should be copied to a sibling before the swap")
     try expect(script.contains("--update-swap \"$TARGET_PENDING\" \"$TARGET_APP\""), "complete bundles should be exchanged atomically")
     try expect(script.contains("SWAP_STARTED=1"), "signal cleanup must track an in-flight swap")
-    try expect(script.contains("SWAPPED == 0 && SWAP_STARTED == 0"), "an in-flight swap must never have its pending backup deleted")
+    try expect(script.contains("PARENT_EXITED=1"), "the installer must know when the app has exited")
+    try expect(script.contains("relaunching current app"), "a pre-swap failure must relaunch the known-good app")
+    try expect(script.contains("RESULT_FILE="), "failed installs should write a durable failure record")
+    try expect(script.contains(": > \"$STAGING_DIR/installer-started\""), "the installer must publish a startup marker before the app quits")
+    try expect(script.contains("$RESULT_FILE.tmp.$$"), "failure records should be published atomically")
+    let trapIndex = script.range(of: "trap finish EXIT")?.lowerBound
+    let setupIndex = script.range(of: "mkdir -p \"$STAGING_DIR\"")?.lowerBound
+    try expect(
+        trapIndex != nil && setupIndex != nil && trapIndex! < setupIndex!,
+        "the exit trap must be installed before staging setup can fail"
+    )
+    try expect(script.contains("TARGET_PENDING/Contents/MacOS/$EXECUTABLE_NAME"), "the verified new build should perform the swap")
     try expect(script.contains("--update-lock-check \"$LOCK_PATH\" \"$LOCK_TOKEN\""), "the Swift helper should verify the inherited lock without Python")
     try expect(script.contains("mv \"$TARGET_PENDING\" \"$TARGET_PREVIOUS\""), "the outgoing app should be retained as the backup")
     try expect(script.contains("\"$XATTR\" -cr \"$TARGET_APP\""), "quarantine bits should be cleared")

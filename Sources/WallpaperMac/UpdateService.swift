@@ -20,7 +20,7 @@ final class UpdateService: ObservableObject {
         case other
 
         var canRetryDownload: Bool {
-            self != .install
+            true
         }
     }
 
@@ -132,6 +132,7 @@ final class UpdateService: ObservableObject {
                 // detached helper handoff. Another app instance must not
                 // prune or replace the same target concurrently.
                 let installLock = try UpdateInstallLock(targetAppURL: Bundle.main.bundleURL)
+                UpdateInstaller.removeStaleInstallerBackups(targetAppURL: Bundle.main.bundleURL)
                 Self.pruneStaleStagingDirectories()
 
                 let downloader = UpdateDownloader()
@@ -157,7 +158,7 @@ final class UpdateService: ObservableObject {
                 await MainActor.run {
                     self.phase = .installing(update)
                 }
-                try UpdateInstaller.launchDetachedInstall(of: prepared, installLock: installLock)
+                try await UpdateInstaller.launchDetachedInstall(of: prepared, installLock: installLock)
                 await MainActor.run {
                     NSApp.terminate(nil)
                 }
@@ -165,6 +166,7 @@ final class UpdateService: ObservableObject {
                 // Hard failure: remove the attempt's staging directory so no
                 // partially downloaded or extracted update lingers.
                 try? FileManager.default.removeItem(at: stagingDirectory)
+                UserDefaults.standard.removeObject(forKey: SettingsKey.lastUpdateCheckDate)
                 await MainActor.run {
                     self.retryUpdate = update
                     self.phase = .failed(Self.failureKind(for: error), error.localizedDescription)

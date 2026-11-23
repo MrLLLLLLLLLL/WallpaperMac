@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         GlobalHotKeyService.shared.register {
             NotificationCenter.default.post(name: .wallpaperMacStatusHideHiddenWallpapers, object: nil)
         }
+        UpdateInstaller.removeStaleInstallerBackupsIfUnlocked(targetAppURL: Bundle.main.bundleURL)
         WallpaperVideoCompatibilityService.removeLegacyPlaybackCache()
         statusBarController = StatusBarController(
             showMainWindow: { [weak self] in self?.showMainWindow() },
@@ -23,15 +24,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         showMainWindow()
 
-        // Daily update check runs at launch, independent of the settings UI.
-        if UserDefaults.standard.object(forKey: SettingsKey.autoCheckUpdates) as? Bool ?? true {
-            UpdateService.shared.runDailyCheckIfNeeded()
-        }
-
+        // A freshly installed build must acknowledge the installer before any
+        // modal UI can block the launch; otherwise a stale failure alert would
+        // make the installer believe the new build never became healthy.
         do {
             _ = try UpdateHealthHandshake.acknowledge(arguments: CommandLine.arguments)
         } catch {
             NSLog("WallpaperMac update health acknowledgement failed: \(error.localizedDescription)")
+        }
+
+        // Consume any failure left behind by the detached installer. Record it
+        // now, but defer the modal until the launch has completed so it cannot
+        // delay the health acknowledgement above.
+        if let failure = UpdateInstallJournal.takeFailure() {
+            // Allow the daily check to run again after a failed install.
+            UserDefaults.standard.removeObject(forKey: SettingsKey.lastUpdateCheckDate)
+            Task { @MainActor [weak self] in
+                self?.presentInstallFailure(failure)
+            }
+        }
+
+        // Daily update check runs at launch, independent of the settings UI.
+        if UserDefaults.standard.object(forKey: SettingsKey.autoCheckUpdates) as? Bool ?? true {
+            UpdateService.shared.runDailyCheckIfNeeded()
+        }
+    }
+
+    private func presentInstallFailure(_ failure: UpdateInstallFailure) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "更新未完成"
+        let targetVersion = failure.version ?? "新版本"
+        var details = "更新到 \(targetVersion) 未完成：\(failure.message)\n"
+        if let installedVersion = UpdateInstaller.installedVersion(at: Bundle.main.bundleURL) {
+            if let failedVersion = failure.version, installedVersion == failedVersion {
+                details += "当前安装的是 \(installedVersion)，但未能确认安装后的首次启动是否正常。"
+            } else {
+                details += "当前仍使用已安装版本 \(installedVersion)。"
+            }
+        } else {
+            details += "当前仍使用已安装版本。"
+        }
+        if let logPath = failure.logPath, !logPath.isEmpty {
+            details += "\n\n安装日志：\(logPath)"
+        }
+        alert.informativeText = details
+        alert.addButton(withTitle: "好")
+        if let logPath = failure.logPath, !logPath.isEmpty {
+            alert.addButton(withTitle: "打开安装日志")
+        }
+        let response = alert.runModal()
+        if response == .alertSecondButtonReturn,
+           let logPath = failure.logPath,
+           !logPath.isEmpty {
+            NSWorkspace.shared.open(URL(fileURLWithPath: logPath))
         }
     }
 
@@ -41,7 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         mainWindowController?.showWindow(nil)
         mainWindowController?.window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        activateApplication()
     }
 
     func showSettingsWindow() {
@@ -50,7 +96,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         settingsWindowController?.showWindow(nil)
         settingsWindowController?.window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        activateApplication()
+    }
+
+    /// A direct-exec launched copy can start behind the previously active app.
+    /// Prefer the modern cooperative activation API when it is available.
+    private func activateApplication() {
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     private func openLibrary() {

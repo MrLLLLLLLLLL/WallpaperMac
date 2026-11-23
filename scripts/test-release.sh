@@ -102,6 +102,9 @@ printf '%s\n' '== Web external navigation authorization =='
 printf '%s\n' '== Web media pause and renderer recovery =='
 ./scripts/web-lifecycle-runtime-test.sh
 
+printf '%s\n' '== Install and restart handoff =='
+./scripts/update-install-restart-smoke.sh
+
 printf '%s\n' '== App smoke test =='
 ./scripts/smoke-app.sh
 
