@@ -24,25 +24,54 @@ STATE_BACKUP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/wallpapermac-release-state.XXXXXX
 CONFIG_DIR="$HOME/Library/Application Support/WallpaperMac/Configuration"
 DEFAULTS_BACKUP="$STATE_BACKUP_DIR/defaults.plist"
 CONFIG_EXISTED=0
+
+# A previous interrupted test may have left the durable library path pointing
+# at a temporary fixture. Heal it before snapshotting; otherwise this suite
+# would faithfully restore the poisoned state on exit.
+TEMP_ROOT="${TMPDIR:-/tmp}"
+TEMP_ROOT="${TEMP_ROOT%/}"
+TEMP_ROOT_REAL="$(cd "$TEMP_ROOT" 2>/dev/null && pwd -P || print -r -- "$TEMP_ROOT")"
+DEFAULT_LIBRARY="$HOME/Library/Application Support/WallpaperMac/Library"
+CURRENT_LIBRARY="$(defaults read com.wallpaper.mac 'WallpaperMac.libraryPath' 2>/dev/null || true)"
+case "$CURRENT_LIBRARY" in
+    "$TEMP_ROOT"/*|"$TEMP_ROOT_REAL"/*)
+        defaults write com.wallpaper.mac 'WallpaperMac.libraryPath' -string "$DEFAULT_LIBRARY"
+        rm -f "$CONFIG_DIR/library-configuration.json"
+        print -u2 "Restored WallpaperMac.libraryPath after a temporary test path was found."
+        ;;
+esac
+
 if [[ -d "$CONFIG_DIR" ]]; then
-    cp -R "$CONFIG_DIR" "$STATE_BACKUP_DIR/Configuration"
     CONFIG_EXISTED=1
+    cp -R "$CONFIG_DIR" "$STATE_BACKUP_DIR/Configuration"
 fi
 if ! defaults export com.wallpaper.mac "$DEFAULTS_BACKUP" 2>/dev/null; then
     rm -f "$DEFAULTS_BACKUP"
 fi
 
 restore_app_state() {
-    if [[ -f "$DEFAULTS_BACKUP" ]]; then
+    if [[ -s "$DEFAULTS_BACKUP" ]]; then
         defaults delete com.wallpaper.mac >/dev/null 2>&1 || true
         defaults import com.wallpaper.mac "$DEFAULTS_BACKUP" >/dev/null 2>&1 || true
     fi
     if (( CONFIG_EXISTED )); then
-        rm -rf "$CONFIG_DIR"
-        cp -R "$STATE_BACKUP_DIR/Configuration" "$CONFIG_DIR"
+        if [[ -d "$STATE_BACKUP_DIR/Configuration" ]]; then
+            rm -rf "$CONFIG_DIR"
+            cp -R "$STATE_BACKUP_DIR/Configuration" "$CONFIG_DIR" 2>/dev/null || true
+        fi
     else
         rm -rf "$CONFIG_DIR"
     fi
+    # Never leave the user's durable library pointing at a temp fixture, even
+    # if the snapshot itself was poisoned.
+    RESTORED_LIBRARY="$(defaults read com.wallpaper.mac 'WallpaperMac.libraryPath' 2>/dev/null || true)"
+    case "$RESTORED_LIBRARY" in
+        "$TEMP_ROOT"/*|"$TEMP_ROOT_REAL"/*)
+            defaults write com.wallpaper.mac 'WallpaperMac.libraryPath' -string "$DEFAULT_LIBRARY"
+            rm -f "$CONFIG_DIR/library-configuration.json"
+            print -u2 "Restored WallpaperMac.libraryPath after the test suite left a temporary path."
+            ;;
+    esac
     rm -rf "$STATE_BACKUP_DIR"
 }
 trap restore_app_state EXIT INT TERM

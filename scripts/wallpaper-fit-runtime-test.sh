@@ -27,16 +27,18 @@ cleanup() {
     for key in 'WallpaperMac.libraryPath' 'WallpaperMac.onboardingCompleted' 'WallpaperMac.fitMode'; do
         defaults delete com.wallpaper.mac "$key" >/dev/null 2>&1 || true
     done
-    if (( DEFAULTS_BACKED_UP )); then
+    if (( DEFAULTS_BACKED_UP )) && [[ -s "$DEFAULTS_BACKUP" ]]; then
         defaults import com.wallpaper.mac "$DEFAULTS_BACKUP" >/dev/null 2>&1 || true
     fi
     # The app records the test library in a configuration file that outlives
     # UserDefaults; restore it so the next normal launch uses the real library.
     if (( CONFIG_EXISTED )); then
-        rm -rf "$CONFIG_DIR"
-        cp -R "$CONFIG_BACKUP" "$CONFIG_DIR"
+        if [[ -d "$CONFIG_BACKUP" ]]; then
+            rm -rf "$CONFIG_DIR"
+            cp -R "$CONFIG_BACKUP" "$CONFIG_DIR" 2>/dev/null || true
+        fi
     else
-        rm -f "$CONFIG_DIR/library-configuration.json"
+        rm -rf "$CONFIG_DIR"
     fi
     if [[ "${WALLPAPERMAC_TEST_KEEP_ARTIFACTS:-0}" == 1 ]]; then
         printf 'fit test artifacts: %s\n' "$TEST_ROOT"
@@ -55,8 +57,8 @@ if pgrep -x WallpaperMac >/dev/null 2>&1; then
 fi
 defaults export com.wallpaper.mac "$DEFAULTS_BACKUP" >/dev/null 2>&1 && DEFAULTS_BACKED_UP=1
 if [[ -d "$CONFIG_DIR" ]]; then
-    cp -R "$CONFIG_DIR" "$CONFIG_BACKUP"
     CONFIG_EXISTED=1
+    cp -R "$CONFIG_DIR" "$CONFIG_BACKUP" || true
 fi
 mkdir -p "$TEST_ROOT/Library/Assets"
 

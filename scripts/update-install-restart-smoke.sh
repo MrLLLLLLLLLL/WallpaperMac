@@ -61,7 +61,7 @@ stop_target_app() {
 
 cleanup() {
     stop_target_app
-    if (( DEFAULTS_BACKED_UP )); then
+    if (( DEFAULTS_BACKED_UP )) && [[ -s "$DEFAULTS_BACKUP" ]]; then
         defaults delete com.wallpaper.mac >/dev/null 2>&1 || true
         defaults import com.wallpaper.mac "$DEFAULTS_BACKUP" >/dev/null 2>&1 || true
     else
@@ -70,14 +70,18 @@ cleanup() {
         defaults delete com.wallpaper.mac 'WallpaperMac.autoCheckUpdates' >/dev/null 2>&1 || true
     fi
     if (( CONFIG_EXISTED )); then
-        rm -rf "$CONFIG_DIR"
-        cp -R "$CONFIG_BACKUP" "$CONFIG_DIR" 2>/dev/null || true
+        if [[ -d "$CONFIG_BACKUP" ]]; then
+            rm -rf "$CONFIG_DIR"
+            cp -R "$CONFIG_BACKUP" "$CONFIG_DIR" 2>/dev/null || true
+        fi
     else
         rm -rf "$CONFIG_DIR"
     fi
     if (( JOURNAL_EXISTED )); then
-        rm -rf "$JOURNAL_DIR"
-        cp -R "$JOURNAL_BACKUP" "$JOURNAL_DIR" 2>/dev/null || true
+        if [[ -d "$JOURNAL_BACKUP" ]]; then
+            rm -rf "$JOURNAL_DIR"
+            cp -R "$JOURNAL_BACKUP" "$JOURNAL_DIR" 2>/dev/null || true
+        fi
     else
         rm -rf "$JOURNAL_DIR"
     fi
@@ -93,13 +97,14 @@ fi
 defaults export com.wallpaper.mac "$DEFAULTS_BACKUP" >/dev/null 2>&1 && DEFAULTS_BACKED_UP=1
 mkdir -p "$TEST_ROOT/Library" "$TARGET_PARENT"
 if [[ -d "$CONFIG_DIR" ]]; then
-    cp -R "$CONFIG_DIR" "$CONFIG_BACKUP"
     CONFIG_EXISTED=1
+    cp -R "$CONFIG_DIR" "$CONFIG_BACKUP" || true
 fi
 if [[ -d "$JOURNAL_DIR" ]]; then
-    cp -R "$JOURNAL_DIR" "$JOURNAL_BACKUP"
     JOURNAL_EXISTED=1
-    rm -rf "$JOURNAL_DIR"
+    if cp -R "$JOURNAL_DIR" "$JOURNAL_BACKUP"; then
+        rm -rf "$JOURNAL_DIR"
+    fi
 fi
 defaults write com.wallpaper.mac 'WallpaperMac.libraryPath' -string "$TEST_ROOT/Library"
 defaults write com.wallpaper.mac 'WallpaperMac.onboardingCompleted' -bool YES
