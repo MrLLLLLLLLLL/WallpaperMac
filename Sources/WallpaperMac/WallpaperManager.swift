@@ -78,12 +78,20 @@ final class WallpaperManager: ObservableObject {
     private weak var store: WallpaperStore?
     private var persistenceGate = LibraryPersistenceGate()
     /// Coalesces queue/assignment/profile JSON writes off the main actor.
-    private lazy var queueWriter = DeferredDiskWriter(onError: { [weak self] error in
-        Task { @MainActor [weak self] in
-            self?.queueSaveError = "保存播放队列失败：\(error.localizedDescription)"
+    /// Both file domains share ONE writer so display-profiles.json (written by
+    /// both persist paths) can never be saved out of order by two actors.
+    private lazy var diskWriter = DeferredDiskWriter(
+        onSuccess: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.queueSaveError = nil
+            }
+        },
+        onError: { [weak self] error in
+            Task { @MainActor [weak self] in
+                self?.queueSaveError = "保存播放队列失败：\(error.localizedDescription)"
+            }
         }
-    })
-    private let assignmentWriter = DeferredDiskWriter()
+    )
     private var playbackPolicy = PlaybackPolicy()
     private var showsHiddenWallpapers = false
     private var didMigrateQueueSlots = false
@@ -396,7 +404,20 @@ final class WallpaperManager: ObservableObject {
         // just to refresh queue items; tearing down then would blank and
         // restart every screen even though the active slot did not change.
         guard modeChanged else {
-            for display in connectedDisplays.values where effectiveQueueID(for: display.id) == nil {
+            // A same-mode refresh can still change eligibility: persistHidden
+            // hides items while the mode stays false. Tear down only the
+            // displays whose currently applied fixed wallpaper is no longer
+            // eligible; queue-managed displays are untouched (their member
+            // updates already went through removeHiddenItemsFromDefaultQueues).
+            for display in connectedDisplays.values {
+                guard effectiveQueueID(for: display.id) == nil else { continue }
+                if let appliedID = appliedWallpaperIDs[display.id],
+                   let item = queueItems[appliedID],
+                   !WallpaperVisibility.isEligible(item, showsHidden: showsHiddenWallpapers) {
+                    // Keep the assignment (wallpaperID) so unlocking restores it.
+                    suspendPresentation(displayID: display.id)
+                    continue
+                }
                 restoreFixedAssignmentIfNeeded(displayID: display.id)
             }
             return
@@ -815,12 +836,19 @@ final class WallpaperManager: ObservableObject {
         guard !persistenceGate.blocksPersistence else { return false }
         guard let queue = queueLibrary[id], !queue.isDefault else { return false }
         let fallbackID = defaultQueueID
-        // Snapshot which displays were actively playing this queue BEFORE
+        // Snapshot which displays were *actively playing* this queue BEFORE
         // removing it. effectiveQueueID resolves through QueueSlotResolver,
         // which returns nil once the queue is gone — computing it after the
         // removal would always be false and skip the slot re-activation that
         // tears down the stale controller and restarts the fallback queue.
-        let wasActiveIDs = Set(bindings.keys.filter { effectiveQueueID(for: $0) == id })
+        // isEnabled is required too: applying a fixed wallpaper calls
+        // stopQueue, which keeps the binding but disables it. Re-activating
+        // such a stopped queue would replace the fixed wallpaper with an
+        // unexpected fallback-queue rotation.
+        let wasActiveIDs = Set(bindings.keys.filter { displayID in
+            effectiveQueueID(for: displayID) == id
+                && bindings[displayID]?.state(for: id).isEnabled == true
+        })
         queueLibrary.removeValue(forKey: id)
         for displayID in Array(bindings.keys) {
             guard var binding = bindings[displayID] else { continue }
@@ -1459,8 +1487,12 @@ final class WallpaperManager: ObservableObject {
         let assignmentsSnapshot = legacyAssignmentSnapshot()
         let profiles = displayProfilesDocumentSnapshot()
         Task {
-            await assignmentWriter.schedule {
-                try store.save(displayProfilesDocument: profiles)
+            await diskWriter.schedule {
+                // Each file saves independently: a display-profiles failure must
+                // not block the assignment file (and vice versa).
+                do { try store.save(displayProfilesDocument: profiles) } catch {
+                    NSLog("WallpaperMac: failed to save display profiles: \(error.localizedDescription)")
+                }
                 try store.save(displayAssignments: assignmentsSnapshot)
             }
         }
@@ -1568,8 +1600,12 @@ final class WallpaperManager: ObservableObject {
         let bindingsSnapshot = legacyBindingSnapshot()
         let profiles = displayProfilesDocumentSnapshot()
         Task {
-            await queueWriter.schedule {
-                try store.save(displayProfilesDocument: profiles)
+            await diskWriter.schedule {
+                // A display-profiles failure must not block the queue/bindings
+                // save (the old synchronous path saved them independently).
+                do { try store.save(displayProfilesDocument: profiles) } catch {
+                    NSLog("WallpaperMac: failed to save display profiles: \(error.localizedDescription)")
+                }
                 try store.save(
                     playbackQueues: queues,
                     displayPlaybackBindings: bindingsSnapshot
@@ -1581,8 +1617,7 @@ final class WallpaperManager: ObservableObject {
     /// Durable flush for callers that must guarantee the write reached disk
     /// before proceeding (e.g. process termination).
     func flushPersistence() async {
-        await queueWriter.flush()
-        await assignmentWriter.flush()
+        await diskWriter.flush()
     }
 
     private func effectiveInterval(queue: PlaybackQueue, state: DisplayQueueState, itemID: UUID) -> Double {

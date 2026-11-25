@@ -37,5 +37,26 @@ public final class DropURLCollector: @unchecked Sendable {
         ordered = ordered.filter { seen.insert($0).inserted }
         return ordered
     }
+
+    /// True when every slot has answered but drain() has not consumed the
+    /// result yet. A watchdog uses this to avoid stealing a complete result
+    /// whose async drain() has not run on the main actor yet.
+    public func isComplete() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !drained && total > 0 && answeredIndices.count == total
+    }
+
+    /// Marks every unanswered slot as answered (nil) so a subsequent drain()
+    /// can complete. No-op once drained. Used by the drop watchdog when a
+    /// provider never calls back.
+    public func forceFinishMissing() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !drained else { return }
+        for index in 0..<total where !answeredIndices.contains(index) {
+            answeredIndices.insert(index)
+        }
+    }
 }
 

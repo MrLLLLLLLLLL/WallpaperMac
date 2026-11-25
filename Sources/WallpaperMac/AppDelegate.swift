@@ -130,7 +130,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Give queued JSON writes a chance to reach disk before the process
         // exits, so a fast queue change right before quitting is not lost.
         NotificationCenter.default.post(name: .wallpaperMacFlushPersistence, object: nil)
-        // Brief grace period for the async flush scheduled by the observer.
-        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.5))
+        // Spin the run loop until the observer's async flush completes (or a
+        // hard cap). A fixed sleep can return before a slow write finishes;
+        // the cap bounds shutdown even if a write hangs.
+        let deadline = Date(timeIntervalSinceNow: 3.0)
+        while Date() < deadline {
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+            if !UserDefaults.standard.bool(forKey: "WallpaperMacPersistenceFlushPending") { break }
+        }
     }
 }

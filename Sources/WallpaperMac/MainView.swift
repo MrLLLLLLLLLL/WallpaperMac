@@ -254,7 +254,11 @@ final class LibraryViewModel: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
+                // AppDelegate spins its run loop until this flag clears (or a
+                // 3s cap), so termination waits for the durable flush.
+                UserDefaults.standard.set(true, forKey: "WallpaperMacPersistenceFlushPending")
                 await self?.wallpaperManager.flushPersistence()
+                UserDefaults.standard.set(false, forKey: "WallpaperMacPersistenceFlushPending")
             }
         }
         displayService.objectWillChange
@@ -278,8 +282,11 @@ final class LibraryViewModel: ObservableObject {
     }
 
     /// Re-reads queue files after the user repaired them and reports whether
-    /// persistence is available again.
+    /// persistence is available again. Only meaningful when writes are blocked
+    /// (load failure) — a save failure must NOT reload, or it would replace the
+    /// unsaved in-memory edits with the stale on-disk state.
     func retryQueuePersistence() {
+        guard wallpaperManager.isQueuePersistenceBlocked else { return }
         let recovered = wallpaperManager.retryLoadingQueues()
         refreshQueuePersistenceWarning()
         if recovered {
@@ -913,19 +920,25 @@ final class LibraryViewModel: ObservableObject {
         }
         // Watchdog: an NSItemProvider that never calls back would otherwise
         // leave the whole drop silently hanging. After the grace period, force
-        // the missing slots to finish so the collected URLs still import and
-        // the user gets a partial-failure notice instead of nothing.
+        // only the *missing* slots to finish so the collected URLs still
+        // import and the user gets a partial-failure notice instead of
+        // nothing. isComplete() guards the normal case: a drop that already
+        // finished must not be re-drained or misreported as a timeout, and a
+        // complete-but-not-yet-drained drop must not be stolen.
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
             guard let self, self.isCurrentLibrarySession(session) else { return }
-            if collector.drain() == nil {
-                for index in 0..<providers.count {
-                    collector.submit(nil, at: index)
-                }
+            if collector.isComplete() {
                 if let urls = collector.drain() {
                     self.beginImport(urls)
-                } else {
-                    self.lastError = "部分拖拽文件读取失败或超时，未能导入。"
                 }
+                return
+            }
+            collector.forceFinishMissing()
+            if let urls = collector.drain() {
+                self.beginImport(urls)
+                self.lastError = "部分拖拽文件读取失败或超时，仅导入了已读取的文件。"
+            } else {
+                self.lastError = "部分拖拽文件读取失败或超时，未能导入。"
             }
         }
     }

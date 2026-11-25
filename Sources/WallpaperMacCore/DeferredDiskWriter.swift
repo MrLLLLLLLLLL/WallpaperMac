@@ -9,10 +9,16 @@ public actor DeferredDiskWriter {
     private var pendingTask: Task<Void, Never>?
     private var pendingWrite: (() throws -> Void)?
     private let debounce: TimeInterval
+    private let onSuccess: @Sendable () -> Void
     private let onError: @Sendable (Error) -> Void
 
-    public init(debounce: TimeInterval = 0.4, onError: @escaping @Sendable (Error) -> Void = { _ in }) {
+    public init(
+        debounce: TimeInterval = 0.4,
+        onSuccess: @escaping @Sendable () -> Void = {},
+        onError: @escaping @Sendable (Error) -> Void = { _ in }
+    ) {
         self.debounce = debounce
+        self.onSuccess = onSuccess
         self.onError = onError
     }
 
@@ -37,6 +43,7 @@ public actor DeferredDiskWriter {
         pendingWrite = nil
         do {
             try write()
+            onSuccess()
         } catch {
             onError(error)
         }

@@ -67,6 +67,10 @@ public final class WallpaperStore {
         libraryURL.appendingPathComponent("wallpapers.json.bak")
     }
 
+    private var indexNeedsReconcileURL: URL {
+        libraryURL.appendingPathComponent("wallpapers.json.recover")
+    }
+
     private var assignmentsURL: URL {
         libraryURL.appendingPathComponent("display-assignments.json")
     }
@@ -1034,6 +1038,13 @@ public final class WallpaperStore {
             NSLog("WallpaperMac: skipped orphan cleanup because wallpapers.json is missing")
             return
         }
+        // A recovered-from-backup index has not been reconciled against the
+        // assets on disk (it may predate imports). Refuse to treat its ID set
+        // as authoritative until a fresh save() clears the marker.
+        if fileManager.fileExists(atPath: indexNeedsReconcileURL.path) {
+            NSLog("WallpaperMac: skipped orphan cleanup because the index was recovered from backup and is not yet reconciled")
+            return
+        }
         let assetsURL = libraryURL.appendingPathComponent("Assets", isDirectory: true)
         guard let entries = try? fileManager.contentsOfDirectory(
             at: assetsURL,
@@ -1090,20 +1101,23 @@ public final class WallpaperStore {
     private func save(_ items: [WallpaperItem]) throws {
         try ensureLibraryDirectories()
         let data = try encoder.encode(items)
-        // Rotate the last known-good index before overwriting. If a later
-        // write is interrupted or the index is lost, items() can recover from
-        // this snapshot instead of presenting an empty library.
-        if fileManager.fileExists(atPath: metadataURL.path),
-           let previous = try? Data(contentsOf: metadataURL),
-           (try? decoder.decode([WallpaperItem].self, from: previous)) != nil {
-            try? previous.write(to: metadataBackupURL, options: .atomic)
-        }
         try data.write(to: metadataURL, options: .atomic)
+        // The freshly saved index is authoritative; it supersedes any prior
+        // backup-recovery marker and re-enables orphan cleanup.
+        try? fileManager.removeItem(at: indexNeedsReconcileURL)
+        // Write the same bytes as the backup so it always matches the latest
+        // index. Rotating the *previous* file would leave .bak one step stale
+        // (e.g. import A then B leaves .bak = [A]); a later recovery from that
+        // stale snapshot would then let orphan cleanup delete B's assets.
+        try? data.write(to: metadataBackupURL, options: .atomic)
     }
 
     /// Restores wallpapers.json from the .bak snapshot when the index is
     /// missing but managed assets are still present. Returns false when there
     /// is nothing to recover (fresh library, no backup, or unusable backup).
+    /// A recovered index is *not* asset-reconciled: orphan cleanup stays
+    /// disabled until a fresh index (written by save) supersedes it, because
+    /// the backup may be older than assets imported after it.
     private func recoverIndexFromBackup() throws -> Bool {
         let assetsURL = libraryURL.appendingPathComponent("Assets", isDirectory: true)
         let entries = (try? fileManager.contentsOfDirectory(atPath: assetsURL.path)) ?? []
@@ -1112,7 +1126,10 @@ public final class WallpaperStore {
               let recovered = try? decoder.decode([WallpaperItem].self, from: data),
               !recovered.isEmpty else { return false }
         try data.write(to: metadataURL, options: .atomic)
-        NSLog("WallpaperMac: recovered wallpapers.json from backup (\(recovered.count) items)")
+        // Durable marker: only a successful save() of a reconciled index clears
+        // this. cleanupOrphanedManagedAssets refuses to run while it is set.
+        try? "1".write(to: indexNeedsReconcileURL, atomically: true, encoding: .utf8)
+        NSLog("WallpaperMac: recovered wallpapers.json from backup (\(recovered.count) items); orphan cleanup disabled until a fresh index is saved")
         return true
     }
 

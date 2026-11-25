@@ -706,6 +706,55 @@ func testMissingIndexSkipsOrphanCleanupAndRecoversFromBackup() throws {
     try expect(reloaded.contains(where: { $0.id == item.id }), "the index should be recovered from the backup")
 }
 
+func testStaleBackupRecoveryDoesNotDeleteNewerAssets() throws {
+    let fixture = try Fixture()
+    let fm = FileManager.default
+    // Import A, then B. With the fixed save() the .bak contains A+B; simulate
+    // a *stale* .bak (the pre-fix shape) by hand-writing a backup with only A
+    // after B was imported.
+    let sourceA = fixture.root.appendingPathComponent("a.png")
+    let sourceB = fixture.root.appendingPathComponent("b.png")
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: sourceA)
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: sourceB)
+    let itemA = try fixture.store.importItem(at: sourceA, storageMode: .managedCopy)
+    let itemB = try fixture.store.importItem(at: sourceB, storageMode: .managedCopy)
+    let copyA = itemA.sourceURL
+    let copyB = itemB.sourceURL
+    try expect(fm.fileExists(atPath: copyA.path) && fm.fileExists(atPath: copyB.path), "both managed copies should exist")
+
+    // Craft the stale backup: only A.
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    let staleData = try encoder.encode([itemA])
+    try staleData.write(to: fixture.library.appendingPathComponent("wallpapers.json.bak"), options: .atomic)
+
+    // Destroy the live index so recovery runs from the stale backup.
+    try fm.removeItem(at: fixture.library.appendingPathComponent("wallpapers.json"))
+
+    // First refresh recovers the stale index (A only) — B's asset must survive
+    // because cleanup is disabled by the recovery marker.
+    _ = try fixture.store.refreshAllAvailability()
+    try expect(fm.fileExists(atPath: copyB.path), "first refresh after stale recovery must not delete B's asset")
+
+    // A second refresh must still not delete B: the marker keeps cleanup off
+    // until a fresh save() writes a reconciled index.
+    _ = try fixture.store.refreshAllAvailability()
+    try expect(fm.fileExists(atPath: copyB.path), "second refresh must still not delete B's asset")
+
+    // A fresh save (field-level update) clears the recovery marker and
+    // re-enables cleanup. The recovered index only contains A, so the now
+    // authoritative cleanup may remove B's orphaned asset — that is correct
+    // (the index is authoritative again); the point of the test is that
+    // nothing is deleted while the marker is still set.
+    _ = try fixture.store.update(item: itemA, isFavorite: true)
+    _ = try fixture.store.refreshAllAvailability()
+    try expect(
+        !fm.fileExists(atPath: fixture.library.appendingPathComponent("wallpapers.json.recover").path),
+        "a fresh save must clear the recovery marker"
+    )
+    try expect(fm.fileExists(atPath: copyA.path), "the indexed asset A survives authoritative cleanup")
+}
+
 func testWebMouseEventScriptActivatesClickOnce() throws {
     let mouseUp = WebMouseEventScript.source(x: 120, y: 80, phase: .mouseUp)
     try expect(
@@ -929,6 +978,7 @@ let tests: [(String, () throws -> Void)] = [
     ("converts fullscreen geometry quartz to cocoa", testFullscreenGeometryConvertsQuartzToCocoa),
     ("tolerates menu bar inset in fullscreen detection", testFullscreenGeometryToleratesMenuBarInset),
     ("recovers index from backup without orphan cleanup", testMissingIndexSkipsOrphanCleanupAndRecoversFromBackup),
+    ("stale backup recovery never deletes newer assets", testStaleBackupRecoveryDoesNotDeleteNewerAssets),
     ("deduplicates and auto sorts playback queues", testPlaybackQueueDeduplicatesAndAutoSorts),
     ("enforces playback queue defaults and overrides", testPlaybackQueueHasDefaultConstraintsAndPerItemOverrides),
     ("persists queue advance mode", testPlaybackQueueAdvanceModeRoundTrips),
