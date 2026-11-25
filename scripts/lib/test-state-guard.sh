@@ -56,7 +56,12 @@ wm_state_guard_restore() {
             WallpaperMac.muted \
             WallpaperMac.webWallpaperInteractionEnabled \
             WallpaperMac.storageMode \
-            WallpaperMac.autoCheckUpdates; do
+            WallpaperMac.autoCheckUpdates \
+            WallpaperMac.autoInstallUpdates \
+            WallpaperMac.lastAutomaticUpdateAttemptDate \
+            WallpaperMac.automaticUpdateBlockedVersion \
+            WallpaperMac.hideHiddenHotKey \
+            WallpaperMac.lockScreenSyncEnabled; do
             defaults delete com.wallpaper.mac "$key" >/dev/null 2>&1 || true
         done
     fi

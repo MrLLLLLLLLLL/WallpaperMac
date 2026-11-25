@@ -32,6 +32,22 @@ if [[ "${1:-}" != "--yes" ]]; then
     exit 2
 fi
 
+# A release tag is allowed only for the commit that is already on main. This
+# prevents tagging a local-only or unrelated HEAD when publishing manually.
+if [[ "$(git symbolic-ref --short -q HEAD)" != "main" ]]; then
+    print -u2 "publish-release.sh must run from main."
+    exit 1
+fi
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    print -u2 "Working tree must be clean before publishing."
+    exit 1
+fi
+git fetch origin main
+if [[ "$(git rev-list --left-right --count HEAD...origin/main)" != $'0\t0' ]]; then
+    print -u2 "HEAD is not synchronized with origin/main; push or reconcile main first."
+    exit 1
+fi
+
 # Verify the local artifacts once more before publishing.
 swift scripts/update-signing-tool.swift verify "$ZIP" "$ZIP.sig" "$PUBLIC_KEY"
 

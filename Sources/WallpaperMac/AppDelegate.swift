@@ -51,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Daily checks and optional unattended installs run for the whole
         // menu-bar session, independent of the settings UI.
         UpdateService.shared.updateAutomaticPreferences()
+        LockScreenWallpaperService.shared.updatePreference()
     }
 
     private func presentInstallFailure(_ failure: UpdateInstallFailure) {

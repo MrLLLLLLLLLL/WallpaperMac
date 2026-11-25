@@ -20,7 +20,8 @@ final class WallpaperWindowController: NSWindowController {
         onVideoPlaybackCompleted: (() -> Void)? = nil,
         onFrameProgress: (() -> Void)? = nil,
         onVideoDurationChanged: ((Double?) -> Void)? = nil,
-        initialSystemSuspended: Bool = false
+        initialSystemSuspended: Bool = false,
+        onWebContentReady: (() -> Void)? = nil
     ) throws {
         isWebWallpaper = item.type == .web
         let window = WallpaperWindow(
@@ -37,11 +38,17 @@ final class WallpaperWindowController: NSWindowController {
             onFrameProgress: onFrameProgress,
             onVideoDurationChanged: onVideoDurationChanged,
             initialSystemSuspended: initialSystemSuspended,
-            frame: NSRect(origin: .zero, size: screen.frame.size)
+            frame: NSRect(origin: .zero, size: screen.frame.size),
+            onWebContentReady: onWebContentReady
         )
         wallpaperContentView = contentView
         window.contentView = contentView
         super.init(window: window)
+    }
+
+    @MainActor
+    func lockScreenSnapshot() async throws -> NSImage? {
+        try await wallpaperContentView.lockScreenSnapshot()
     }
 
     func togglePlayback() {

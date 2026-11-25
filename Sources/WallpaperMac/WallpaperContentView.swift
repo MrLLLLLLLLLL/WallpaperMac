@@ -39,6 +39,8 @@ final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDelegate {
     private var loopObserver: NSObjectProtocol?
     private var compatibilityTask: Task<Void, Never>?
     private var isTornDown = false
+    private var webContentReady = false
+    private let onWebContentReady: (() -> Void)?
 
     var playbackState: WallpaperManager.PlaybackState {
         switch item.type {
@@ -51,6 +53,22 @@ final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDelegate {
         }
     }
 
+    /// Captures the currently rendered web page for the system lock-screen
+    /// image. The snapshot is taken on the main actor by WebKit.
+    @MainActor
+    func lockScreenSnapshot() async throws -> NSImage? {
+        guard item.type == .web, webContentReady, let webView else { return nil }
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<NSImage?, Error>) in
+            webView.takeSnapshot(with: nil) { image, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: image)
+                }
+            }
+        }
+    }
+
     init(
         item: WallpaperItem,
         policy: PlaybackPolicy,
@@ -59,7 +77,8 @@ final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDelegate {
         onFrameProgress: (() -> Void)? = nil,
         onVideoDurationChanged: ((Double?) -> Void)? = nil,
         initialSystemSuspended: Bool = false,
-        frame: NSRect
+        frame: NSRect,
+        onWebContentReady: (() -> Void)? = nil
     ) throws {
         self.item = item
         self.isPlaying = policy.isPlaying
@@ -72,6 +91,7 @@ final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDelegate {
         self.onFrameProgress = onFrameProgress
         self.onVideoDurationChanged = onVideoDurationChanged
         self.isSystemSuspended = initialSystemSuspended
+        self.onWebContentReady = onWebContentReady
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
@@ -86,6 +106,7 @@ final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDelegate {
     func teardown() {
         guard !isTornDown else { return }
         isTornDown = true
+        webContentReady = false
         releasePlaybackResources()
         removeInterfaceViews()
     }
@@ -491,6 +512,7 @@ final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDelegate {
     }
 
     private func configureWebPlayback() {
+        webContentReady = false
         guard webView == nil else { return }
         let configuration = WKWebViewConfiguration()
         configuration.mediaTypesRequiringUserActionForPlayback = []
@@ -724,6 +746,7 @@ final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDelegate {
                   self.isPlaying,
                   !self.isSystemSuspended else { return }
             self.webRecoveryWorkItem = nil
+            self.webContentReady = false
             self.webView?.reload()
             self.startWebLoadWatchdog()
         }
@@ -753,6 +776,10 @@ final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDelegate {
         // Always re-apply the current state, including a pause that happened
         // before or during navigation.
         applyPlaybackState()
+        webContentReady = true
+        // A first apply may have happened before the page was renderable.
+        // Notify the lock-screen service only after real content is ready.
+        onWebContentReady?()
     }
 
     func webView(

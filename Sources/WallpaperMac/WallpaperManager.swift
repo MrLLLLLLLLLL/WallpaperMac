@@ -335,7 +335,10 @@ final class WallpaperManager: ObservableObject {
             onVideoDurationChanged: { [weak self] duration in
                 self?.videoDurationDidChange(for: display.id, session: session, duration: duration)
             },
-            initialSystemSuspended: suspended
+            initialSystemSuspended: suspended,
+            onWebContentReady: { [weak self] in
+                self?.webContentDidFinish(for: display.id, session: session)
+            }
         )
         replacement.setSystemSuspended(suspended, reloadWebContentOnResume: false)
         if suspended {
@@ -356,8 +359,31 @@ final class WallpaperManager: ObservableObject {
         publishDisplayAssignments()
         appliedWallpaperIDs[display.id] = item.id
         playbackStates[display.id] = replacement.playbackState
+        NotificationCenter.default.post(
+            name: .wallpaperMacAppliedWallpaperChanged,
+            object: nil,
+            userInfo: ["displayID": display.id, "itemID": item.id]
+        )
         persistAssignments()
         present(replacement, replacing: previous, effect: transition, on: display.screen)
+    }
+
+    private func webContentDidFinish(for displayID: String, session: PlaybackSession) {
+        guard currentSessions[displayID] == session else { return }
+        // Reuse the applied notification so the service schedules a fresh
+        // generation after a slow web page has actually finished loading.
+        NotificationCenter.default.post(
+            name: .wallpaperMacAppliedWallpaperChanged,
+            object: nil,
+            userInfo: ["displayID": displayID, "itemID": session.itemID]
+        )
+    }
+
+    /// Returns the current web page snapshot for lock-screen synchronization.
+    /// Image/video wallpapers are resolved from their static thumbnail paths.
+    @MainActor
+    func lockScreenSnapshot(for displayID: String) async throws -> NSImage? {
+        try await controllers[displayID]?.lockScreenSnapshot()
     }
 
     func clear(displayID: String) {

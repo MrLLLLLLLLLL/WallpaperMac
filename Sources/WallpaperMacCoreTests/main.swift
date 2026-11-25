@@ -763,6 +763,29 @@ func testStaleBackupRecoveryDoesNotDeleteNewerAssets() throws {
     try expect(fm.fileExists(atPath: copyA.path), "the indexed asset A survives authoritative cleanup")
 }
 
+func testLockScreenResourceResolverSelectsStaticImages() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let imageURL = root.appendingPathComponent("image.png")
+    let thumbnailURL = root.appendingPathComponent("thumb.jpg")
+    try Data("image".utf8).write(to: imageURL)
+    try Data("thumb".utf8).write(to: thumbnailURL)
+
+    let image = WallpaperItem(id: UUID(), name: "image", type: .image, sourceURL: imageURL, storageMode: .externalReference)
+    try expect(LockScreenResourceResolver.existingImageURL(for: image), equals: imageURL, "image wallpapers should use their original file for lock-screen quality")
+
+    let video = WallpaperItem(id: UUID(), name: "video", type: .video, sourceURL: root.appendingPathComponent("video.mp4"), storageMode: .externalReference, thumbnailURL: thumbnailURL)
+    try expect(LockScreenResourceResolver.existingImageURL(for: video), equals: thumbnailURL, "video wallpapers should use their generated thumbnail")
+
+    let web = WallpaperItem(id: UUID(), name: "web", type: .web, sourceURL: imageURL, storageMode: .externalReference)
+    try expect(LockScreenResourceResolver.existingImageURL(for: web) == nil, "web wallpapers without thumbnails need a live-page snapshot")
+    try expect(LockScreenResourceResolver.snapshotFilename(for: web), equals: "\(web.id.uuidString).png", "web snapshot filenames must be unique per wallpaper")
+
+    let missingImage = WallpaperItem(id: UUID(), name: "missing", type: .image, sourceURL: root.appendingPathComponent("missing.png"), storageMode: .externalReference, thumbnailURL: thumbnailURL)
+    try expect(LockScreenResourceResolver.existingImageURL(for: missingImage), equals: thumbnailURL, "a missing source may still use an existing thumbnail")
+}
+
 func testHotKeyShortcutValidationAndPersistence() throws {
     let defaultShortcut = HotKeyShortcut.defaultHideHidden
     try expect(defaultShortcut.isValid, "the built-in shortcut must remain valid")
@@ -1050,6 +1073,7 @@ let tests: [(String, () throws -> Void)] = [
     ("normalizes and persists display queue", testDisplayQueueNormalizesAndPersists),
     ("keeps display queues independent", testDisplayQueuesStayIndependent),
     ("evaluates playback suspension rules", testPlaybackPolicySuspensionRules),
+    ("resolves static lock screen resources", testLockScreenResourceResolverSelectsStaticImages),
     ("validates and round trips custom hotkeys", testHotKeyShortcutValidationAndPersistence),
     ("gates automatic update checks and installation", testUpdateAutomationPreferencesGateSchedulingAndInstall),
     ("suspends on screen sleep and session inactivity", testScreenSleepAndSessionInactivityAlwaysSuspend),

@@ -70,6 +70,8 @@ private struct SettingsView: View {
     @AppStorage(SettingsKey.launchAtLogin) private var launchAtLogin = false
     @AppStorage(SettingsKey.autoCheckUpdates) private var autoCheckUpdates = true
     @AppStorage(SettingsKey.autoInstallUpdates) private var autoInstallUpdates = false
+    @AppStorage(SettingsKey.lockScreenSyncEnabled) private var lockScreenSyncEnabled = false
+    @ObservedObject private var lockScreenService = LockScreenWallpaperService.shared
     @State private var launchAtLoginError: String?
     @State private var isSyncingLoginToggle = false
     @ObservedObject private var updateService = UpdateService.shared
@@ -135,6 +137,9 @@ private struct SettingsView: View {
             // a contradictory "install automatically but never check" state.
             if enabled { autoCheckUpdates = true }
             updateService.updateAutomaticPreferences()
+        }
+        .onChange(of: lockScreenSyncEnabled) { _ in
+            lockScreenService.updatePreference()
         }
         .onChange(of: isRecordingHotKey) { recording in
             GlobalHotKeyService.shared.isRecordingHotKey = recording
@@ -308,6 +313,20 @@ private struct SettingsView: View {
                 )
             }
 
+            settingsSection("锁屏壁纸") {
+                settingsToggle(
+                    "同步当前壁纸到锁屏",
+                    description: "使用当前壁纸的静态预览同步系统桌面图片：图片使用原图，视频使用缩略图，网页使用当前页面快照。macOS 是否将系统桌面图片用于锁屏由系统决定，不会修改 FileVault 登录界面。",
+                    binding: $lockScreenSyncEnabled
+                )
+                if let error = lockScreenService.lastError {
+                    Text(error)
+                        .font(AppTheme.Typography.micro)
+                        .foregroundStyle(AppTheme.Palette.danger)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
             settingsSection("快捷键") {
                 HStack(alignment: .center, spacing: 10) {
                     Image(systemName: "command")
@@ -396,7 +415,7 @@ private struct SettingsView: View {
                 updateSectionContent
                 ThemeHairline()
                 settingsToggle(
-                    "启动时每日检查一次",
+                    "每天检查更新",
                     description: "每天最多检查一次 GitHub 发布，只在发现新版本时提示。",
                     binding: $autoCheckUpdates
                 )
@@ -944,6 +963,7 @@ enum SettingsKey {
     static let appearanceTheme = "WallpaperMac.appearanceTheme"
     static let lastUpdateCheckDate = "WallpaperMac.lastUpdateCheckDate"
     static let lastAutomaticUpdateAttemptDate = "WallpaperMac.lastAutomaticUpdateAttemptDate"
+    static let lockScreenSyncEnabled = "WallpaperMac.lockScreenSyncEnabled"
     static let automaticUpdateBlockedVersion = "WallpaperMac.automaticUpdateBlockedVersion"
 }
 

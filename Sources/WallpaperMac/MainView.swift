@@ -268,6 +268,17 @@ final class LibraryViewModel: ObservableObject {
                 self?.objectWillChange.send()
             }
             .store(in: &observationCancellables)
+        LockScreenWallpaperService.shared.configure(
+            context: LockScreenWallpaperService.Context(
+                items: { [weak self] in self?.wallpapers ?? [] },
+                displays: { [weak self] in self?.displayService.displays ?? [] },
+                appliedWallpaperIDs: { [weak self] in self?.wallpaperManager.appliedWallpaperIDs ?? [:] },
+                libraryURL: { [weak self] in self?.libraryURL },
+                snapshot: { [weak self] displayID in
+                    try await self?.wallpaperManager.lockScreenSnapshot(for: displayID)
+                }
+            )
+        )
     }
 
     private func refreshQueuePersistenceWarning() {
