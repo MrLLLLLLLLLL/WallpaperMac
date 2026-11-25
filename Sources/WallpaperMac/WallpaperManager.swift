@@ -1482,20 +1482,7 @@ final class WallpaperManager: ObservableObject {
 
     private func persistAssignments() {
         publishDisplayAssignments()
-        guard let store else { return }
-        syncProfilesFromRuntime()
-        let assignmentsSnapshot = legacyAssignmentSnapshot()
-        let profiles = displayProfilesDocumentSnapshot()
-        Task {
-            await diskWriter.schedule {
-                // Each file saves independently: a display-profiles failure must
-                // not block the assignment file (and vice versa).
-                do { try store.save(displayProfilesDocument: profiles) } catch {
-                    NSLog("WallpaperMac: failed to save display profiles: \(error.localizedDescription)")
-                }
-                try store.save(displayAssignments: assignmentsSnapshot)
-            }
-        }
+        schedulePersistence()
     }
 
     @discardableResult
@@ -1586,30 +1573,40 @@ final class WallpaperManager: ObservableObject {
     }
 
     private func persistQueues() {
-        guard !persistenceGate.blocksPersistence else {
-            // Loading failed: the in-memory state is a fallback, never the
-            // user's data. Keep the original files untouched until a reload
-            // succeeds.
-            return
-        }
+        schedulePersistence()
+    }
+
+    /// Snapshots the ENTIRE persistence state on the main actor and schedules
+    /// one debounced write covering every file (profiles, assignments, queues,
+    /// bindings). The writer replaces its pending write on each schedule, so a
+    /// partial (queues-only or assignments-only) write would let a later
+    /// persistAssignments call silently drop a pending persistQueues write.
+    /// Latest-full-snapshot-wins keeps every domain durable and ordered.
+    private func schedulePersistence() {
         guard let store else { return }
         syncProfilesFromRuntime()
-        // Snapshot on the main actor; the actual JSON encode + atomic write
-        // happens off the main actor so queue advancement never blocks UI.
+        let blocked = persistenceGate.blocksPersistence
         let queues = playbackQueues
         let bindingsSnapshot = legacyBindingSnapshot()
+        let assignmentsSnapshot = legacyAssignmentSnapshot()
         let profiles = displayProfilesDocumentSnapshot()
         Task {
             await diskWriter.schedule {
-                // A display-profiles failure must not block the queue/bindings
-                // save (the old synchronous path saved them independently).
+                // Each file saves independently: a profile failure must not
+                // block the other files (the old synchronous path behaved the
+                // same). Queue/bindings writes stay gated on load health.
                 do { try store.save(displayProfilesDocument: profiles) } catch {
                     NSLog("WallpaperMac: failed to save display profiles: \(error.localizedDescription)")
                 }
-                try store.save(
-                    playbackQueues: queues,
-                    displayPlaybackBindings: bindingsSnapshot
-                )
+                do { try store.save(displayAssignments: assignmentsSnapshot) } catch {
+                    NSLog("WallpaperMac: failed to save display assignments: \(error.localizedDescription)")
+                }
+                if !blocked {
+                    try store.save(
+                        playbackQueues: queues,
+                        displayPlaybackBindings: bindingsSnapshot
+                    )
+                }
             }
         }
     }
