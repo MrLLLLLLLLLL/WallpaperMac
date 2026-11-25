@@ -406,8 +406,10 @@ func testSingleHTMLImportOnlyCopiesSelectedFile() throws {
     try expect(item.relativeEntryPath, equals: nil, "single HTML has no project-relative entry")
     let assets = fixture.library.appendingPathComponent("Assets", isDirectory: true)
     let entries = try FileManager.default.contentsOfDirectory(at: assets, includingPropertiesForKeys: nil)
-    try expect(entries.count, equals: 1, "only the selected HTML file may be copied")
-    try expect(entries.first?.lastPathComponent.hasSuffix("-clock.html") == true, "the managed asset should be the selected file")
+    try expect(entries.count, equals: 1, "only one UUID asset directory may be created")
+    try expect(entries.first?.lastPathComponent, equals: item.id.uuidString, "the asset directory must use the wallpaper UUID")
+    try expect(item.sourceURL.lastPathComponent, equals: "clock.html", "the original filename should be preserved inside the UUID directory")
+    try expect(item.sourceURL.deletingLastPathComponent().lastPathComponent, equals: item.id.uuidString, "the managed file should be nested inside its UUID directory")
     try expect(!FileManager.default.fileExists(atPath: item.sourceURL.appendingPathComponent("unrelated.txt").path), "unrelated sibling must not be copied")
     try expect(!FileManager.default.fileExists(atPath: item.sourceURL.appendingPathComponent(".hidden-sentinel").path), "hidden sibling must not be copied")
 }
@@ -582,6 +584,7 @@ func testRemovesManagedWallpaperAndAsset() throws {
     let remainingItems = try fixture.store.items()
     try expect(remainingItems.isEmpty, "removed item should leave the index")
     try expect(!FileManager.default.fileExists(atPath: item.sourceURL.path), "managed asset should be deleted")
+    try expect(!FileManager.default.fileExists(atPath: item.sourceURL.deletingLastPathComponent().path), "the empty UUID asset directory should be removed too")
 }
 
 func testInvalidHTMLImportCleansManagedAsset() throws {
@@ -693,7 +696,7 @@ func testFullscreenGeometryToleratesMenuBarInset() throws {
 func testMissingIndexSkipsOrphanCleanupAndRecoversFromBackup() throws {
     let fixture = try Fixture()
     let fm = FileManager.default
-    // Import one managed asset so Assets/ has a {UUID}-named file.
+    // Import one managed asset so Assets/ has a UUID directory with a file.
     let source = fixture.root.appendingPathComponent("sample.png")
     try Data([0x89, 0x50, 0x4E, 0x47]).write(to: source)
     let item = try fixture.store.importItem(at: source, storageMode: .managedCopy)
@@ -1175,6 +1178,8 @@ let tests: [(String, () throws -> Void)] = [
     ("aggregates drop URLs in drag order", testDropURLCollectorPreservesOrderAndDrainsOnce),
     ("keeps edited modern pair over legacy residual", testMigrationKeepsEditedModernPairWhenLegacyResidualExists),
     ("resumes migration from existing plan file", testMigrationResumesFromExistingPlan),
+    ("recovered index does not trigger layout cleanup", testRecoveredIndexDoesNotTriggerLayoutMigrationCleanup),
+    ("migrates legacy flat assets into UUID folders", testLegacyFlatAssetsMigrateToUUIDFolders),
     ("parses orphan UUID prefixes past hyphens", testOrphanCleanupParsesUUIDPrefixPastHyphens),
     ("streams signature digests matching one-shot", testStreamingSignatureDigestMatchesOneShot),
     ("kills timed-out child processes", testProcessRunnerTimesOutAndKillsChild),
@@ -4324,6 +4329,75 @@ func testMigrationResumesFromExistingPlan() throws {
     try expect(FileManager.default.fileExists(atPath: plan.path) == false, "plan file should be cleaned after commit")
 }
 
+func testLegacyFlatAssetsMigrateToUUIDFolders() throws {
+    let fixture = try Fixture()
+    let fm = FileManager.default
+    let assets = fixture.library.appendingPathComponent("Assets", isDirectory: true)
+    try fm.createDirectory(at: assets, withIntermediateDirectories: true)
+
+    let imageID = UUID()
+    let oldImage = assets.appendingPathComponent("\(imageID.uuidString)-photo.png")
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: oldImage)
+    let image = WallpaperItem(
+        id: imageID,
+        name: "legacy-image",
+        type: .image,
+        sourceURL: oldImage,
+        storageMode: .managedCopy
+    )
+
+    let webID = UUID()
+    let oldSite = assets.appendingPathComponent("\(webID.uuidString)-site", isDirectory: true)
+    try fm.createDirectory(at: oldSite, withIntermediateDirectories: true)
+    let oldEntry = oldSite.appendingPathComponent("index.html")
+    try Data("<html></html>".utf8).write(to: oldEntry)
+    let web = WallpaperItem(
+        id: webID,
+        name: "legacy-site",
+        type: .web,
+        sourceURL: oldSite,
+        entryURL: oldEntry,
+        relativeEntryPath: "index.html",
+        storageMode: .managedCopy
+    )
+    try fixture.store.save(items: [image, web])
+
+    let refreshed = try fixture.store.refreshAllAvailability()
+    let migratedImage = try require(refreshed.first(where: { $0.id == imageID }), "migrated image should remain indexed")
+    let migratedWeb = try require(refreshed.first(where: { $0.id == webID }), "migrated web item should remain indexed")
+    let newImage = assets.appendingPathComponent(imageID.uuidString).appendingPathComponent("photo.png")
+    let newSite = assets.appendingPathComponent(webID.uuidString).appendingPathComponent("site")
+    try expect(migratedImage.sourceURL, equals: newImage, "legacy image should move into its UUID directory")
+    try expect(migratedWeb.sourceURL, equals: newSite, "legacy web project should move into its UUID directory")
+    try expect(migratedWeb.entryURL, equals: newSite.appendingPathComponent("index.html"), "web entry should follow the migrated project")
+    try expect(migratedWeb.relativeEntryPath, equals: "index.html", "relative entry path must be preserved")
+    try expect(!fm.fileExists(atPath: oldImage.path), "the old flat image should be moved, not duplicated")
+    try expect(!fm.fileExists(atPath: oldSite.path), "the old flat project should be moved, not duplicated")
+    try expect(migratedImage.availability, equals: .available, "migrated image should remain playable")
+    try expect(migratedWeb.availability, equals: .available, "migrated web project should remain playable")
+}
+
+func testRecoveredIndexDoesNotTriggerLayoutMigrationCleanup() throws {
+    let fixture = try Fixture()
+    let fm = FileManager.default
+    let source = fixture.root.appendingPathComponent("indexed.png")
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: source)
+    let indexed = try fixture.store.importItem(at: source, storageMode: .managedCopy)
+    let assets = fixture.library.appendingPathComponent("Assets", isDirectory: true)
+    let orphanID = UUID()
+    let oldOrphan = assets.appendingPathComponent("\(orphanID.uuidString)-newer.png")
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: oldOrphan)
+
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    try encoder.encode([indexed]).write(to: fixture.library.appendingPathComponent("wallpapers.json.bak"), options: .atomic)
+    try fm.removeItem(at: fixture.library.appendingPathComponent("wallpapers.json"))
+
+    _ = try fixture.store.refreshAllAvailability()
+    try expect(fm.fileExists(atPath: oldOrphan.path), "an old-layout asset from after the backup must not be deleted during recovery")
+    try expect(fm.fileExists(atPath: fixture.library.appendingPathComponent("wallpapers.json.recover").path), "recovery must keep its reconcile marker")
+}
+
 func testOrphanCleanupParsesUUIDPrefixPastHyphens() throws {
     let fixture = try Fixture()
     let assets = fixture.library.appendingPathComponent("Assets", isDirectory: true)
@@ -4333,6 +4407,9 @@ func testOrphanCleanupParsesUUIDPrefixPastHyphens() throws {
     let knownName = "\(knownID.uuidString)-keep.png"
     let orphanID = UUID()
     let orphanName = "\(orphanID.uuidString)-orphan.png"
+    let orphanDirectory = assets.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: orphanDirectory, withIntermediateDirectories: true)
+    try Data("new-orphan".utf8).write(to: orphanDirectory.appendingPathComponent("orphan.png"))
     try Data("k".utf8).write(to: assets.appendingPathComponent(knownName))
     try Data("o".utf8).write(to: assets.appendingPathComponent(orphanName))
     // Not UUID-prefixed: must never be deleted.
@@ -4349,13 +4426,18 @@ func testOrphanCleanupParsesUUIDPrefixPastHyphens() throws {
     try fixture.store.save(items: [item])
     _ = try fixture.store.refreshAllAvailability()
 
+    let migratedKnown = assets.appendingPathComponent(knownID.uuidString).appendingPathComponent("keep.png")
     try expect(
-        FileManager.default.fileExists(atPath: assets.appendingPathComponent(knownName).path),
-        "indexed managed asset must survive orphan cleanup"
+        FileManager.default.fileExists(atPath: migratedKnown.path),
+        "indexed managed asset must survive orphan cleanup after layout migration"
     )
     try expect(
         FileManager.default.fileExists(atPath: assets.appendingPathComponent(orphanName).path) == false,
-        "UUID-prefixed asset with no index entry must be removed"
+        "legacy UUID-prefixed asset with no index entry must be removed"
+    )
+    try expect(
+        FileManager.default.fileExists(atPath: orphanDirectory.path) == false,
+        "an unindexed UUID directory with no index entry must be removed"
     )
     try expect(
         FileManager.default.fileExists(atPath: userFile.path),

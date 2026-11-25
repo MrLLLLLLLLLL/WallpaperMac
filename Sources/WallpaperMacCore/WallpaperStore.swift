@@ -523,9 +523,15 @@ public final class WallpaperStore {
 
         switch storageMode {
         case .managedCopy:
-            let assetsURL = libraryURL.appendingPathComponent("Assets", isDirectory: true)
-            let destinationName = "\(id.uuidString)-\(managedCopySourceURL.lastPathComponent)"
-            storedURL = assetsURL.appendingPathComponent(destinationName, isDirectory: managedCopySourceURL.isExistingDirectory)
+            let assetDirectory = managedAssetDirectory(for: id)
+            try fileManager.createDirectory(at: assetDirectory, withIntermediateDirectories: true)
+            // Each wallpaper owns one UUID directory. The original filename is
+            // retained inside it, so Assets never mixes unrelated wallpapers
+            // or requires UUID-prefix parsing to find an item's contents.
+            storedURL = assetDirectory.appendingPathComponent(
+                managedCopySourceURL.lastPathComponent,
+                isDirectory: managedCopySourceURL.isExistingDirectory
+            )
             try fileManager.copyItem(at: managedCopySourceURL, to: storedURL)
         case .externalReference:
             storedURL = sourceURL
@@ -586,8 +592,11 @@ public final class WallpaperStore {
             try save(currentItems)
             return item
         } catch {
-            if storageMode == .managedCopy, fileManager.fileExists(atPath: storedURL.path) {
-                try? fileManager.removeItem(at: storedURL)
+            if storageMode == .managedCopy {
+                if fileManager.fileExists(atPath: storedURL.path) {
+                    try? fileManager.removeItem(at: storedURL)
+                }
+                removeEmptyManagedAssetDirectory(for: id)
             }
             removePlaybackProxyIfOwned(at: playbackURL)
             throw error
@@ -875,17 +884,110 @@ public final class WallpaperStore {
            fileManager.fileExists(atPath: item.sourceURL.path) {
             do {
                 try fileManager.removeItem(at: item.sourceURL)
+                removeEmptyManagedAssetDirectory(for: item)
             } catch {
                 NSLog("WallpaperMac: orphaned managed asset \(item.sourceURL.path): \(error.localizedDescription)")
             }
+        }
+        if item.storageMode == .managedCopy {
+            removeEmptyManagedAssetDirectory(for: item)
         }
         removeThumbnailIfOwned(by: item)
         removePlaybackProxyIfOwned(at: item.playbackURL)
     }
 
+    /// Normalizes the pre-0.2.16 flat layout
+    /// `Assets/{UUID}-filename` into `Assets/{UUID}/filename`. Indexed items
+    /// are moved before orphan cleanup runs, and their source/entry URLs are
+    /// updated in the same save. Existing destination files are never
+    /// overwritten; if both layouts exist, the UUID-directory form wins and
+    /// the legacy file is left untouched for manual reconciliation.
+    private func migrateLegacyManagedAssetsIfNeeded() {
+        guard fileManager.fileExists(atPath: metadataURL.path) else { return }
+        let currentItems: [WallpaperItem]
+        do {
+            currentItems = try items()
+        } catch {
+            return
+        }
+        // A backup recovery may be older than assets on disk. Do not save a
+        // layout migration (which would clear .recover) until a fresh,
+        // reconciled save has explicitly re-enabled orphan cleanup.
+        guard !fileManager.fileExists(atPath: indexNeedsReconcileURL.path) else { return }
+        let assetsURL = libraryURL.appendingPathComponent("Assets", isDirectory: true)
+        var updatedItems: [WallpaperItem] = []
+        var didChange = false
+        for item in currentItems where item.storageMode == .managedCopy {
+            let target = managedAssetURL(for: item)
+            let targetDirectory = managedAssetDirectory(for: item.id)
+            let oldSource = item.sourceURL
+            var updated = item
+            if !fileManager.fileExists(atPath: target.path),
+               !fileManager.fileExists(atPath: oldSource.path) {
+                // A record written by an older version may have lost its
+                // original URL. Only use the legacy fallback if it exists.
+                let legacy = assetsURL.appendingPathComponent("\(item.id.uuidString)-\(oldSource.lastPathComponent)")
+                guard fileManager.fileExists(atPath: legacy.path) else {
+                    updatedItems.append(item)
+                    continue
+                }
+                do {
+                    try fileManager.createDirectory(at: targetDirectory, withIntermediateDirectories: true)
+                    try fileManager.moveItem(at: legacy, to: target)
+                    updated.sourceURL = target
+                } catch {
+                    updatedItems.append(item)
+                    continue
+                }
+            } else if !fileManager.fileExists(atPath: target.path),
+                      fileManager.fileExists(atPath: oldSource.path) {
+                do {
+                    try fileManager.createDirectory(at: targetDirectory, withIntermediateDirectories: true)
+                    try fileManager.moveItem(at: oldSource, to: target)
+                    updated.sourceURL = target
+                } catch {
+                    updatedItems.append(item)
+                    continue
+                }
+            } else {
+                // The new layout already exists (or both layouts exist).
+                updated.sourceURL = target
+            }
+
+            if item.type == .web {
+                updated.entryURL = migratedEntryURL(for: item, oldSource: oldSource, newSource: target)
+            }
+            if updated != item { didChange = true }
+            updatedItems.append(updated)
+        }
+        if didChange {
+            // Include non-managed items unchanged; save also refreshes .bak.
+            let managedIDs = Set(updatedItems.map(\.id))
+            let untouched = currentItems.filter { !managedIDs.contains($0.id) }
+            try? save(updatedItems + untouched)
+        }
+    }
+
+    private func migratedEntryURL(for item: WallpaperItem, oldSource: URL, newSource: URL) -> URL? {
+        guard item.type == .web else { return item.entryURL }
+        if let relative = item.relativeEntryPath, !relative.isEmpty {
+            return newSource.appendingPathComponent(relative)
+        }
+        guard let oldEntry = item.entryURL else { return nil }
+        if oldEntry.standardizedFileURL == oldSource.standardizedFileURL {
+            return newSource
+        }
+        let oldPath = oldSource.standardizedFileURL.path
+        let oldEntryPath = oldEntry.standardizedFileURL.path
+        let prefix = oldPath.hasSuffix("/") ? oldPath : oldPath + "/"
+        guard oldEntryPath.hasPrefix(prefix) else { return oldEntry }
+        return newSource.appendingPathComponent(String(oldEntryPath.dropFirst(prefix.count)))
+    }
+
     @discardableResult
     public func refreshAllAvailability() throws -> [WallpaperItem] {
         removeLegacyVideoProxies()
+        migrateLegacyManagedAssetsIfNeeded()
         cleanupOrphanedManagedAssets()
         let currentItems = try items()
         var refreshed: [WallpaperItem] = []
@@ -985,6 +1087,37 @@ public final class WallpaperStore {
         try fileManager.createDirectory(at: assetsURL, withIntermediateDirectories: true)
     }
 
+    private func managedAssetDirectory(for id: UUID) -> URL {
+        libraryURL
+            .appendingPathComponent("Assets", isDirectory: true)
+            .appendingPathComponent(id.uuidString, isDirectory: true)
+    }
+
+    private func managedAssetURL(for item: WallpaperItem) -> URL {
+        let legacyPrefix = "\(item.id.uuidString)-"
+        let filename = item.sourceURL.lastPathComponent.hasPrefix(legacyPrefix)
+            ? String(item.sourceURL.lastPathComponent.dropFirst(legacyPrefix.count))
+            : item.sourceURL.lastPathComponent
+        return managedAssetDirectory(for: item.id).appendingPathComponent(
+            filename,
+            isDirectory: item.sourceURL.hasDirectoryPath
+        )
+    }
+
+    private func removeEmptyManagedAssetDirectory(for item: WallpaperItem) {
+        removeEmptyManagedAssetDirectory(for: item.id)
+    }
+
+    private func removeEmptyManagedAssetDirectory(for id: UUID) {
+        let directory = managedAssetDirectory(for: id)
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: []
+        ), contents.isEmpty else { return }
+        try? fileManager.removeItem(at: directory)
+    }
+
     /// Prepares the URL AVFoundation should open for a video wallpaper.
     /// Managed imports can be normalized in their library copy. External
     /// references always open the original file and never create persistent
@@ -1026,9 +1159,10 @@ public final class WallpaperStore {
         try? fileManager.removeItem(at: proxiesURL)
     }
 
-    /// Removes managed assets under `Assets/` whose `{UUID}-` prefix matches no
-    /// indexed item. Scope is strictly that ownership namespace — user files
-    /// and external references are never touched.
+    /// Removes managed assets under `Assets/` whose UUID ownership marker does
+    /// not match an indexed item. Both the current UUID-directory layout and
+    /// the legacy `{UUID}-filename` layout are recognized. Files without that
+    /// namespace are never touched.
     private func cleanupOrphanedManagedAssets() {
         // Never clean when the index is missing: items() returns [] for a
         // missing file, which would make every managed asset look orphaned and
@@ -1063,8 +1197,7 @@ public final class WallpaperStore {
         // state (e.g. a restored-but-stale index). Refuse to delete in that
         // case; the user can re-import or repair explicitly.
         let hasManagedAssets = entries.contains { entry in
-            let name = entry.lastPathComponent
-            return name.count > 36 && UUID(uuidString: String(name.prefix(36))) != nil
+            managedAssetUUID(from: entry) != nil
         }
         if knownIDs.isEmpty, hasManagedAssets {
             NSLog("WallpaperMac: skipped orphan cleanup because the index is empty while Assets/ is not")
@@ -1072,21 +1205,29 @@ public final class WallpaperStore {
         }
 
         for entry in entries {
-            let name = entry.lastPathComponent
-            // Ownership marker: `{UUID}-originalName` (see import destinationName).
-            // UUID strings contain hyphens themselves (8-4-4-4-12 = 36 chars),
-            // so the prefix is the first 36 characters, not up to the first '-'.
-            guard name.count > 36 else { continue }
-            let uuidPrefix = String(name.prefix(36))
-            guard name.hasPrefix(uuidPrefix), name.dropFirst(36).hasPrefix("-") else { continue }
-            guard UUID(uuidString: uuidPrefix) != nil, !knownIDs.contains(uuidPrefix) else { continue }
+            guard let uuid = managedAssetUUID(from: entry), !knownIDs.contains(uuid.uuidString) else { continue }
             do {
+                // UUID directories are removed as a unit; legacy flat files
+                // and legacy project directories use the same ownership rule.
                 try fileManager.removeItem(at: entry)
-                NSLog("WallpaperMac: removed orphaned managed asset \(name)")
+                NSLog("WallpaperMac: removed orphaned managed asset \(entry.lastPathComponent)")
             } catch {
-                NSLog("WallpaperMac: failed to remove orphaned asset \(name): \(error.localizedDescription)")
+                NSLog("WallpaperMac: failed to remove orphaned asset \(entry.lastPathComponent): \(error.localizedDescription)")
             }
         }
+    }
+
+    private func managedAssetUUID(from entry: URL) -> UUID? {
+        let name = entry.lastPathComponent
+        if name.count == 36, let uuid = UUID(uuidString: name) {
+            return uuid
+        }
+        guard name.count > 36,
+              name.dropFirst(36).hasPrefix("-"),
+              let uuid = UUID(uuidString: String(name.prefix(36))) else {
+            return nil
+        }
+        return uuid
     }
 
     private func removePlaybackProxyIfOwned(at url: URL?) {

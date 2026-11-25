@@ -121,11 +121,11 @@ display-profiles.json              # 稳定显示器档案（UUID、分配、队
 wallpaper-groups.json              # 分组
 display-queues.json                # 旧版本队列数据的迁移来源
 hidden-wallpapers-lock.json        # 隐藏壁纸密码验证信息（不含明文密码）
-Assets/                            # “复制到应用库”的资源副本
+Assets/                            # “复制到应用库”的资源副本，每个壁纸一个 UUID 子目录
 Thumbnails/                        # 生成的缩略图
 ```
 
-应用还会在 `~/Library/Application Support/WallpaperMac/Configuration/` 保存壁纸库位置配置。兼容视频不会生成完整播放副本，旧版本遗留的 `VideoProxies/` 会在加载壁纸库时自动删除。旧版索引缺少新增字段时会使用兼容默认值读取；不要手工编辑 JSON，除非你已备份壁纸库并清楚数据格式的影响。
+应用还会在 `~/Library/Application Support/WallpaperMac/Configuration/` 保存壁纸库位置配置。`Assets/` 使用 `Assets/{UUID}/{原始文件名}` 的结构，每个壁纸拥有独立目录；旧版 `Assets/{UUID}-{原始文件名}` 平铺资源会在加载时自动迁移，网页入口、删除和孤儿清理同时兼容两种布局。兼容视频不会生成完整播放副本，旧版本遗留的 `VideoProxies/` 会在加载壁纸库时自动删除。旧版索引缺少新增字段时会使用兼容默认值读取；不要手工编辑 JSON，除非你已备份壁纸库并清楚数据格式的影响。
 
 ### 两种导入策略
 
