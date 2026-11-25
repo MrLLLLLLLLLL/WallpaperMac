@@ -22,6 +22,11 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     guard condition() else { throw TestFailure(message: message) }
 }
 
+func require<T>(_ value: T?, _ message: String) throws -> T {
+    guard let value else { throw TestFailure(message: message) }
+    return value
+}
+
 struct Fixture {
     let root: URL
     let library: URL
@@ -755,6 +760,74 @@ func testStaleBackupRecoveryDoesNotDeleteNewerAssets() throws {
     try expect(fm.fileExists(atPath: copyA.path), "the indexed asset A survives authoritative cleanup")
 }
 
+func testHotKeyShortcutValidationAndPersistence() throws {
+    let defaultShortcut = HotKeyShortcut.defaultHideHidden
+    try expect(defaultShortcut.isValid, "the built-in shortcut must remain valid")
+    try expect(defaultShortcut.displayString, equals: "⌃⌥H", "the default shortcut should render as control-option-H")
+
+    let unmodified = HotKeyShortcut(keyCode: 0, modifiers: 0)
+    try expect(!unmodified.isValid, "a bare letter must not be accepted as a global shortcut")
+    let shiftOnly = HotKeyShortcut(keyCode: 0, modifiers: HotKeyShortcut.shiftModifier)
+    try expect(!shiftOnly.isValid, "shift alone must not be accepted")
+    let unknownModifier = HotKeyShortcut(keyCode: 0, modifiers: 0x8000)
+    try expect(!unknownModifier.isValid, "unknown modifier bits must be rejected")
+    let commandQ = HotKeyShortcut(keyCode: 12, modifiers: HotKeyShortcut.commandModifier)
+    try expect(commandQ.validationIssue != nil, "reserved application shortcuts must be rejected before registration")
+    let custom = HotKeyShortcut(
+        keyCode: 8,
+        modifiers: HotKeyShortcut.controlModifier | HotKeyShortcut.optionModifier | HotKeyShortcut.shiftModifier
+    )
+    try expect(custom.isValid, "a custom control-option-shift shortcut should be valid")
+    try expect(custom.displayString, equals: "⌃⌥⇧C", "custom shortcut display should include every modifier")
+
+    let data = try JSONEncoder().encode(custom)
+    let restored = try JSONDecoder().decode(HotKeyShortcut.self, from: data)
+    try expect(restored, equals: custom, "custom shortcut should survive JSON persistence")
+
+    let suiteName = "WallpaperMacHotKeyTests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    custom.save(to: defaults, key: "shortcut")
+    try expect(HotKeyShortcut.load(from: defaults, key: "shortcut"), equals: custom, "a saved custom shortcut should load on the next launch")
+    try expect(HotKeyShortcut.load(from: defaults, key: "missing"), equals: .defaultHideHidden, "a missing preference must fall back to the default")
+}
+
+func testUpdateAutomationPreferencesGateSchedulingAndInstall() throws {
+    let now = Date()
+    let defaults = UpdateAutomationPreferences()
+    try expect(defaults.shouldScheduleDailyCheck, "daily checks should remain enabled by default")
+    try expect(!defaults.shouldInstallAutomatically, "unattended installs must be opt-in")
+    try expect(defaults.shouldCheck(now: now, lastCheck: nil), "a missing last-check date should trigger the first check")
+    try expect(!defaults.shouldCheck(now: now, lastCheck: now), "a check within 24 hours should be throttled")
+    try expect(
+        defaults.shouldCheck(now: now.addingTimeInterval(24 * 60 * 60), lastCheck: now),
+        "a check exactly 24 hours later should be allowed"
+    )
+    try expect(
+        !defaults.shouldCheck(
+            now: now.addingTimeInterval(60 * 60),
+            lastCheck: now.addingTimeInterval(-24 * 60 * 60),
+            lastAutomaticAttempt: now
+        ),
+        "a recent automatic attempt must throttle even when the last successful check is old"
+    )
+    try expect(
+        defaults.shouldCheck(now: now, lastCheck: now.addingTimeInterval(24 * 60 * 60)),
+        "a future-dated last check must not suppress checks after a clock adjustment"
+    )
+    try expect(
+        !defaults.shouldCheck(now: now.addingTimeInterval(24 * 60 * 60), lastCheck: now, isBusy: true),
+        "an in-flight check or install must suppress another scheduled attempt"
+    )
+
+    let automatic = UpdateAutomationPreferences(dailyCheckEnabled: true, automaticInstallEnabled: true)
+    try expect(automatic.shouldInstallAutomatically, "enabling both switches should allow automatic installation")
+    let checksDisabled = UpdateAutomationPreferences(dailyCheckEnabled: false, automaticInstallEnabled: true)
+    try expect(!checksDisabled.shouldScheduleDailyCheck, "disabling checks must stop the daily timer")
+    try expect(!checksDisabled.shouldInstallAutomatically, "disabling checks must also stop unattended installs")
+    try expect(!checksDisabled.shouldCheck(now: now, lastCheck: nil), "disabled checks must not run even without a last-check date")
+}
+
 func testWebMouseEventScriptActivatesClickOnce() throws {
     let mouseUp = WebMouseEventScript.source(x: 120, y: 80, phase: .mouseUp)
     try expect(
@@ -974,6 +1047,8 @@ let tests: [(String, () throws -> Void)] = [
     ("normalizes and persists display queue", testDisplayQueueNormalizesAndPersists),
     ("keeps display queues independent", testDisplayQueuesStayIndependent),
     ("evaluates playback suspension rules", testPlaybackPolicySuspensionRules),
+    ("validates and round trips custom hotkeys", testHotKeyShortcutValidationAndPersistence),
+    ("gates automatic update checks and installation", testUpdateAutomationPreferencesGateSchedulingAndInstall),
     ("suspends on screen sleep and session inactivity", testScreenSleepAndSessionInactivityAlwaysSuspend),
     ("converts fullscreen geometry quartz to cocoa", testFullscreenGeometryConvertsQuartzToCocoa),
     ("tolerates menu bar inset in fullscreen detection", testFullscreenGeometryToleratesMenuBarInset),
@@ -1025,6 +1100,8 @@ let tests: [(String, () throws -> Void)] = [
     ("filters hidden wallpapers from queues", testWallpaperVisibilityFiltersQueues),
     ("pauses fullscreen only on the matching display", testFullScreenPauseIsPerDisplay),
     ("migrates a complete wallpaper library", testLibraryMigrationCopiesCompleteLibrary),
+    ("rebases resource URLs during library migration", testLibraryMigrationRebasesResourceURLs),
+    ("preserves external references and backup-only migration", testLibraryMigrationPreservesExternalInsideAndBackupOnly),
     ("rejects unsafe library migration targets", testLibraryMigrationRejectsUnsafeTargets),
     ("classifies queues by hidden membership", testQueueKindFollowsHiddenMembership),
     ("resolves normal and hidden queue slots", testQueueSlotResolverMatchesQueueKind),
@@ -4870,6 +4947,112 @@ func testLibraryMigrationCopiesCompleteLibrary() throws {
         equals: "asset",
         "copied bytes must match the source"
     )
+}
+
+func testLibraryMigrationRebasesResourceURLs() throws {
+    let fixture = try Fixture()
+    let fm = FileManager.default
+    let imageSource = fixture.root.appendingPathComponent("image.png")
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: imageSource)
+    let managedImage = try fixture.store.importItem(at: imageSource, storageMode: .managedCopy)
+    let thumbnail = fixture.library.appendingPathComponent("Thumbnails/\(managedImage.id.uuidString).jpg")
+    try fm.createDirectory(at: thumbnail.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data("thumbnail".utf8).write(to: thumbnail)
+    var imageWithThumbnail = managedImage
+    imageWithThumbnail.thumbnailURL = thumbnail
+    _ = try fixture.store.update(item: imageWithThumbnail)
+
+    let site = fixture.root.appendingPathComponent("site", isDirectory: true)
+    try fm.createDirectory(at: site, withIntermediateDirectories: true)
+    try Data("<html></html>".utf8).write(to: site.appendingPathComponent("index.html"))
+    let managedWeb = try fixture.store.importItem(at: site, storageMode: .managedCopy)
+
+    let externalSource = fixture.root.appendingPathComponent("external.png")
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: externalSource)
+    let external = try fixture.store.importItem(at: externalSource, storageMode: .externalReference)
+    let externalThumbnail = fixture.root.appendingPathComponent("external-thumb.jpg")
+    try Data("external-thumbnail".utf8).write(to: externalThumbnail)
+    var externalWithThumbnail = external
+    externalWithThumbnail.thumbnailURL = externalThumbnail
+    _ = try fixture.store.update(item: externalWithThumbnail)
+
+    let destination = fixture.root.appendingPathComponent("Migrated Library", isDirectory: true)
+    _ = try WallpaperLibraryMigrator.migrate(from: fixture.library, to: destination)
+    let migratedStore = WallpaperStore(libraryURL: destination)
+    let migratedItems = try migratedStore.items()
+    let migratedImage = try require(migratedItems.first(where: { $0.id == managedImage.id }), "migrated item should exist")
+    let migratedWeb = try require(migratedItems.first(where: { $0.id == managedWeb.id }), "migrated item should exist")
+    let migratedExternal = try require(migratedItems.first(where: { $0.id == external.id }), "migrated item should exist")
+
+    try expect(migratedImage.sourceURL.path.hasPrefix(destination.path + "/"), "managed source must move into the new library")
+    try expect(migratedImage.thumbnailURL?.path.hasPrefix(destination.appendingPathComponent("Thumbnails").path + "/") == true, "managed thumbnail must move into the new Thumbnails directory")
+    try expect(fm.fileExists(atPath: migratedImage.thumbnailURL!.path), "the migrated thumbnail must exist")
+    try expect(migratedWeb.entryURL?.path.hasPrefix(destination.path + "/") == true, "managed web entry must move with the copied project")
+    try expect(fm.fileExists(atPath: migratedWeb.entryURL!.path), "the migrated web entry must exist")
+    try expect(migratedExternal.sourceURL, equals: external.sourceURL, "external source references must not be rewritten")
+    try expect(migratedExternal.thumbnailURL, equals: externalThumbnail, "an external thumbnail outside the library must not be rewritten")
+
+    let backupData = try Data(contentsOf: destination.appendingPathComponent("wallpapers.json.bak"))
+    let backupDecoder = JSONDecoder()
+    backupDecoder.dateDecodingStrategy = .iso8601
+    let backupItems = try backupDecoder.decode([WallpaperItem].self, from: backupData)
+    let backupImage = try require(backupItems.first(where: { $0.id == managedImage.id }), "backup item should exist")
+    try expect(backupImage.thumbnailURL, equals: migratedImage.thumbnailURL, "the backup must receive the same rebased paths")
+
+    // Removing the old library must not invalidate managed playback or the
+    // copied thumbnails.
+    try fm.removeItem(at: fixture.library)
+    let refreshed = try migratedStore.refreshAllAvailability()
+    try expect(refreshed.first(where: { $0.id == managedImage.id })?.availability, equals: .available, "managed image remains available after old-library deletion")
+    try expect(refreshed.first(where: { $0.id == managedWeb.id })?.availability, equals: .available, "managed web remains available after old-library deletion")
+    try expect(fm.fileExists(atPath: migratedImage.thumbnailURL!.path), "thumbnail survives old-library deletion")
+}
+
+func testLibraryMigrationPreservesExternalInsideAndBackupOnly() throws {
+    let fixture = try Fixture()
+    let fm = FileManager.default
+    let insideSource = fixture.library.appendingPathComponent("inside.png")
+    try fm.createDirectory(at: insideSource.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: insideSource)
+    let externalInside = try fixture.store.importItem(at: insideSource, storageMode: .externalReference)
+    let insideThumbnail = fixture.library.appendingPathComponent("Thumbnails/\(externalInside.id.uuidString).jpg")
+    try fm.createDirectory(at: insideThumbnail.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data("inside-thumbnail".utf8).write(to: insideThumbnail)
+    var withThumbnail = externalInside
+    withThumbnail.thumbnailURL = insideThumbnail
+    _ = try fixture.store.update(item: withThumbnail)
+
+    let destination = fixture.root.appendingPathComponent("External Migration", isDirectory: true)
+    _ = try WallpaperLibraryMigrator.migrate(from: fixture.library, to: destination)
+    let migrated = try WallpaperStore(libraryURL: destination).items()
+    let item = try require(migrated.first(where: { $0.id == externalInside.id }), "external item should migrate")
+    try expect(item.sourceURL, equals: insideSource, "an external source physically inside the old library must not be rewritten")
+    try expect(item.thumbnailURL?.path.hasPrefix(destination.appendingPathComponent("Thumbnails").path + "/") == true, "the app-owned thumbnail inside the old library must move")
+
+    // A backup-only library must stay backup-only after migration, and the
+    // backup must be independently rewritten before recovery is attempted.
+    let backupOnly = fixture.root.appendingPathComponent("Backup Only Source", isDirectory: true)
+    try fm.createDirectory(at: backupOnly, withIntermediateDirectories: true)
+    let backupStore = WallpaperStore(libraryURL: backupOnly)
+    let backupAsset = fixture.root.appendingPathComponent("backup.png")
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: backupAsset)
+    let backupItem = try backupStore.importItem(at: backupAsset, storageMode: .managedCopy)
+    try fm.removeItem(at: backupOnly.appendingPathComponent("wallpapers.json"))
+    let backupDestination = fixture.root.appendingPathComponent("Backup Only Destination", isDirectory: true)
+    _ = try WallpaperLibraryMigrator.migrate(from: backupOnly, to: backupDestination)
+    try expect(!fm.fileExists(atPath: backupDestination.appendingPathComponent("wallpapers.json").path), "migration must not invent a primary index for a backup-only library")
+    let backupData = try Data(contentsOf: backupDestination.appendingPathComponent("wallpapers.json.bak"))
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let backupItems = try decoder.decode([WallpaperItem].self, from: backupData)
+    let migratedBackupItem = try require(backupItems.first, "the backup item should remain decodable")
+    try expect(migratedBackupItem.sourceURL.path.hasPrefix(backupDestination.path + "/"), "backup managed source must move to the new library")
+
+    try fm.removeItem(at: backupOnly)
+    let recovered = try WallpaperStore(libraryURL: backupDestination).items()
+    try expect(recovered.first?.id, equals: backupItem.id, "the rebased backup should recover after the old library is deleted")
+    try expect(recovered.first?.sourceURL.path.hasPrefix(backupDestination.path + "/") == true, "recovery must not reintroduce old source paths")
+    try expect(fm.fileExists(atPath: backupDestination.appendingPathComponent("wallpapers.json.recover").path), "backup recovery must preserve its reconcile marker")
 }
 
 func testLibraryMigrationRejectsUnsafeTargets() throws {

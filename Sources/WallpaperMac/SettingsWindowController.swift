@@ -69,11 +69,15 @@ private struct SettingsView: View {
     @AppStorage(SettingsKey.webWallpaperInteractionEnabled) private var webWallpaperInteractionEnabled = false
     @AppStorage(SettingsKey.launchAtLogin) private var launchAtLogin = false
     @AppStorage(SettingsKey.autoCheckUpdates) private var autoCheckUpdates = true
+    @AppStorage(SettingsKey.autoInstallUpdates) private var autoInstallUpdates = false
     @State private var launchAtLoginError: String?
     @State private var isSyncingLoginToggle = false
     @ObservedObject private var updateService = UpdateService.shared
     @ObservedObject private var themeStore = ThemeStore.shared
     @State private var category: SettingsCategory = .general
+    @State private var hideHiddenHotKey = HotKeyShortcut.defaultHideHidden
+    @State private var hotKeyMessage: String?
+    @State private var isRecordingHotKey = false
 
     private var applicationVersionInfo: ApplicationVersionInfo {
         ApplicationVersionInfo(
@@ -110,9 +114,9 @@ private struct SettingsView: View {
             launchAtLogin = LoginItemService.isEnabled
             isSyncingLoginToggle = false
             // First open of settings may still trigger a missed daily check.
-            if autoCheckUpdates {
-                updateService.runDailyCheckIfNeeded()
-            }
+            updateService.updateAutomaticPreferences()
+            hideHiddenHotKey = GlobalHotKeyService.shared.selectedShortcut
+            hotKeyMessage = GlobalHotKeyService.shared.lastRegistrationResult?.message
         }
         .onChange(of: libraryPath) { _ in notifySettingsChanged() }
         .onChange(of: storageMode) { _ in notifySettingsChanged() }
@@ -122,6 +126,26 @@ private struct SettingsView: View {
         .onChange(of: pauseInFullScreen) { _ in notifySettingsChanged() }
         .onChange(of: fitMode) { _ in notifySettingsChanged() }
         .onChange(of: webWallpaperInteractionEnabled) { _ in notifySettingsChanged() }
+        .onChange(of: autoCheckUpdates) { enabled in
+            if !enabled { autoInstallUpdates = false }
+            updateService.updateAutomaticPreferences()
+        }
+        .onChange(of: autoInstallUpdates) { enabled in
+            // Auto-install includes the daily check; enabling it never leaves
+            // a contradictory "install automatically but never check" state.
+            if enabled { autoCheckUpdates = true }
+            updateService.updateAutomaticPreferences()
+        }
+        .onChange(of: isRecordingHotKey) { recording in
+            GlobalHotKeyService.shared.isRecordingHotKey = recording
+        }
+        .onChange(of: category) { _ in
+            isRecordingHotKey = false
+        }
+        .onDisappear {
+            isRecordingHotKey = false
+            GlobalHotKeyService.shared.isRecordingHotKey = false
+        }
         .onChange(of: launchAtLogin) { enabled in
             guard !isSyncingLoginToggle else { return }
             updateLaunchAtLogin(enabled)
@@ -299,7 +323,7 @@ private struct SettingsView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer(minLength: 8)
-                    Text("⌃⌥H")
+                    Text(hideHiddenHotKey.displayString)
                         .font(AppTheme.Typography.mono(10, weight: .semibold))
                         .foregroundStyle(AppTheme.Palette.accent)
                         .padding(.horizontal, 7)
@@ -308,6 +332,44 @@ private struct SettingsView: View {
                             RoundedRectangle(cornerRadius: 4, style: .continuous)
                                 .fill(AppTheme.Palette.accentWash)
                         )
+                }
+                HStack(spacing: 8) {
+                    Button(isRecordingHotKey ? "正在等待按键…" : "自定义快捷键…") {
+                        hotKeyMessage = nil
+                        isRecordingHotKey = true
+                    }
+                    .buttonStyle(AccentActionButtonStyle(compact: true))
+                    .disabled(isRecordingHotKey)
+                    Button("恢复默认") { applyHideHiddenHotKey(.defaultHideHidden) }
+                        .buttonStyle(QuietButtonStyle(compact: true))
+                    if isRecordingHotKey {
+                        Button("取消") { isRecordingHotKey = false }
+                            .buttonStyle(QuietButtonStyle(compact: true))
+                    }
+                }
+                if isRecordingHotKey {
+                    HStack(spacing: 8) {
+                        HotKeyRecorderView(
+                            onRecord: { shortcut in applyHideHiddenHotKey(shortcut) },
+                            onCancel: { isRecordingHotKey = false }
+                        )
+                        .frame(width: 1, height: 1)
+                        .opacity(0.01)
+                        Text("请按下新快捷键，需包含 ⌃、⌥ 或 ⌘ 中至少一个。系统快捷键会先预检，注册失败会保留原快捷键。")
+                            .font(AppTheme.Typography.micro)
+                            .foregroundStyle(AppTheme.Palette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Text("提示：macOS 无法枚举所有第三方应用的普通全局热键；若出现双重响应，请更换组合。")
+                    .font(AppTheme.Typography.micro)
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let hotKeyMessage {
+                    Text(hotKeyMessage)
+                        .font(AppTheme.Typography.micro)
+                        .foregroundStyle(hotKeyMessage == "快捷键已更新。" ? AppTheme.Palette.applied : AppTheme.Palette.danger)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
@@ -335,8 +397,14 @@ private struct SettingsView: View {
                 ThemeHairline()
                 settingsToggle(
                     "启动时每日检查一次",
-                    description: "每天最多检查一次 GitHub 发布。",
+                    description: "每天最多检查一次 GitHub 发布，只在发现新版本时提示。",
                     binding: $autoCheckUpdates
+                )
+                ThemeHairline()
+                settingsToggle(
+                    "每天自动检查并安装更新",
+                    description: "开启后每天定时检查；发现新版本会自动下载、校验并安装，应用将重启。关闭时只提示更新。",
+                    binding: $autoInstallUpdates
                 )
             }
 
@@ -559,6 +627,21 @@ private struct SettingsView: View {
                         .disabled(updateService.isBusy)
                 }
             }
+        }
+    }
+
+    private func applyHideHiddenHotKey(_ shortcut: HotKeyShortcut) {
+        let result = GlobalHotKeyService.shared.updateShortcut(shortcut)
+        switch result {
+        case .success:
+            // Only persist a shortcut Carbon actually accepted. A failed
+            // attempt leaves both the active and stored shortcut unchanged.
+            hideHiddenHotKey = shortcut
+            shortcut.save(to: .standard, key: SettingsKey.hideHiddenHotKey)
+            hotKeyMessage = "快捷键已更新。"
+            isRecordingHotKey = false
+        case .invalid, .conflict, .failure:
+            hotKeyMessage = result.message
         }
     }
 
@@ -853,11 +936,15 @@ enum SettingsKey {
     static let pauseInFullScreen = "WallpaperMac.pauseInFullScreen"
     static let fitMode = "WallpaperMac.fitMode"
     static let webWallpaperInteractionEnabled = "WallpaperMac.webWallpaperInteractionEnabled"
+    static let hideHiddenHotKey = "WallpaperMac.hideHiddenHotKey"
     static let launchAtLogin = "WallpaperMac.launchAtLogin"
     static let onboardingCompleted = "WallpaperMac.onboardingCompleted"
     static let autoCheckUpdates = "WallpaperMac.autoCheckUpdates"
+    static let autoInstallUpdates = "WallpaperMac.autoInstallUpdates"
     static let appearanceTheme = "WallpaperMac.appearanceTheme"
     static let lastUpdateCheckDate = "WallpaperMac.lastUpdateCheckDate"
+    static let lastAutomaticUpdateAttemptDate = "WallpaperMac.lastAutomaticUpdateAttemptDate"
+    static let automaticUpdateBlockedVersion = "WallpaperMac.automaticUpdateBlockedVersion"
 }
 
 extension Notification.Name {

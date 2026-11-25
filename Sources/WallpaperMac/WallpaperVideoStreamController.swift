@@ -199,7 +199,7 @@ final class WallpaperVideoStreamController {
         // Decide signal transitions under the lock; the flag itself is only
         // read/written here and in teardown (both hold stateLock).
         var sendSignal: Int32?
-        if let childPID {
+        if process != nil {
             if isPlaying, isProcessSuspended {
                 sendSignal = SIGCONT
                 isProcessSuspended = false

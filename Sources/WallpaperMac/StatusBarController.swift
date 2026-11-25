@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import WallpaperMacCore
 
 @MainActor
 final class StatusBarController: NSObject, NSMenuDelegate {
@@ -9,6 +10,8 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private let togglePlaybackItem = NSMenuItem()
     private let toggleMuteItem = NSMenuItem()
     private let updateItem = NSMenuItem()
+    private let hideHiddenItem = NSMenuItem()
+    private var hotKeyObservation: AnyCancellable?
     private var updatePhaseObservation: AnyCancellable?
     private let showMainWindow: () -> Void
     private let showSettings: () -> Void
@@ -94,14 +97,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         toggleMuteItem.target = self
         menu.addItem(toggleMuteItem)
 
-        let hideHiddenItem = NSMenuItem(
-            title: "关闭隐藏壁纸",
-            action: #selector(hideHiddenWallpapersAction),
-            keyEquivalent: "h"
-        )
-        hideHiddenItem.keyEquivalentModifierMask = [.control, .option]
-        hideHiddenItem.target = self
-        menu.addItem(hideHiddenItem)
+        configureHideHiddenItem()
 
         menu.addItem(.separator())
         let libraryItem = NSMenuItem(title: "打开壁纸库", action: #selector(openLibraryAction), keyEquivalent: "")
@@ -130,6 +126,40 @@ final class StatusBarController: NSObject, NSMenuDelegate {
                 self.isPlaybackPaused = !playing
                 self.refreshPlaybackMenuTitle()
             }
+        }
+    }
+
+    private func configureHideHiddenItem() {
+        hideHiddenItem.title = "关闭隐藏壁纸"
+        hideHiddenItem.action = #selector(hideHiddenWallpapersAction)
+        hideHiddenItem.target = self
+        menu.addItem(hideHiddenItem)
+        let service = GlobalHotKeyService.shared
+        hotKeyObservation = service.$currentShortcut
+            .combineLatest(service.$isHotKeyRegistered, service.$lastRegistrationResult)
+            .sink { [weak self] shortcut, isRegistered, result in
+                Task { @MainActor [weak self] in
+                    self?.applyHotKey(shortcut, isRegistered: isRegistered, result: result)
+                }
+            }
+    }
+
+    private func applyHotKey(
+        _ shortcut: HotKeyShortcut,
+        isRegistered: Bool,
+        result: HotKeyRegistrationResult?
+    ) {
+        hideHiddenItem.keyEquivalent = isRegistered ? shortcut.menuKeyEquivalent : ""
+        var modifiers: NSEvent.ModifierFlags = []
+        if shortcut.modifiers & HotKeyShortcut.commandModifier != 0 { modifiers.insert(.command) }
+        if shortcut.modifiers & HotKeyShortcut.shiftModifier != 0 { modifiers.insert(.shift) }
+        if shortcut.modifiers & HotKeyShortcut.optionModifier != 0 { modifiers.insert(.option) }
+        if shortcut.modifiers & HotKeyShortcut.controlModifier != 0 { modifiers.insert(.control) }
+        hideHiddenItem.keyEquivalentModifierMask = isRegistered ? modifiers : []
+        if isRegistered {
+            hideHiddenItem.toolTip = "关闭隐藏壁纸（\(shortcut.displayString)）"
+        } else {
+            hideHiddenItem.toolTip = result?.message ?? "全局快捷键当前不可用"
         }
     }
 

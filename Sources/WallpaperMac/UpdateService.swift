@@ -41,10 +41,72 @@ final class UpdateService: ObservableObject {
     private(set) var retryUpdate: AvailableUpdate?
 
     private var task: Task<Void, Never>?
+    private var dailyTimer: Timer?
+    private var wakeObserver: NSObjectProtocol?
+    /// True only for a check started by the automatic scheduler. A manual
+    /// check never turns into an unattended install.
+    private var automaticInstallRequested = false
     private let clock: @MainActor () -> Date
+    private let dailyCheckInterval: TimeInterval
 
-    init(clock: @escaping @MainActor () -> Date = { Date() }) {
+    init(
+        clock: @escaping @MainActor () -> Date = { Date() },
+        dailyCheckInterval: TimeInterval = 24 * 60 * 60
+    ) {
         self.clock = clock
+        self.dailyCheckInterval = dailyCheckInterval
+    }
+
+    private var automationPreferences: UpdateAutomationPreferences {
+        let defaults = UserDefaults.standard
+        return UpdateAutomationPreferences(
+            dailyCheckEnabled: defaults.object(forKey: SettingsKey.autoCheckUpdates) as? Bool ?? true,
+            automaticInstallEnabled: defaults.object(forKey: SettingsKey.autoInstallUpdates) as? Bool ?? false
+        )
+    }
+
+    /// Applies the current update settings and keeps a repeating daily check
+    /// alive for the whole menu-bar session, not just app launch. Called at
+    /// startup and whenever either update toggle changes.
+    func updateAutomaticPreferences() {
+        dailyTimer?.invalidate()
+        dailyTimer = nil
+        let preferences = automationPreferences
+        // Reuse an already discovered update before starting another network
+        // check. A version that failed an automatic install stays manual-only.
+        var startedInstall = false
+        if preferences.shouldInstallAutomatically,
+           case .available(let update) = phase,
+           !isAutomaticInstallBlocked(update.version) {
+            // Reusing an available result is still an automatic attempt: a
+            // network failure must consume a daily slot just like a check-
+            // initiated download, rather than retrying on every launch.
+            UserDefaults.standard.set(clock(), forKey: SettingsKey.lastAutomaticUpdateAttemptDate)
+            startInstall(update, automatic: true)
+            startedInstall = true
+        }
+        if preferences.shouldScheduleDailyCheck {
+            if wakeObserver == nil {
+                wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                    forName: NSWorkspace.didWakeNotification,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    Task { @MainActor [weak self] in
+                        self?.runDailyCheckIfNeeded()
+                    }
+                }
+            }
+            if !startedInstall {
+                runDailyCheckIfNeeded()
+            }
+            dailyTimer = Timer.scheduledTimer(withTimeInterval: dailyCheckInterval, repeats: true) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.runDailyCheckIfNeeded()
+                }
+            }
+            dailyTimer?.tolerance = 300
+        }
     }
 
     var isBusy: Bool {
@@ -67,9 +129,24 @@ final class UpdateService: ObservableObject {
     }
 
     func checkForUpdates(userInitiated: Bool) {
+        checkForUpdates(origin: userInitiated ? .manual : .scheduled)
+    }
+
+    private enum CheckOrigin {
+        case manual
+        case scheduled
+    }
+
+    private func checkForUpdates(origin: CheckOrigin) {
         guard !isBusy else { return }
         phase = .checking
         retryUpdate = nil
+        automaticInstallRequested = origin == .scheduled && automationPreferences.shouldInstallAutomatically
+        if origin == .scheduled {
+            // Attempts, not just successful checks, consume a daily slot. A
+            // failed network/install attempt must not retry on every launch.
+            UserDefaults.standard.set(clock(), forKey: SettingsKey.lastAutomaticUpdateAttemptDate)
+        }
         let currentVersion = ApplicationVersionInfo(
             infoDictionary: Bundle.main.infoDictionary ?? [:],
             fallbackVersion: ApplicationVersionInfo.developmentFallbackVersion
@@ -84,31 +161,39 @@ final class UpdateService: ObservableObject {
                     self.phase = .upToDate(version)
                 case .updateAvailable(let update):
                     self.phase = .available(update)
+                    if self.automaticInstallRequested,
+                       self.automationPreferences.shouldInstallAutomatically,
+                       !self.isAutomaticInstallBlocked(update.version) {
+                        // Re-check the preference: the user may have disabled
+                        // automatic installation while the request was in flight.
+                        self.startInstall(update, automatic: true)
+                    }
                 }
                 UserDefaults.standard.set(self.clock(), forKey: SettingsKey.lastUpdateCheckDate)
             } catch {
                 // Silent background checks only surface real updates.
-                self.phase = userInitiated
+                self.phase = origin == .manual
                     ? .failed(Self.failureKind(for: error), error.localizedDescription)
                     : .idle
             }
+            self.automaticInstallRequested = false
         }
     }
 
     func installUpdate(_ update: AvailableUpdate) {
         guard !isBusy else { return }
         retryUpdate = update
-        startInstall(update)
+        startInstall(update, automatic: false)
     }
 
     /// Retries the last approved update's download without running the GitHub
     /// release check again.
     func retryDownload() {
         guard canRetryDownload, let update = retryUpdate else { return }
-        startInstall(update)
+        startInstall(update, automatic: false)
     }
 
-    private func startInstall(_ update: AvailableUpdate) {
+    private func startInstall(_ update: AvailableUpdate, automatic: Bool) {
         // A process can outlive the bundle it was launched from (for example
         // after installing the DMG over a running copy). Compare against the
         // version on disk before downloading or replacing anything, so a
@@ -166,22 +251,49 @@ final class UpdateService: ObservableObject {
                 // Hard failure: remove the attempt's staging directory so no
                 // partially downloaded or extracted update lingers.
                 try? FileManager.default.removeItem(at: stagingDirectory)
-                UserDefaults.standard.removeObject(forKey: SettingsKey.lastUpdateCheckDate)
+                if !automatic {
+                    UserDefaults.standard.removeObject(forKey: SettingsKey.lastUpdateCheckDate)
+                }
                 await MainActor.run {
                     self.retryUpdate = update
+                    if automatic {
+                        let kind = Self.failureKind(for: error)
+                        // Network failures may be retried on the next daily
+                        // cycle. Deterministic verification/install failures
+                        // block only this version; manual retry remains
+                        // available. Another owner holding the install lock is
+                        // a defer, not a reason to block the package.
+                        if kind != .network, !(error is UpdateInstallError && Self.isAlreadyInstalling(error)) {
+                            UserDefaults.standard.set(update.version, forKey: SettingsKey.automaticUpdateBlockedVersion)
+                        }
+                    }
                     self.phase = .failed(Self.failureKind(for: error), error.localizedDescription)
                 }
             }
         }
     }
 
+    private static func isAlreadyInstalling(_ error: Error) -> Bool {
+        guard case UpdateInstallError.alreadyInstalling = error else { return false }
+        return true
+    }
+
+    private func isAutomaticInstallBlocked(_ version: String) -> Bool {
+        UserDefaults.standard.string(forKey: SettingsKey.automaticUpdateBlockedVersion) == version
+    }
+
     func runDailyCheckIfNeeded() {
-        guard !isBusy else { return }
-        let lastCheck = UserDefaults.standard.object(forKey: SettingsKey.lastUpdateCheckDate) as? Date
-        if let lastCheck, clock().timeIntervalSince(lastCheck) < 24 * 60 * 60 {
-            return
-        }
-        checkForUpdates(userInitiated: false)
+        let defaults = UserDefaults.standard
+        let lastCheck = defaults.object(forKey: SettingsKey.lastUpdateCheckDate) as? Date
+        let lastAttempt = defaults.object(forKey: SettingsKey.lastAutomaticUpdateAttemptDate) as? Date
+        guard automationPreferences.shouldCheck(
+            now: clock(),
+            lastCheck: lastCheck,
+            lastAutomaticAttempt: lastAttempt,
+            isBusy: isBusy,
+            interval: dailyCheckInterval
+        ) else { return }
+        checkForUpdates(origin: .scheduled)
     }
 
     /// Clears a visible "update available" or error prompt without touching a

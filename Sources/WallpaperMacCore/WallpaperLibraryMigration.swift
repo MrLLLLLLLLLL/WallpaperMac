@@ -55,6 +55,11 @@ public enum WallpaperLibraryMigrator {
         to destination: URL,
         fileManager: FileManager = .default
     ) throws -> WallpaperLibraryMigrationResult {
+        // Keep the lexical roots used by the persisted index alongside the
+        // resolved roots used for safety checks and copying. An index may use
+        // either spelling when a library was selected through a symlink.
+        let storedSource = source.standardizedFileURL
+        let storedDestination = destination.standardizedFileURL
         let source = source.standardizedFileURL.resolvingSymlinksInPath()
         let destination = destination.standardizedFileURL.resolvingSymlinksInPath()
         guard source != destination else {
@@ -108,6 +113,16 @@ public enum WallpaperLibraryMigrator {
                 let destinationItem = destination.appendingPathComponent(name)
                 try fileManager.copyItem(at: sourceItem, to: destinationItem)
             }
+            // Metadata is rewritten inside the same do/catch as the copy. A
+            // malformed index or backup therefore follows the same rollback
+            // path as a failed file copy and cannot leave a nonempty target.
+            try rewriteMetadata(
+                at: destination,
+                storedSource: storedSource,
+                resolvedSource: source,
+                storedDestination: storedDestination,
+                fileManager: fileManager
+            )
             let metrics = try libraryMetrics(at: source, fileManager: fileManager)
             return WallpaperLibraryMigrationResult(
                 sourceURL: source,
@@ -132,6 +147,115 @@ public enum WallpaperLibraryMigrator {
             }
             throw WallpaperLibraryMigrationError.copyFailed(error.localizedDescription)
         }
+    }
+
+    private static func rewriteMetadata(
+        at destination: URL,
+        storedSource: URL,
+        resolvedSource: URL,
+        storedDestination: URL,
+        fileManager: FileManager
+    ) throws {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        for name in ["wallpapers.json", "wallpapers.json.bak"] {
+            let url = destination.appendingPathComponent(name)
+            guard fileManager.fileExists(atPath: url.path) else { continue }
+            let data = try Data(contentsOf: url)
+            let items = try decoder.decode([WallpaperItem].self, from: data)
+            let rebased = items.map { item in
+                rebase(
+                    item,
+                    storedSource: storedSource,
+                    resolvedSource: resolvedSource,
+                    storedDestination: storedDestination
+                )
+            }
+            // Do not use WallpaperStore.save here: migration must preserve a
+            // distinct backup and any .recover marker, and must not create an
+            // index when the source only had a backup.
+            let output = try encoder.encode(rebased)
+            try output.write(to: url, options: .atomic)
+        }
+    }
+
+    private static func rebase(
+        _ item: WallpaperItem,
+        storedSource: URL,
+        resolvedSource: URL,
+        storedDestination: URL
+    ) -> WallpaperItem {
+        var updated = item
+        if item.storageMode == .managedCopy {
+            updated.sourceURL = rebaseLibraryURL(
+                item.sourceURL,
+                storedSource: storedSource,
+                resolvedSource: resolvedSource,
+                storedDestination: storedDestination,
+                thumbnailsOnly: false
+            )
+            updated.entryURL = item.entryURL.map {
+                rebaseLibraryURL(
+                    $0,
+                    storedSource: storedSource,
+                    resolvedSource: resolvedSource,
+                    storedDestination: storedDestination,
+                    thumbnailsOnly: false
+                )
+            }
+            updated.playbackURL = item.playbackURL.map {
+                rebaseLibraryURL(
+                    $0,
+                    storedSource: storedSource,
+                    resolvedSource: resolvedSource,
+                    storedDestination: storedDestination,
+                    thumbnailsOnly: false
+                )
+            }
+        }
+        // Thumbnails are app-owned even for external-reference items. Only
+        // files under the old library's Thumbnails directory move; an external
+        // source or an arbitrary external thumbnail is never rewritten.
+        updated.thumbnailURL = item.thumbnailURL.map {
+            rebaseLibraryURL(
+                $0,
+                storedSource: storedSource,
+                resolvedSource: resolvedSource,
+                storedDestination: storedDestination,
+                thumbnailsOnly: true
+            )
+        }
+        return updated
+    }
+
+    private static func rebaseLibraryURL(
+        _ url: URL,
+        storedSource: URL,
+        resolvedSource: URL,
+        storedDestination: URL,
+        thumbnailsOnly: Bool
+    ) -> URL {
+        guard url.isFileURL else { return url }
+        let path = url.standardizedFileURL.path
+        let roots = [storedSource, resolvedSource].map { root in
+            thumbnailsOnly
+                ? root.appendingPathComponent("Thumbnails", isDirectory: true).standardizedFileURL
+                : root.standardizedFileURL
+        }
+        for root in roots {
+            let rootPath = root.path
+            let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+            guard path.hasPrefix(prefix) else { continue }
+            let relative = String(path.dropFirst(prefix.count))
+            let destination = thumbnailsOnly
+                ? storedDestination.appendingPathComponent("Thumbnails", isDirectory: true)
+                : storedDestination
+            guard !relative.isEmpty else { return destination }
+            return destination.appendingPathComponent(relative, isDirectory: url.hasDirectoryPath).standardizedFileURL
+        }
+        return url
     }
 
     private static func libraryMetrics(

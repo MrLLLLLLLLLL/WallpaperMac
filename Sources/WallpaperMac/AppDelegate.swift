@@ -37,17 +37,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // now, but defer the modal until the launch has completed so it cannot
         // delay the health acknowledgement above.
         if let failure = UpdateInstallJournal.takeFailure() {
-            // Allow the daily check to run again after a failed install.
-            UserDefaults.standard.removeObject(forKey: SettingsKey.lastUpdateCheckDate)
+            // Do not automatically reinstall the same version after a
+            // detached-install failure. The journal's failure is shown to the
+            // user, while the next daily check may discover a different one.
+            if let version = failure.version {
+                UserDefaults.standard.set(version, forKey: SettingsKey.automaticUpdateBlockedVersion)
+            }
             Task { @MainActor [weak self] in
                 self?.presentInstallFailure(failure)
             }
         }
 
-        // Daily update check runs at launch, independent of the settings UI.
-        if UserDefaults.standard.object(forKey: SettingsKey.autoCheckUpdates) as? Bool ?? true {
-            UpdateService.shared.runDailyCheckIfNeeded()
-        }
+        // Daily checks and optional unattended installs run for the whole
+        // menu-bar session, independent of the settings UI.
+        UpdateService.shared.updateAutomaticPreferences()
     }
 
     private func presentInstallFailure(_ failure: UpdateInstallFailure) {
