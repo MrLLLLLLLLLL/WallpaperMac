@@ -2,16 +2,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$ROOT/scripts/lib/test-state-guard.sh"
 APP="$ROOT/dist/WallpaperMac.app"
 EXEC="$APP/Contents/MacOS/WallpaperMac"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/wallpapermac-stream-memory.XXXXXX")"
 LIBRARY="$TEST_ROOT/Library"
 SOURCE="$TEST_ROOT/large-stream.mp4"
-DEFAULTS_BACKUP="$TEST_ROOT/defaults.plist"
-DEFAULTS_BACKED_UP=0
-CONFIG_DIR="$HOME/Library/Application Support/WallpaperMac/Configuration"
-CONFIG_BACKUP="$TEST_ROOT/configuration-backup"
-CONFIG_EXISTED=0
 RUN_PID=""
 
 cleanup() {
@@ -23,22 +19,9 @@ cleanup() {
         done
         kill -9 "$RUN_PID" 2>/dev/null || true
     fi
-    if (( DEFAULTS_BACKED_UP )) && [[ -s "$DEFAULTS_BACKUP" ]]; then
-        defaults delete com.wallpaper.mac >/dev/null 2>&1 || true
-        defaults import com.wallpaper.mac "$DEFAULTS_BACKUP" >/dev/null 2>&1 || true
-    else
-        defaults delete com.wallpaper.mac 'WallpaperMac.libraryPath' >/dev/null 2>&1 || true
-        defaults delete com.wallpaper.mac 'WallpaperMac.onboardingCompleted' >/dev/null 2>&1 || true
-    fi
-    if (( CONFIG_EXISTED )); then
-        if [[ -d "$CONFIG_BACKUP" ]]; then
-            rm -rf "$CONFIG_DIR"
-            cp -R "$CONFIG_BACKUP" "$CONFIG_DIR" 2>/dev/null || true
-        fi
-    else
-        rm -rf "$CONFIG_DIR"
-    fi
+    wm_state_guard_restore
     rm -rf "$TEST_ROOT"
+
 }
 trap cleanup EXIT INT TERM
 
@@ -46,11 +29,7 @@ FFMPEG="${WALLPAPERMAC_FFMPEG:-/opt/homebrew/bin/ffmpeg}"
 [[ -x "$FFMPEG" ]] || { echo "ffmpeg not found: $FFMPEG" >&2; exit 1; }
 test -x "$EXEC"
 
-defaults export com.wallpaper.mac "$DEFAULTS_BACKUP" >/dev/null 2>&1 && DEFAULTS_BACKED_UP=1
-if [[ -d "$CONFIG_DIR" ]]; then
-    CONFIG_EXISTED=1
-    cp -R "$CONFIG_DIR" "$CONFIG_BACKUP" || true
-fi
+wm_state_guard_init "$TEST_ROOT"
 mkdir -p "$LIBRARY/Assets"
 
 echo '== Build long streaming fixture =='

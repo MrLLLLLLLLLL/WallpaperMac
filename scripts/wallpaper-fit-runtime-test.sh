@@ -2,14 +2,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$ROOT/scripts/lib/test-state-guard.sh"
 EXEC="$ROOT/dist/WallpaperMac.app/Contents/MacOS/WallpaperMac"
 FFMPEG="${WALLPAPERMAC_FFMPEG:-/opt/homebrew/bin/ffmpeg}"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/wallpapermac-fit-test.XXXXXX")"
-DEFAULTS_BACKUP="$TEST_ROOT/defaults.plist"
-DEFAULTS_BACKED_UP=0
-CONFIG_DIR="$HOME/Library/Application Support/WallpaperMac/Configuration"
-CONFIG_BACKUP="$TEST_ROOT/configuration-backup"
-CONFIG_EXISTED=0
 RUN_PID=""
 
 cleanup() {
@@ -24,27 +20,13 @@ cleanup() {
     # `defaults import` merges, so remove the keys this test writes first;
     # otherwise a key absent from the backup survives pointing at deleted
     # test fixtures.
-    for key in 'WallpaperMac.libraryPath' 'WallpaperMac.onboardingCompleted' 'WallpaperMac.fitMode'; do
-        defaults delete com.wallpaper.mac "$key" >/dev/null 2>&1 || true
-    done
-    if (( DEFAULTS_BACKED_UP )) && [[ -s "$DEFAULTS_BACKUP" ]]; then
-        defaults import com.wallpaper.mac "$DEFAULTS_BACKUP" >/dev/null 2>&1 || true
-    fi
-    # The app records the test library in a configuration file that outlives
-    # UserDefaults; restore it so the next normal launch uses the real library.
-    if (( CONFIG_EXISTED )); then
-        if [[ -d "$CONFIG_BACKUP" ]]; then
-            rm -rf "$CONFIG_DIR"
-            cp -R "$CONFIG_BACKUP" "$CONFIG_DIR" 2>/dev/null || true
-        fi
-    else
-        rm -rf "$CONFIG_DIR"
-    fi
+    wm_state_guard_restore
     if [[ "${WALLPAPERMAC_TEST_KEEP_ARTIFACTS:-0}" == 1 ]]; then
         printf 'fit test artifacts: %s\n' "$TEST_ROOT"
     else
         rm -rf "$TEST_ROOT"
     fi
+
 }
 trap cleanup EXIT INT TERM
 
@@ -55,11 +37,7 @@ if pgrep -x WallpaperMac >/dev/null 2>&1; then
     echo 'quit any running WallpaperMac instance before the fit runtime test' >&2
     exit 1
 fi
-defaults export com.wallpaper.mac "$DEFAULTS_BACKUP" >/dev/null 2>&1 && DEFAULTS_BACKED_UP=1
-if [[ -d "$CONFIG_DIR" ]]; then
-    CONFIG_EXISTED=1
-    cp -R "$CONFIG_DIR" "$CONFIG_BACKUP" || true
-fi
+wm_state_guard_init "$TEST_ROOT"
 mkdir -p "$TEST_ROOT/Library/Assets"
 
 python3 - "$TEST_ROOT" <<'PY'

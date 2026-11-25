@@ -113,6 +113,9 @@ printf '%s\n' '== Video codec compatibility =='
 printf '%s\n' '== Queue pause and system suspension =='
 ./scripts/queue-pause-runtime-test.sh
 
+printf '%s\n' '== Queue memory regression =='
+./scripts/queue-memory-regression.sh
+
 printf '%s\n' '== Decoder failure lifecycle =='
 ./scripts/video-stream-failure-test.sh
 
@@ -157,6 +160,23 @@ SHORT_VERSION="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$
 BUNDLE_VERSION="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$APP/Contents/Info.plist")"
 [[ "$SHORT_VERSION" == "$VERSION" ]] || { print -u2 "CFBundleShortVersionString mismatch: $SHORT_VERSION != $VERSION"; exit 1; }
 [[ "$BUNDLE_VERSION" == "$VERSION" ]] || { print -u2 "CFBundleVersion mismatch: $BUNDLE_VERSION != $VERSION"; exit 1; }
+
+# Version carriers must agree, or the release is inconsistent no matter how
+# green the runtime tests are.
+printf '%s\n' '== Version consistency =='
+FALLBACK_VERSION="$(grep -E 'developmentFallbackVersion[[:space:]]*=' "$ROOT/Sources/WallpaperMacCore/ApplicationVersionInfo.swift" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+[[ "$FALLBACK_VERSION" == "$VERSION" ]] || {
+    print -u2 "ApplicationVersionInfo.developmentFallbackVersion ($FALLBACK_VERSION) != VERSION ($VERSION)"
+    exit 1
+}
+if ! grep -qE "^## \[$VERSION\]" "$ROOT/CHANGELOG.md"; then
+    print -u2 "CHANGELOG.md has no section for $VERSION"
+    exit 1
+fi
+if git -C "$ROOT" rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+    print -u2 "Tag v$VERSION already exists; bump VERSION before releasing again."
+    exit 1
+fi
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
 /usr/bin/file "$APP/Contents/MacOS/WallpaperMac"
 ./scripts/update-atomic-swap-smoke.sh

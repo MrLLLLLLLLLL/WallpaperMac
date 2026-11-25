@@ -2,14 +2,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$ROOT/scripts/lib/test-state-guard.sh"
 EXEC="$ROOT/dist/WallpaperMac.app/Contents/MacOS/WallpaperMac"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/wallpapermac-external-navigation.XXXXXX")"
 LIBRARY="$TEST_ROOT/Library"
-DEFAULTS_BACKUP="$TEST_ROOT/defaults.plist"
-DEFAULTS_BACKED_UP=0
-CONFIG_DIR="$HOME/Library/Application Support/WallpaperMac/Configuration"
-CONFIG_BACKUP="$TEST_ROOT/configuration-backup"
-CONFIG_EXISTED=0
 RUN_PID=""
 SERVER_PID=""
 HIDDEN_PROCESS_NAMES=""
@@ -30,33 +26,15 @@ cleanup() {
             osascript -e "tell application \"System Events\" to set visible of process \"$process_name\" to true" >/dev/null 2>&1 || true
         done
     fi
-    if (( DEFAULTS_BACKED_UP )) && [[ -s "$DEFAULTS_BACKUP" ]]; then
-        defaults delete com.wallpaper.mac >/dev/null 2>&1 || true
-        defaults import com.wallpaper.mac "$DEFAULTS_BACKUP" >/dev/null 2>&1 || true
-    else
-        defaults delete com.wallpaper.mac 'WallpaperMac.libraryPath' >/dev/null 2>&1 || true
-        defaults delete com.wallpaper.mac 'WallpaperMac.onboardingCompleted' >/dev/null 2>&1 || true
-        defaults delete com.wallpaper.mac 'WallpaperMac.webWallpaperInteractionEnabled' >/dev/null 2>&1 || true
-    fi
-    if (( CONFIG_EXISTED )); then
-        if [[ -d "$CONFIG_BACKUP" ]]; then
-            rm -rf "$CONFIG_DIR"
-            cp -R "$CONFIG_BACKUP" "$CONFIG_DIR" 2>/dev/null || true
-        fi
-    else
-        rm -rf "$CONFIG_DIR"
-    fi
+    wm_state_guard_restore
     rm -rf "$TEST_ROOT"
+
 }
 trap cleanup EXIT INT TERM
 
 cd "$ROOT"
 test -x "$EXEC"
-defaults export com.wallpaper.mac "$DEFAULTS_BACKUP" >/dev/null 2>&1 && DEFAULTS_BACKED_UP=1
-if [[ -d "$CONFIG_DIR" ]]; then
-    CONFIG_EXISTED=1
-    cp -R "$CONFIG_DIR" "$CONFIG_BACKUP" || true
-fi
+wm_state_guard_init "$TEST_ROOT"
 mkdir -p "$LIBRARY/Assets"
 
 # The local server exists only to detect an external browser opening the URL.

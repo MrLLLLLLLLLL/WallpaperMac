@@ -9,7 +9,7 @@
 1. 阅读现有 Issue，避免重复工作；新增功能请先说明具体的本地壁纸工作流和边界。
 2. 对涉及 UI、队列策略、导入格式或持久化数据的改动，先提出简短设计说明，再开始实现。
 3. 不要提交私人壁纸、视频、网页项目、用户资源索引、日志、Cookie、证书或签名身份。
-4. 不要擅自引入远程 URL 壁纸、账号体系、云同步或在线素材市场；这些不属于当前产品范围。
+4. 不要擅自引入账号体系、云同步或在线素材市场；这些不属于当前产品范围。HTTP/HTTPS 网页壁纸自 0.2.8 起已支持，但新增远程来源仍需先提出设计说明。
 
 ## 本地开发
 
@@ -54,9 +54,7 @@ git diff --check
 以下检查需要真实 macOS 桌面环境，通常在准备发布时运行：
 
 ```bash
-./scripts/test-release.sh
-./scripts/player-runtime-test.sh
-./scripts/queue-memory-regression.sh
+./scripts/test-release.sh   # 已包含播放器矩阵、内存回归与版本一致性校验
 ./scripts/build-dmg.sh
 ```
 
@@ -69,6 +67,18 @@ UI、视频和 `WKWebView` 改动还应手工检查：导入、检查器预览�
 - 不要把 `dist/`、`.build/` 或单纯格式化的无关改动混入功能 PR。
 - 如果改动影响版本行为，请更新 `CHANGELOG.md`，必要时在本地补充发布说明（`docs/release-notes/`，不随仓库发布）。
 
+## 发布流程
+
+发布只在维护者明确要求时进行。步骤：
+
+1. 确认 `VERSION`、`ApplicationVersionInfo.developmentFallbackVersion`、`CHANGELOG.md` 段落、`docs/release-notes/<version>.md` 已同步，工作区干净。
+2. `WALLPAPERMAC_UPDATE_SIGNING_KEY="$PWD/secrets/WallpaperMac.update.key" ./scripts/test-release.sh`，必须输出 `ALL_RELEASE_TESTS_PASSED`。
+3. `./scripts/build-release.sh` 生成并签名 ZIP/DMG/SHA256SUMS（缺私钥 fail-closed）。
+4. `./scripts/publish-release.sh --yes`：打 `v<x.y.z>` 标签、推送、`gh release create` 上传四个产物，随后自动运行生产模式 `update-artifact-smoke.sh` 校验线上产物，输出 `PUBLISH_RELEASE_PASSED`。
+5. 真机升级验收：从上一版本检查更新，确认退出、替换、自动重启，壁纸库/队列/分配保留，再次检查显示最新。
+
+注意：`secrets/` 与更新私钥永不提交；发布公钥内嵌于 `Sources/WallpaperMacCore/Update/UpdateSignature.swift`。App 使用 ad-hoc 签名，正式对外分发前应完成 Developer ID 签名与 Apple 公证。0.2.8–0.2.13 用户需手动安装一次 0.2.14 才能恢复自动更新，发布说明必须保留该指引。
+
 ## 行为边界
 
-WallpaperMac 当前只支持本地图片、视频和本地 HTML 项目。外部文件引用只能移除应用记录，不能删除用户原始文件；应用库副本才可以由应用托管删除。请在修改导入、删除或失效资源处理时保留这一约束。
+WallpaperMac 支持本地图片、视频、本地 HTML 项目，以及 HTTP/HTTPS 网页壁纸（0.2.8 起）。外部文件引用只能移除应用记录，不能删除用户原始文件；应用库副本才可以由应用托管删除。请在修改导入、删除或失效资源处理时保留这一约束。

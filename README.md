@@ -4,7 +4,7 @@
 
 WallpaperMac 是一款使用 **SwiftUI + AppKit** 构建的原生 macOS 壁纸管理工具。它将本地图片、视频、本地 HTML 项目和 HTTP/HTTPS 网页网址统一纳入壁纸库，支持多显示器独立分配、播放队列、分组、菜单栏控制和可迁移的壁纸库存储位置。
 
-当前版本：**0.2.13** · 目标平台：**macOS 13+** · 构建方式：**Swift Package Manager**
+当前版本：**0.2.14** · 目标平台：**macOS 13+** · 构建方式：**Swift Package Manager**
 
 App 内置兼容视频转换工具，用于播放 AV1 等 macOS AVFoundation 不直接支持的编码。
 
@@ -69,6 +69,10 @@ App 内置兼容视频转换工具，用于播放 AV1 等 macOS AVFoundation 不
 4. 首次启动时确认壁纸库位置，然后拖入图片、视频、本地 HTML 项目，或在“添加壁纸”菜单中选择“导入网址”。
 
 本地打包脚本使用 ad-hoc 签名。若 Gatekeeper 阻止首次启动，可在 Finder 中按住 Control 单击应用、选择“打开”，然后确认。对外正式分发前，应完成 Developer ID 签名与 Apple 公证。
+
+### 从旧版本升级（0.2.8–0.2.13 用户必读）
+
+**0.2.8–0.2.13 的安装器会拒绝自己的临时交换名，无法通过应用内自动更新升级到 0.2.14。** 这些版本的用户请下载 0.2.14 的 DMG 手动安装一次：打开 DMG、将新的 `WallpaperMac.app` 拖入 `Applications` 覆盖旧版本即可。手动安装后，后续版本即可恢复正常自动更新。0.2.14 及更早版本生成的安装器不含超时保护；从 0.2.14 起，安装器在复制、校验、交换任一步卡死都会按超时回滚。
 
 ### 从源码构建
 
@@ -217,15 +221,17 @@ git diff --check
 ### 发布验证与打包
 
 ```bash
-# 完整本地发布检查：模板、测试、Debug/Release 构建、App/ZIP、播放器和 Bundle
+# 完整本地发布检查：模板、测试、Debug/Release 构建、App/ZIP、播放器、内存回归和 Bundle
 ./scripts/test-release.sh
-
-# 验证连续队列切换中的播放器释放和内存回归
-./scripts/queue-memory-regression.sh
 
 # 一次生成并验证同源 ZIP、DMG、签名与 SHA256SUMS
 ./scripts/build-release.sh
+
+# 打标签、推送、创建 Release 并立即校验线上产物
+./scripts/publish-release.sh --yes
 ```
+
+`test-release.sh` 现已包含队列内存回归与版本一致性校验（`VERSION`、`developmentFallbackVersion`、`CHANGELOG`、Git 标签），无需单独补跑内存回归。`publish-release.sh` 在发布末尾自动运行生产模式的 `update-artifact-smoke.sh`，校验线上 ZIP、`SHA256SUMS` 与 `.sig`。
 
 发布产物生成在 `dist/`：
 

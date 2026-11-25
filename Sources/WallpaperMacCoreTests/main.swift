@@ -628,6 +628,84 @@ func testPlaybackPolicySuspensionRules() throws {
     try expect(!disabled.shouldPauseDynamicWallpaper(isOnBattery: true, isFullScreenAppActive: true), "disabled policies should not pause")
 }
 
+func testScreenSleepAndSessionInactivityAlwaysSuspend() throws {
+    let policy = PlaybackPolicy(pauseOnBattery: false, pauseInFullScreenApps: false)
+    let asleep = PlaybackActivityState(isScreenAsleep: true)
+    try expect(
+        policy.shouldPauseDynamicWallpaper(displayID: "any", activity: asleep),
+        "a sleeping screen must suspend even with battery/fullscreen policies disabled"
+    )
+    let inactive = PlaybackActivityState(isSessionInactive: true)
+    try expect(
+        policy.shouldPauseDynamicWallpaper(displayID: "any", activity: inactive),
+        "an inactive session must suspend regardless of preferences"
+    )
+    let awake = PlaybackActivityState()
+    try expect(
+        !policy.shouldPauseDynamicWallpaper(displayID: "any", activity: awake),
+        "awake active screens with no policy match should not suspend"
+    )
+}
+
+func testFullscreenGeometryConvertsQuartzToCocoa() throws {
+    // Main screen 1920x1080, secondary stacked ABOVE it. A fullscreen window on
+    // the upper display has a negative Quartz y; naive edge comparison against
+    // the Cocoa frame would never match.
+    let primary: CGFloat = 1080
+    let quartzRect = CGRect(x: 0, y: -1200, width: 1920, height: 1200)
+    let cocoa = FullscreenGeometry.cocoaRect(fromQuartz: quartzRect, primaryScreenHeight: primary)
+    // Cocoa origin for the upper screen: primary - (quartzY + height) = 1080 - 0 = 1080.
+    try expect(cocoa.minY, equals: 1080, "quartz->cocoa must flip around the primary screen height")
+    try expect(cocoa.minX, equals: 0, "cocoa x should be preserved")
+    try expect(cocoa.height, equals: 1200, "cocoa height should be preserved")
+    let upperScreenFrame = CGRect(x: 0, y: 1080, width: 1920, height: 1200)
+    try expect(
+        FullscreenGeometry.isFullscreen(rect: cocoa, on: upperScreenFrame),
+        "a fullscreen rect on a stacked upper display must be detected"
+    )
+    let mainScreenFrame = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    try expect(
+        !FullscreenGeometry.isFullscreen(rect: cocoa, on: mainScreenFrame),
+        "the upper-display rect must not match the main screen"
+    )
+}
+
+func testFullscreenGeometryToleratesMenuBarInset() throws {
+    let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+    // A window covering everything but the 25pt menu bar should still count.
+    let rect = CGRect(x: 0, y: 25, width: 1440, height: 875)
+    try expect(
+        FullscreenGeometry.isFullscreen(rect: rect, on: screen),
+        "a near-fullscreen rect (menu bar inset) should pass the area threshold"
+    )
+    let small = CGRect(x: 100, y: 100, width: 400, height: 300)
+    try expect(
+        !FullscreenGeometry.isFullscreen(rect: small, on: screen),
+        "a small floating window is not fullscreen"
+    )
+}
+
+func testMissingIndexSkipsOrphanCleanupAndRecoversFromBackup() throws {
+    let fixture = try Fixture()
+    let fm = FileManager.default
+    // Import one managed asset so Assets/ has a {UUID}-named file.
+    let source = fixture.root.appendingPathComponent("sample.png")
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: source)
+    let item = try fixture.store.importItem(at: source, storageMode: .managedCopy)
+    let managedCopy = item.sourceURL
+    try expect(fm.fileExists(atPath: managedCopy.path), "managed copy should exist after import")
+
+    // Second save rotates a backup, then the live index is destroyed.
+    _ = try fixture.store.update(item: item, isFavorite: true)
+    let indexURL = fixture.library.appendingPathComponent("wallpapers.json")
+    try fm.removeItem(at: indexURL)
+
+    // Reload must not delete the managed asset; it should restore from .bak.
+    let reloaded = try fixture.store.refreshAllAvailability()
+    try expect(fm.fileExists(atPath: managedCopy.path), "a missing index must not orphan-delete managed assets")
+    try expect(reloaded.contains(where: { $0.id == item.id }), "the index should be recovered from the backup")
+}
+
 func testWebMouseEventScriptActivatesClickOnce() throws {
     let mouseUp = WebMouseEventScript.source(x: 120, y: 80, phase: .mouseUp)
     try expect(
@@ -847,6 +925,10 @@ let tests: [(String, () throws -> Void)] = [
     ("normalizes and persists display queue", testDisplayQueueNormalizesAndPersists),
     ("keeps display queues independent", testDisplayQueuesStayIndependent),
     ("evaluates playback suspension rules", testPlaybackPolicySuspensionRules),
+    ("suspends on screen sleep and session inactivity", testScreenSleepAndSessionInactivityAlwaysSuspend),
+    ("converts fullscreen geometry quartz to cocoa", testFullscreenGeometryConvertsQuartzToCocoa),
+    ("tolerates menu bar inset in fullscreen detection", testFullscreenGeometryToleratesMenuBarInset),
+    ("recovers index from backup without orphan cleanup", testMissingIndexSkipsOrphanCleanupAndRecoversFromBackup),
     ("deduplicates and auto sorts playback queues", testPlaybackQueueDeduplicatesAndAutoSorts),
     ("enforces playback queue defaults and overrides", testPlaybackQueueHasDefaultConstraintsAndPerItemOverrides),
     ("persists queue advance mode", testPlaybackQueueAdvanceModeRoundTrips),
