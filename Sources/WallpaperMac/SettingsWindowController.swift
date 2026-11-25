@@ -964,6 +964,8 @@ enum SettingsKey {
     static let lastUpdateCheckDate = "WallpaperMac.lastUpdateCheckDate"
     static let lastAutomaticUpdateAttemptDate = "WallpaperMac.lastAutomaticUpdateAttemptDate"
     static let lockScreenSyncEnabled = "WallpaperMac.lockScreenSyncEnabled"
+    static let originalDesktopImages = "WallpaperMac.originalDesktopImages"
+    static let lastSyncedDesktopImages = "WallpaperMac.lastSyncedDesktopImages"
     static let automaticUpdateBlockedVersion = "WallpaperMac.automaticUpdateBlockedVersion"
 }
 

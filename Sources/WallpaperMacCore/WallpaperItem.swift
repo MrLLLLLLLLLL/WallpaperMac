@@ -96,7 +96,7 @@ public struct WallpaperMetadata: Codable, Equatable, Sendable {
 
 public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
-        case id, name, type, sourceURL, playbackURL, entryURL, relativeEntryPath, storageMode, thumbnailURL, metadata, availability
+        case id, name, type, sourceURL, playbackURL, entryURL, relativeEntryPath, storageMode, thumbnailURL, lockScreenOverrideURL, metadata, availability
         case createdAt, lastUsedAt, isFavorite, groupID, fitModeOverride, isHidden
     }
 
@@ -123,6 +123,9 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
     }
 
     public var thumbnailURL: URL?
+    /// Optional user-selected static image used instead of the generated lock
+    /// preview. Kept in the library so migration can rebase it with the index.
+    public var lockScreenOverrideURL: URL?
     public var metadata: WallpaperMetadata?
     public var availability: WallpaperAvailability
     public var createdAt: Date
@@ -143,6 +146,7 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
         isHidden = try container.decodeIfPresent(Bool.self, forKey: .isHidden) ?? false
         storageMode = try container.decode(StorageMode.self, forKey: .storageMode)
         thumbnailURL = try container.decodeIfPresent(URL.self, forKey: .thumbnailURL)
+        lockScreenOverrideURL = try container.decodeIfPresent(URL.self, forKey: .lockScreenOverrideURL)
         metadata = try container.decodeIfPresent(WallpaperMetadata.self, forKey: .metadata)
         // Legacy archives omitted several fields. Fall back conservatively:
         // missing availability must not look healthy, and missing createdAt
@@ -166,6 +170,7 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
         isHidden: Bool = false,
         storageMode: StorageMode,
         thumbnailURL: URL? = nil,
+        lockScreenOverrideURL: URL? = nil,
         metadata: WallpaperMetadata? = nil,
         availability: WallpaperAvailability = .available,
         createdAt: Date = Date(),
@@ -184,6 +189,7 @@ public struct WallpaperItem: Identifiable, Codable, Equatable, Sendable {
         self.isHidden = isHidden
         self.storageMode = storageMode
         self.thumbnailURL = thumbnailURL
+        self.lockScreenOverrideURL = lockScreenOverrideURL
         self.metadata = metadata
         self.availability = availability
         self.createdAt = createdAt

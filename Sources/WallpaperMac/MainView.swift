@@ -131,6 +131,9 @@ final class LibraryViewModel: ObservableObject {
     /// Mirrors WallpaperManager.queueLoadError/queueSaveError so the UI can
     /// surface that queue persistence is disabled instead of failing silently.
     @Published private(set) var queuePersistenceWarning: String?
+    /// Changes when a lock-screen override or a web-ready snapshot changes, so
+    /// the inspector can refresh its preview without rebuilding the library.
+    @Published private(set) var lockScreenPreviewVersion = 0
     @Published private(set) var libraryURL: URL
     @Published var storageMode: StorageMode
     @Published var playbackPolicy: PlaybackPolicy
@@ -232,6 +235,11 @@ final class LibraryViewModel: ObservableObject {
             },
             center.addObserver(forName: .wallpaperMacStatusHideHiddenWallpapers, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor [weak self] in self?.hideHiddenWallpapersFromShortcut() }
+            },
+            center.addObserver(forName: .wallpaperMacAppliedWallpaperChanged, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.lockScreenPreviewVersion += 1
+                }
             }
         ]
         reload(afterLoad: restoreWallpaperAssignments)
@@ -1137,6 +1145,98 @@ final class LibraryViewModel: ObservableObject {
                 guard let self, self.isCurrentLibrarySession(session) else { return }
                 self.lastError = error.localizedDescription
             }
+        }
+    }
+
+    // MARK: - Lock-screen preview overrides
+
+    func lockScreenPreviewImage(for item: WallpaperItem) async -> NSImage? {
+        // For an applied web wallpaper, the live ready page is more useful
+        // than an old library thumbnail. A custom override still wins.
+        if item.type == .web, item.lockScreenOverrideURL == nil,
+           let displayID = wallpaperManager.appliedWallpaperIDs.first(where: { $0.value == item.id })?.key,
+           let image = try? await wallpaperManager.lockScreenSnapshot(for: displayID) {
+            return image
+        }
+        guard let url = LockScreenResourceResolver.existingImageURL(for: item) else { return nil }
+        return ThumbnailCache.shared.image(at: url)
+    }
+
+    func replaceLockScreenImage(for item: WallpaperItem) {
+        let panel = NSOpenPanel()
+        panel.title = "选择锁屏图片"
+        panel.message = "选择一张图片作为该壁纸的锁屏覆盖图。"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.image]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let image = NSImage(contentsOf: url),
+              let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let data = NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:]) else {
+            lastError = "无法读取所选图片，请选择 PNG、JPEG 或其他常见图片格式。"
+            return
+        }
+        let directory = libraryURL.appendingPathComponent("LockScreen", isDirectory: true)
+        let destination = directory.appendingPathComponent("\(item.id.uuidString).png")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try data.write(to: destination, options: .atomic)
+        } catch {
+            lastError = "保存锁屏图片失败：\(error.localizedDescription)"
+            return
+        }
+        let worker = storeWorker
+        let session = librarySessionID
+        Task { [weak self] in
+            do {
+                let persisted = try await worker.updateLockScreenOverride(id: item.id, imageURL: destination)
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                if let index = self.wallpapers.firstIndex(where: { $0.id == item.id }) {
+                    self.wallpapers[index] = persisted
+                }
+                self.lockScreenPreviewVersion += 1
+                self.notifyLockScreenOverrideChanged(for: item.id)
+                self.showToast("锁屏图片已替换")
+            } catch {
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.lastError = error.localizedDescription
+            }
+        }
+    }
+
+    func clearLockScreenOverride(for item: WallpaperItem) {
+        guard let oldURL = item.lockScreenOverrideURL else { return }
+        let worker = storeWorker
+        let session = librarySessionID
+        Task { [weak self] in
+            do {
+                let persisted = try await worker.updateLockScreenOverride(id: item.id, imageURL: nil)
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                if let index = self.wallpapers.firstIndex(where: { $0.id == item.id }) {
+                    self.wallpapers[index] = persisted
+                }
+                let directory = self.libraryURL.appendingPathComponent("LockScreen", isDirectory: true).standardizedFileURL
+                if oldURL.standardizedFileURL.path.hasPrefix(directory.path + "/") {
+                    try? FileManager.default.removeItem(at: oldURL)
+                }
+                self.lockScreenPreviewVersion += 1
+                self.notifyLockScreenOverrideChanged(for: item.id)
+                self.showToast("已恢复自动锁屏预览")
+            } catch {
+                guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.lastError = error.localizedDescription
+            }
+        }
+    }
+
+    private func notifyLockScreenOverrideChanged(for itemID: UUID) {
+        for (displayID, appliedID) in wallpaperManager.appliedWallpaperIDs where appliedID == itemID {
+            NotificationCenter.default.post(
+                name: .wallpaperMacAppliedWallpaperChanged,
+                object: nil,
+                userInfo: ["displayID": displayID, "itemID": itemID]
+            )
         }
     }
 
@@ -3849,6 +3949,7 @@ private struct InspectorView: View {
                     VStack(alignment: .leading, spacing: 20) {
                         preview(for: item)
                         titleBlock(for: item)
+                        LockScreenPreviewView(model: model, item: item)
                         displaySection(for: item)
                         if item.type != .image {
                             playbackSection(for: item)

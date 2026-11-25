@@ -8,6 +8,11 @@ public enum LockScreenResourceResolver {
         for item: WallpaperItem,
         fileManager: FileManager = .default
     ) -> URL? {
+        if let override = item.lockScreenOverrideURL,
+           override.isFileURL,
+           fileManager.fileExists(atPath: override.path) {
+            return override
+        }
         if item.type == .image,
            item.sourceURL.isFileURL,
            fileManager.fileExists(atPath: item.sourceURL.path) {

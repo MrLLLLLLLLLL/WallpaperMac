@@ -227,6 +227,16 @@ public enum WallpaperLibraryMigrator {
                 thumbnailsOnly: true
             )
         }
+        updated.lockScreenOverrideURL = item.lockScreenOverrideURL.map {
+            rebaseLibraryURL(
+                $0,
+                storedSource: storedSource,
+                resolvedSource: resolvedSource,
+                storedDestination: storedDestination,
+                thumbnailsOnly: false,
+                lockScreenOnly: true
+            )
+        }
         return updated
     }
 
@@ -235,12 +245,16 @@ public enum WallpaperLibraryMigrator {
         storedSource: URL,
         resolvedSource: URL,
         storedDestination: URL,
-        thumbnailsOnly: Bool
+        thumbnailsOnly: Bool,
+        lockScreenOnly: Bool = false
     ) -> URL {
         guard url.isFileURL else { return url }
         let path = url.standardizedFileURL.path
         let roots = [storedSource, resolvedSource].map { root in
-            thumbnailsOnly
+            if lockScreenOnly {
+                return root.appendingPathComponent("LockScreen", isDirectory: true).standardizedFileURL
+            }
+            return thumbnailsOnly
                 ? root.appendingPathComponent("Thumbnails", isDirectory: true).standardizedFileURL
                 : root.standardizedFileURL
         }
@@ -249,9 +263,14 @@ public enum WallpaperLibraryMigrator {
             let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
             guard path.hasPrefix(prefix) else { continue }
             let relative = String(path.dropFirst(prefix.count))
-            let destination = thumbnailsOnly
-                ? storedDestination.appendingPathComponent("Thumbnails", isDirectory: true)
-                : storedDestination
+            let destination: URL
+            if lockScreenOnly {
+                destination = storedDestination.appendingPathComponent("LockScreen", isDirectory: true)
+            } else {
+                destination = thumbnailsOnly
+                    ? storedDestination.appendingPathComponent("Thumbnails", isDirectory: true)
+                    : storedDestination
+            }
             guard !relative.isEmpty else { return destination }
             return destination.appendingPathComponent(relative, isDirectory: url.hasDirectoryPath).standardizedFileURL
         }

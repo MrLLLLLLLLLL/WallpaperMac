@@ -778,12 +778,37 @@ func testLockScreenResourceResolverSelectsStaticImages() throws {
     let video = WallpaperItem(id: UUID(), name: "video", type: .video, sourceURL: root.appendingPathComponent("video.mp4"), storageMode: .externalReference, thumbnailURL: thumbnailURL)
     try expect(LockScreenResourceResolver.existingImageURL(for: video), equals: thumbnailURL, "video wallpapers should use their generated thumbnail")
 
+    var overriddenVideo = video
+    overriddenVideo.lockScreenOverrideURL = imageURL
+    try expect(LockScreenResourceResolver.existingImageURL(for: overriddenVideo), equals: imageURL, "a user-selected lock-screen override must take precedence")
+
     let web = WallpaperItem(id: UUID(), name: "web", type: .web, sourceURL: imageURL, storageMode: .externalReference)
     try expect(LockScreenResourceResolver.existingImageURL(for: web) == nil, "web wallpapers without thumbnails need a live-page snapshot")
     try expect(LockScreenResourceResolver.snapshotFilename(for: web), equals: "\(web.id.uuidString).png", "web snapshot filenames must be unique per wallpaper")
 
     let missingImage = WallpaperItem(id: UUID(), name: "missing", type: .image, sourceURL: root.appendingPathComponent("missing.png"), storageMode: .externalReference, thumbnailURL: thumbnailURL)
     try expect(LockScreenResourceResolver.existingImageURL(for: missingImage), equals: thumbnailURL, "a missing source may still use an existing thumbnail")
+}
+
+func testLockScreenOverridePersistsAndIsRemovedWithWallpaper() throws {
+    let fixture = try Fixture()
+    let source = fixture.root.appendingPathComponent("source.png")
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: source)
+    let item = try fixture.store.importItem(at: source, storageMode: .externalReference)
+    let directory = fixture.library.appendingPathComponent("LockScreen", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let override = directory.appendingPathComponent("\(item.id.uuidString).png")
+    try Data("custom".utf8).write(to: override)
+
+    let persisted = try fixture.store.updateLockScreenOverride(id: item.id, imageURL: override)
+    try expect(persisted.lockScreenOverrideURL, equals: override, "custom lock-screen URL should persist")
+    let reloaded = try require(try fixture.store.items().first, "override should survive a store reload")
+    try expect(reloaded.lockScreenOverrideURL, equals: override, "override should decode from wallpapers.json")
+    let touched = try fixture.store.touchLastUsed(id: item.id)
+    try expect(touched.lockScreenOverrideURL, equals: override, "unrelated field updates must preserve the override")
+
+    try fixture.store.remove(item: touched)
+    try expect(!FileManager.default.fileExists(atPath: override.path), "deleting a wallpaper should remove its app-owned override")
 }
 
 func testHotKeyShortcutValidationAndPersistence() throws {
@@ -1074,6 +1099,7 @@ let tests: [(String, () throws -> Void)] = [
     ("keeps display queues independent", testDisplayQueuesStayIndependent),
     ("evaluates playback suspension rules", testPlaybackPolicySuspensionRules),
     ("resolves static lock screen resources", testLockScreenResourceResolverSelectsStaticImages),
+    ("persists and removes lock screen overrides", testLockScreenOverridePersistsAndIsRemovedWithWallpaper),
     ("validates and round trips custom hotkeys", testHotKeyShortcutValidationAndPersistence),
     ("gates automatic update checks and installation", testUpdateAutomationPreferencesGateSchedulingAndInstall),
     ("suspends on screen sleep and session inactivity", testScreenSleepAndSessionInactivityAlwaysSuspend),
@@ -5066,6 +5092,10 @@ func testLibraryMigrationRebasesResourceURLs() throws {
     try Data("thumbnail".utf8).write(to: thumbnail)
     var imageWithThumbnail = managedImage
     imageWithThumbnail.thumbnailURL = thumbnail
+    let lockOverride = fixture.library.appendingPathComponent("LockScreen/\(managedImage.id.uuidString).png")
+    try fm.createDirectory(at: lockOverride.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data("lock".utf8).write(to: lockOverride)
+    imageWithThumbnail.lockScreenOverrideURL = lockOverride
     _ = try fixture.store.update(item: imageWithThumbnail)
 
     let site = fixture.root.appendingPathComponent("site", isDirectory: true)
@@ -5093,6 +5123,8 @@ func testLibraryMigrationRebasesResourceURLs() throws {
     try expect(migratedImage.sourceURL.path.hasPrefix(destination.path + "/"), "managed source must move into the new library")
     try expect(migratedImage.thumbnailURL?.path.hasPrefix(destination.appendingPathComponent("Thumbnails").path + "/") == true, "managed thumbnail must move into the new Thumbnails directory")
     try expect(fm.fileExists(atPath: migratedImage.thumbnailURL!.path), "the migrated thumbnail must exist")
+    try expect(migratedImage.lockScreenOverrideURL?.path.hasPrefix(destination.appendingPathComponent("LockScreen").path + "/") == true, "custom lock-screen override must move with the library")
+    try expect(fm.fileExists(atPath: migratedImage.lockScreenOverrideURL!.path), "the migrated lock-screen override must exist")
     try expect(migratedWeb.entryURL?.path.hasPrefix(destination.path + "/") == true, "managed web entry must move with the copied project")
     try expect(fm.fileExists(atPath: migratedWeb.entryURL!.path), "the migrated web entry must exist")
     try expect(migratedExternal.sourceURL, equals: external.sourceURL, "external source references must not be rewritten")

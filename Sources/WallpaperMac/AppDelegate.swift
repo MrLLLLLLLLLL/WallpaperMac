@@ -131,6 +131,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Restore the system images that were in place before lock-screen sync.
+        // This is separate from disabling the preference: quitting restores,
+        // while disabling only stops future writes.
+        let restoredImages = LockScreenWallpaperService.shared.restoreOriginalWallpapers()
+        if restoredImages > 0 {
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.75))
+        }
         // Give queued JSON writes a chance to reach disk before the process
         // exits, so a fast queue change right before quitting is not lost.
         NotificationCenter.default.post(name: .wallpaperMacFlushPersistence, object: nil)

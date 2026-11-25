@@ -69,9 +69,14 @@ final class LockScreenWallpaperService: ObservableObject {
     /// Monotonically increasing per-screen generation. An async task may only
     /// write if its generation and item are still current when it completes.
     private var generations: [String: Int] = [:]
+    private var originalDesktopImages: [String: String]
+    private var lastSyncedDesktopImages: [String: String]
     private var observers: [NSObjectProtocol] = []
 
     private init() {
+        let defaults = UserDefaults.standard
+        originalDesktopImages = defaults.dictionary(forKey: SettingsKey.originalDesktopImages) as? [String: String] ?? [:]
+        lastSyncedDesktopImages = defaults.dictionary(forKey: SettingsKey.lastSyncedDesktopImages) as? [String: String] ?? [:]
         let center = NotificationCenter.default
         observers.append(center.addObserver(
             forName: .wallpaperMacAppliedWallpaperChanged,
@@ -121,6 +126,7 @@ final class LockScreenWallpaperService: ObservableObject {
         guard let context else { return }
         let items = context.items()
         for display in context.displays() {
+            captureOriginalBaseline(for: display)
             guard let itemID = context.appliedWallpaperIDs()[display.id],
                   let item = items.first(where: { $0.id == itemID }) else { continue }
             schedule(item: item, display: display)
@@ -168,14 +174,19 @@ final class LockScreenWallpaperService: ObservableObject {
             if item.type != .web,
                currentDesktopURL?.standardizedFileURL == imageURL.standardizedFileURL {
                 errorsByDisplay[display.id] = nil
+                lastSyncedDesktopImages[display.id] = imageURL.path
+                persistDesktopImageHistory()
                 return
             }
+            captureOriginalBaseline(for: display)
             if let setDesktopImageURL = context?.setDesktopImageURL {
                 try setDesktopImageURL(imageURL, display.screen)
             } else {
                 try NSWorkspace.shared.setDesktopImageURL(imageURL, for: display.screen, options: [:])
             }
             guard isCurrent(generation: generation, itemID: item.id, displayID: display.id) else { return }
+            lastSyncedDesktopImages[display.id] = imageURL.path
+            persistDesktopImageHistory()
             errorsByDisplay[display.id] = nil
         } catch {
             guard isCurrent(generation: generation, itemID: item.id, displayID: display.id) else { return }
@@ -192,7 +203,13 @@ final class LockScreenWallpaperService: ObservableObject {
     }
 
     private func imageURL(for item: WallpaperItem, display: DisplayService.Display, generation: Int) async throws -> URL? {
-        // Web always prefers the live page over an old library thumbnail.
+        // A user-selected override always wins, including for web wallpapers.
+        if let override = item.lockScreenOverrideURL,
+           FileManager.default.fileExists(atPath: override.path) {
+            return override
+        }
+        // Web without an override always prefers the live page over an old
+        // library thumbnail.
         if item.type != .web,
            let existing = LockScreenResourceResolver.existingImageURL(for: item) {
             return existing
@@ -223,6 +240,55 @@ final class LockScreenWallpaperService: ObservableObject {
             try data.write(to: url, options: .atomic)
             return url
         }
+    }
+
+    private func captureOriginalBaseline(for display: DisplayService.Display) {
+        guard let current = context?.desktopImageURL?(display.screen)?.path
+            ?? NSWorkspace.shared.desktopImageURL(for: display.screen)?.path else { return }
+        // If the current image is our previous synchronized image, retain the
+        // older baseline. If the user changed it while sync was disabled, that
+        // new image becomes the thing to restore on quit.
+        if lastSyncedDesktopImages[display.id] == current { return }
+        guard originalDesktopImages[display.id] != current else { return }
+        originalDesktopImages[display.id] = current
+        persistDesktopImageHistory()
+    }
+
+    private func persistDesktopImageHistory() {
+        let defaults = UserDefaults.standard
+        defaults.set(originalDesktopImages, forKey: SettingsKey.originalDesktopImages)
+        defaults.set(lastSyncedDesktopImages, forKey: SettingsKey.lastSyncedDesktopImages)
+    }
+
+    /// Restores the per-screen images captured before synchronization. Called
+    /// synchronously by AppDelegate before the process exits. The run loop is
+    /// given a short chance to deliver AppKit's asynchronous image update.
+    @discardableResult
+    func restoreOriginalWallpapers() -> Int {
+        guard let context else { return 0 }
+        var restored = 0
+        for (displayID, path) in originalDesktopImages {
+            guard let display = context.displays().first(where: { $0.id == displayID }) else { continue }
+            let url = URL(fileURLWithPath: path)
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            let currentURL = context.desktopImageURL?(display.screen)
+                ?? NSWorkspace.shared.desktopImageURL(for: display.screen)
+            if currentURL?.standardizedFileURL != url.standardizedFileURL {
+                do {
+                    if let setDesktopImageURL = context.setDesktopImageURL {
+                        try setDesktopImageURL(url, display.screen)
+                    } else {
+                        try NSWorkspace.shared.setDesktopImageURL(url, for: display.screen, options: [:])
+                    }
+                    restored += 1
+                } catch {
+                    NSLog("WallpaperMac failed to restore wallpaper for %@: %@", displayID, error.localizedDescription)
+                }
+            }
+        }
+        lastSyncedDesktopImages.removeAll()
+        persistDesktopImageHistory()
+        return restored
     }
 
     private func snapshotDirectory(for display: DisplayService.Display) throws -> URL {

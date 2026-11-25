@@ -633,6 +633,22 @@ public final class WallpaperStore {
         return currentItems[index]
     }
 
+    /// Changes only the user-selected lock-screen override, preserving all
+    /// concurrent metadata/favorite/import edits.
+    @discardableResult
+    public func updateLockScreenOverride(id: UUID, imageURL: URL?) throws -> WallpaperItem {
+        var currentItems = try items()
+        guard let index = currentItems.firstIndex(where: { $0.id == id }) else {
+            throw WallpaperStoreError.itemNotFound(id)
+        }
+        guard currentItems[index].lockScreenOverrideURL != imageURL else {
+            return currentItems[index]
+        }
+        currentItems[index].lockScreenOverrideURL = imageURL
+        try save(currentItems)
+        return currentItems[index]
+    }
+
     /// Field-level last-used update; never writes a stale whole-item snapshot.
     @discardableResult
     public func touchLastUsed(id: UUID, date: Date = Date()) throws -> WallpaperItem {
@@ -801,8 +817,10 @@ public final class WallpaperStore {
             // The replacement may have different dimensions, duration, or artwork.
             // Force a fresh enrichment pass after relocation instead of showing stale metadata.
             removeThumbnailIfOwned(by: item)
+            removeLockScreenOverrideIfOwned(by: item)
             updated.metadata = nil
             updated.thumbnailURL = nil
+            updated.lockScreenOverrideURL = nil
 
             if item.type == .web {
                 let baseURL = item.storageMode == .managedCopy ? item.sourceURL : replacementURL
@@ -892,8 +910,18 @@ public final class WallpaperStore {
         if item.storageMode == .managedCopy {
             removeEmptyManagedAssetDirectory(for: item)
         }
+        removeLockScreenOverrideIfOwned(by: item)
         removeThumbnailIfOwned(by: item)
         removePlaybackProxyIfOwned(at: item.playbackURL)
+    }
+
+    private func removeLockScreenOverrideIfOwned(by item: WallpaperItem) {
+        guard let override = item.lockScreenOverrideURL, override.isFileURL else { return }
+        let directory = libraryURL.appendingPathComponent("LockScreen", isDirectory: true).standardizedFileURL
+        let candidate = override.standardizedFileURL
+        let prefix = directory.path.hasSuffix("/") ? directory.path : directory.path + "/"
+        guard candidate.path.hasPrefix(prefix), fileManager.fileExists(atPath: candidate.path) else { return }
+        try? fileManager.removeItem(at: candidate)
     }
 
     /// Normalizes the pre-0.2.16 flat layout

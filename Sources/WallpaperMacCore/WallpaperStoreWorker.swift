@@ -196,6 +196,10 @@ public actor WallpaperStoreWorker {
         try store.touchLastUsed(id: id, date: date)
     }
 
+    public func updateLockScreenOverride(id: UUID, imageURL: URL?) throws -> WallpaperItem {
+        try store.updateLockScreenOverride(id: id, imageURL: imageURL)
+    }
+
     public func updateHidden(id: UUID, isHidden: Bool) throws -> WallpaperItem {
         try store.updateHidden(id: id, isHidden: isHidden)
     }

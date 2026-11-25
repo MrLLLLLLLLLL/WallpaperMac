@@ -61,7 +61,9 @@ wm_state_guard_restore() {
             WallpaperMac.lastAutomaticUpdateAttemptDate \
             WallpaperMac.automaticUpdateBlockedVersion \
             WallpaperMac.hideHiddenHotKey \
-            WallpaperMac.lockScreenSyncEnabled; do
+            WallpaperMac.lockScreenSyncEnabled \
+            WallpaperMac.originalDesktopImages \
+            WallpaperMac.lastSyncedDesktopImages; do
             defaults delete com.wallpaper.mac "$key" >/dev/null 2>&1 || true
         done
     fi
