@@ -63,6 +63,10 @@ public final class WallpaperStore {
         libraryURL.appendingPathComponent("wallpapers.json")
     }
 
+    private var metadataBackupURL: URL {
+        libraryURL.appendingPathComponent("wallpapers.json.bak")
+    }
+
     private var assignmentsURL: URL {
         libraryURL.appendingPathComponent("display-assignments.json")
     }
@@ -110,6 +114,13 @@ public final class WallpaperStore {
 
     public func items() throws -> [WallpaperItem] {
         guard fileManager.fileExists(atPath: metadataURL.path) else {
+            // A missing index while managed assets are still on disk means the
+            // library was damaged (failed atomic write, sync conflict, manual
+            // deletion) rather than freshly created. Try to self-heal from the
+            // last known-good snapshot before treating the library as empty.
+            if try recoverIndexFromBackup() {
+                return try items()
+            }
             return []
         }
         let data = try Data(contentsOf: metadataURL)
@@ -1015,6 +1026,14 @@ public final class WallpaperStore {
     /// indexed item. Scope is strictly that ownership namespace — user files
     /// and external references are never touched.
     private func cleanupOrphanedManagedAssets() {
+        // Never clean when the index is missing: items() returns [] for a
+        // missing file, which would make every managed asset look orphaned and
+        // wipe the user's whole library. Only an index that exists and decodes
+        // is allowed to authorize deletions.
+        guard fileManager.fileExists(atPath: metadataURL.path) else {
+            NSLog("WallpaperMac: skipped orphan cleanup because wallpapers.json is missing")
+            return
+        }
         let assetsURL = libraryURL.appendingPathComponent("Assets", isDirectory: true)
         guard let entries = try? fileManager.contentsOfDirectory(
             at: assetsURL,
@@ -1026,6 +1045,18 @@ public final class WallpaperStore {
         do {
             knownIDs = Set(try items().map { $0.id.uuidString })
         } catch {
+            return
+        }
+
+        // An empty index with managed assets still present is an inconsistent
+        // state (e.g. a restored-but-stale index). Refuse to delete in that
+        // case; the user can re-import or repair explicitly.
+        let hasManagedAssets = entries.contains { entry in
+            let name = entry.lastPathComponent
+            return name.count > 36 && UUID(uuidString: String(name.prefix(36))) != nil
+        }
+        if knownIDs.isEmpty, hasManagedAssets {
+            NSLog("WallpaperMac: skipped orphan cleanup because the index is empty while Assets/ is not")
             return
         }
 
@@ -1059,7 +1090,30 @@ public final class WallpaperStore {
     private func save(_ items: [WallpaperItem]) throws {
         try ensureLibraryDirectories()
         let data = try encoder.encode(items)
+        // Rotate the last known-good index before overwriting. If a later
+        // write is interrupted or the index is lost, items() can recover from
+        // this snapshot instead of presenting an empty library.
+        if fileManager.fileExists(atPath: metadataURL.path),
+           let previous = try? Data(contentsOf: metadataURL),
+           (try? decoder.decode([WallpaperItem].self, from: previous)) != nil {
+            try? previous.write(to: metadataBackupURL, options: .atomic)
+        }
         try data.write(to: metadataURL, options: .atomic)
+    }
+
+    /// Restores wallpapers.json from the .bak snapshot when the index is
+    /// missing but managed assets are still present. Returns false when there
+    /// is nothing to recover (fresh library, no backup, or unusable backup).
+    private func recoverIndexFromBackup() throws -> Bool {
+        let assetsURL = libraryURL.appendingPathComponent("Assets", isDirectory: true)
+        let entries = (try? fileManager.contentsOfDirectory(atPath: assetsURL.path)) ?? []
+        guard !entries.isEmpty, fileManager.fileExists(atPath: metadataBackupURL.path) else { return false }
+        guard let data = try? Data(contentsOf: metadataBackupURL),
+              let recovered = try? decoder.decode([WallpaperItem].self, from: data),
+              !recovered.isEmpty else { return false }
+        try data.write(to: metadataURL, options: .atomic)
+        NSLog("WallpaperMac: recovered wallpapers.json from backup (\(recovered.count) items)")
+        return true
     }
 
     private func displayName(for url: URL) -> String {

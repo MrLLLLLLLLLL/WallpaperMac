@@ -263,6 +263,16 @@ struct QueueWorkspaceView: View {
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)
+                    // Random playback has no cycle bookkeeping yet, so
+                    // "stop after one cycle" would never trigger. Hide the
+                    // choice instead of letting it silently lie.
+                    .disabled(queue.playbackMode == .random)
+                }
+                if queue.playbackMode == .random {
+                    Text("随机播放暂不支持“播放一轮后停止”，将一直循环。")
+                        .font(AppTheme.Typography.micro)
+                        .foregroundStyle(AppTheme.Palette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 labeled("转场") {
                     Picker("转场", selection: Binding(
@@ -375,7 +385,16 @@ struct QueueWorkspaceView: View {
     private func update(_ queue: PlaybackQueue, _ change: (inout PlaybackQueue) -> Void) {
         var updated = queue
         change(&updated)
-        _ = model.wallpaperManager.updateQueue(updated)
+        if !model.wallpaperManager.updateQueue(updated) {
+            // Surface that the edit did not persist instead of silently doing
+            // nothing when queue persistence is blocked or the queue vanished.
+            if model.wallpaperManager.isQueuePersistenceBlocked {
+                model.lastError = model.wallpaperManager.queueLoadError
+                    ?? "队列文件损坏，已暂停保存以保护原数据；本次修改未生效。"
+            } else {
+                model.lastError = "保存队列修改失败，请重试。"
+            }
+        }
     }
 
     private func move(_ queue: PlaybackQueue, from source: IndexSet, to destination: Int) {

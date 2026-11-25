@@ -128,6 +128,9 @@ final class LibraryViewModel: ObservableObject {
     @Published var sortOrder: WallpaperSortOrder = .recentlyAdded { didSet { resetPagination() } }
     @Published var layout: LibraryLayout = .grid
     @Published var lastError: String?
+    /// Mirrors WallpaperManager.queueLoadError/queueSaveError so the UI can
+    /// surface that queue persistence is disabled instead of failing silently.
+    @Published private(set) var queuePersistenceWarning: String?
     @Published private(set) var libraryURL: URL
     @Published var storageMode: StorageMode
     @Published var playbackPolicy: PlaybackPolicy
@@ -157,8 +160,11 @@ final class LibraryViewModel: ObservableObject {
     private let libraryAccess: WallpaperLibraryAccess
     private var shouldCreateMissingLibraryDirectory: Bool
     private var pendingGroupAssignmentIDs: Set<UUID> = []
+    private var groupCreationSucceeded = false
     private var pendingQueueAssignmentIDs: Set<UUID> = []
     private var undoOperation: (() -> Void)?
+    /// True only while the visible toast carries a real undo action.
+    var canUndoToast: Bool { undoOperation != nil }
     private var activeToastID: UUID?
     private var metadataEnrichmentTask: Task<Void, Never>?
     private var metadataEnrichmentGeneration = 0
@@ -233,6 +239,24 @@ final class LibraryViewModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &observationCancellables)
+        wallpaperManager.$queueLoadError
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.refreshQueuePersistenceWarning() }
+            .store(in: &observationCancellables)
+        wallpaperManager.$queueSaveError
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.refreshQueuePersistenceWarning() }
+            .store(in: &observationCancellables)
+        refreshQueuePersistenceWarning()
+        NotificationCenter.default.addObserver(
+            forName: .wallpaperMacFlushPersistence,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.wallpaperManager.flushPersistence()
+            }
+        }
         displayService.objectWillChange
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
@@ -242,8 +266,36 @@ final class LibraryViewModel: ObservableObject {
             .store(in: &observationCancellables)
     }
 
-    private func normalizeDestinationForConnectedDisplays() {
-        switch destination {
+    private func refreshQueuePersistenceWarning() {
+        if let saveError = wallpaperManager.queueSaveError {
+            queuePersistenceWarning = saveError
+        } else if wallpaperManager.isQueuePersistenceBlocked {
+            queuePersistenceWarning = wallpaperManager.queueLoadError
+                ?? "队列文件损坏，已暂停保存以保护原数据。"
+        } else {
+            queuePersistenceWarning = nil
+        }
+    }
+
+    /// Re-reads queue files after the user repaired them and reports whether
+    /// persistence is available again.
+    func retryQueuePersistence() {
+        let recovered = wallpaperManager.retryLoadingQueues()
+        refreshQueuePersistenceWarning()
+        if recovered {
+            showToast("队列已恢复保存。")
+        } else {
+            lastError = "队列文件仍然无法读取，请检查 playback-queues.json 与 display-playback-bindings.json 后再重试。"
+        }
+    }
+
+    private func queueOperationBlockedError() -> String? {
+        guard wallpaperManager.isQueuePersistenceBlocked else { return nil }
+        return wallpaperManager.queueLoadError
+            ?? "队列文件损坏，已暂停保存以保护原数据；请先修复或重试加载。"
+    }
+
+    private func normalizeDestinationForConnectedDisplays() {        switch destination {
         case .display(let displayID):
             if !displayService.displays.contains(where: { $0.id == displayID }) {
                 destination = .displaysOverview
@@ -625,6 +677,7 @@ final class LibraryViewModel: ObservableObject {
             do {
                 let snapshot = try await worker.createGroup(group, assigning: assignmentIDs)
                 guard let self, self.isCurrentLibrarySession(session) else { return }
+                self.groupCreationSucceeded = true
                 self.pendingGroupAssignmentIDs.removeAll()
                 self.applyMutationSnapshot(snapshot, enrichMetadata: false)
             } catch {
@@ -636,7 +689,20 @@ final class LibraryViewModel: ObservableObject {
 
     func beginCreateGroup(for ids: Set<UUID>) {
         pendingGroupAssignmentIDs = ids
+        groupCreationSucceeded = false
         isNewGroupSheetPresented = true
+    }
+
+    /// Drops a cancelled selection so the next group created from the sidebar
+    /// does not silently absorb wallpapers from an earlier dismissed sheet.
+    /// A successful create flips the flag before dismissing, so its in-flight
+    /// assignment IDs are preserved until the worker snapshot lands.
+    func discardPendingGroupAssignment() {
+        if groupCreationSucceeded {
+            groupCreationSucceeded = false
+        } else {
+            pendingGroupAssignmentIDs = []
+        }
     }
 
     func assignSelected(to groupID: UUID?) {
@@ -715,7 +781,10 @@ final class LibraryViewModel: ObservableObject {
         queue.replaceWallpaperIDs(wallpaperIDs, markingSortMode: .custom)
         queue.defaultIntervalSeconds = intervalSeconds
         queue.transition = transition
-        _ = wallpaperManager.updateQueue(queue)
+        if !wallpaperManager.updateQueue(queue) {
+            lastError = queueOperationBlockedError() ?? "保存队列失败，请重试。"
+            return
+        }
         if isEnabled && !wallpaperIDs.isEmpty {
             wallpaperManager.setActiveQueue(queueID, for: display, policy: playbackPolicy, items: wallpapers)
         } else {
@@ -839,6 +908,23 @@ final class LibraryViewModel: ObservableObject {
                     if let urls = collector.drain() {
                         self.beginImport(urls)
                     }
+                }
+            }
+        }
+        // Watchdog: an NSItemProvider that never calls back would otherwise
+        // leave the whole drop silently hanging. After the grace period, force
+        // the missing slots to finish so the collected URLs still import and
+        // the user gets a partial-failure notice instead of nothing.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+            guard let self, self.isCurrentLibrarySession(session) else { return }
+            if collector.drain() == nil {
+                for index in 0..<providers.count {
+                    collector.submit(nil, at: index)
+                }
+                if let urls = collector.drain() {
+                    self.beginImport(urls)
+                } else {
+                    self.lastError = "部分拖拽文件读取失败或超时，未能导入。"
                 }
             }
         }
@@ -1406,15 +1492,14 @@ final class LibraryViewModel: ObservableObject {
         return accepted
     }
 
-    func beginCreateQueue(for ids: Set<UUID> = []) {
-        pendingQueueAssignmentIDs = ids
+    func beginCreateQueue(for ids: Set<UUID> = []) {        pendingQueueAssignmentIDs = ids
         isNewQueueSheetPresented = true
     }
 
     @discardableResult
     func createQueue(named name: String) -> PlaybackQueue? {
         guard let queue = wallpaperManager.createQueue(named: name) else {
-            lastError = "已经存在同名播放队列，或名称为空。"
+            lastError = queueOperationBlockedError() ?? "已经存在同名播放队列，或名称为空。"
             return nil
         }
         if !pendingQueueAssignmentIDs.isEmpty {
@@ -1450,7 +1535,9 @@ final class LibraryViewModel: ObservableObject {
             lastError = "默认队列不可删除。"
             return
         }
-        _ = wallpaperManager.deleteQueue(id: queue.id, policy: playbackPolicy, items: wallpapers)
+        if !wallpaperManager.deleteQueue(id: queue.id, policy: playbackPolicy, items: wallpapers) {
+            lastError = queueOperationBlockedError() ?? "删除队列失败，请重试。"
+        }
     }
 
     func addWallpapers(_ ids: Set<UUID>, to queueID: UUID) {
@@ -1470,7 +1557,9 @@ final class LibraryViewModel: ObservableObject {
     func moveWallpaper(in queue: PlaybackQueue, from source: Int, to destination: Int) {
         var updated = queue
         updated.moveWallpaper(from: source, to: destination)
-        _ = wallpaperManager.updateQueue(updated)
+        if !wallpaperManager.updateQueue(updated) {
+            lastError = queueOperationBlockedError() ?? "调整队列顺序失败，请重试。"
+        }
     }
 
     func setActiveQueue(_ queue: PlaybackQueue, for displayID: String) {
@@ -1577,7 +1666,9 @@ struct MainView: View {
         .sheet(isPresented: $model.isWebURLImportPresented) {
             WebWallpaperURLImportSheet { model.importWebWallpaper($0) }
         }
-        .sheet(isPresented: $model.isNewGroupSheetPresented) {
+        .sheet(isPresented: $model.isNewGroupSheetPresented, onDismiss: {
+            model.discardPendingGroupAssignment()
+        }) {
             NewGroupSheet { name in
                 model.createGroup(named: name)
             }
@@ -1613,20 +1704,39 @@ struct MainView: View {
             Text("应用库副本会被删除；外部文件引用只删除 WallpaperMac 中的记录，不会删除原文件。")
         }
         .overlay(alignment: .bottom) {
-            if let toast = model.toastMessage {
-                HStack(spacing: 12) {
-                    Text(toast)
-                    if model.toastMessage != nil {
-                        Button("撤销") { model.undoLastAction() }
+            VStack(spacing: 10) {
+                if let warning = model.queuePersistenceWarning {
+                    HStack(spacing: 12) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(AppTheme.Palette.warning)
+                        Text(warning)
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("重试加载") { model.retryQueuePersistence() }
                             .buttonStyle(.borderless)
                             .foregroundStyle(AppTheme.Palette.accent)
                     }
+                    .font(.callout)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(.horizontal, 24)
                 }
-                .font(.callout)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .background(.regularMaterial, in: Capsule())
-                .padding(.bottom, 18)
+                if let toast = model.toastMessage {
+                    HStack(spacing: 12) {
+                        Text(toast)
+                        if model.canUndoToast {
+                            Button("撤销") { model.undoLastAction() }
+                                .buttonStyle(.borderless)
+                                .foregroundStyle(AppTheme.Palette.accent)
+                        }
+                    }
+                    .font(.callout)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(.bottom, 18)
+                }
             }
         }
         .alert("操作失败", isPresented: Binding(
@@ -2376,7 +2486,7 @@ private struct SidebarView: View {
                     }
 
                     sectionHeader("分组") {
-                        Button { model.isNewGroupSheetPresented = true } label: {
+                        Button { model.beginCreateGroup(for: []) } label: {
                             Image(systemName: "plus")
                                 .font(.system(size: 10, weight: .semibold))
                         }
@@ -2774,7 +2884,7 @@ private struct LibraryContentView: View {
                 }
             }
             Divider()
-            Button("新建分组…") { model.isNewGroupSheetPresented = true }
+            Button("新建分组…") { model.beginCreateGroup(for: []) }
         } label: {
             Label("分组", systemImage: "folder")
                 .font(AppTheme.Typography.caption)
