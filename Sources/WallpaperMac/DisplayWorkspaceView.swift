@@ -437,16 +437,7 @@ struct DisplayWorkspaceView: View {
     }
 
     private func snapshot(for display: DisplayService.Display) -> DisplaySnapshot {
-        let itemID = model.wallpaperManager.appliedWallpaperIDs[display.id]
-        let item = itemID.flatMap { id in model.wallpapers.first(where: { $0.id == id }) }
-        let queue = model.wallpaperManager.effectiveQueue(for: display.id)
-        let state = queue.flatMap { model.wallpaperManager.state(for: display.id, queueID: $0.id) }
-        return DisplaySnapshot(
-            item: item,
-            queue: queue,
-            state: state,
-            playback: model.wallpaperManager.playbackStates[display.id]
-        )
+        DisplaySnapshot(model: model, display: display)
     }
 
     private func isStatic(_ snapshot: DisplaySnapshot) -> Bool {

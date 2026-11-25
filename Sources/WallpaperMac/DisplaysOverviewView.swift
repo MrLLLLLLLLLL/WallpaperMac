@@ -69,16 +69,7 @@ struct DisplaysOverviewView: View {
     }
 
     private func snapshot(for display: DisplayService.Display) -> DisplaySnapshot {
-        let itemID = model.wallpaperManager.appliedWallpaperIDs[display.id]
-        let item = itemID.flatMap { id in model.wallpapers.first(where: { $0.id == id }) }
-        let queue = model.wallpaperManager.effectiveQueue(for: display.id)
-        let state = queue.flatMap { model.wallpaperManager.state(for: display.id, queueID: $0.id) }
-        return DisplaySnapshot(
-            item: item,
-            queue: queue,
-            state: state,
-            playback: model.wallpaperManager.playbackStates[display.id]
-        )
+        DisplaySnapshot(model: model, display: display)
     }
 }
 
@@ -87,6 +78,18 @@ struct DisplaySnapshot {
     let queue: PlaybackQueue?
     let state: DisplayQueueState?
     let playback: WallpaperManager.PlaybackState?
+
+    /// Shared assembly used by both the overview grid and the single-display
+    /// workspace so the two never drift apart.
+    @MainActor
+    init(model: LibraryViewModel, display: DisplayService.Display) {
+        let itemID = model.wallpaperManager.appliedWallpaperIDs[display.id]
+        item = itemID.flatMap { id in model.wallpapers.first(where: { $0.id == id }) }
+        let queue = model.wallpaperManager.effectiveQueue(for: display.id)
+        self.queue = queue
+        state = queue.flatMap { model.wallpaperManager.state(for: display.id, queueID: $0.id) }
+        playback = model.wallpaperManager.playbackStates[display.id]
+    }
 
     var isQueueActive: Bool {
         queue != nil && state?.isEnabled == true
