@@ -483,6 +483,34 @@ public enum UpdateInstaller {
             write_failure "$1"
             exit 1
         }
+        # Run a command with a hard time limit. zsh has no `timeout`, so run the
+        # command in the background and poll it with kill -0. Polling avoids a
+        # separate watchdog subshell: a lingering watchdog would inherit the
+        # install-lock fd (stdin) and keep the flock held after the script
+        # exits, deadlocking the next update attempt. stdin is detached so the
+        # child never holds the inherited lock descriptor.
+        run_bounded() {
+            local limit="$1"; shift
+            "$@" </dev/null &
+            local cmd_pid=$!
+            local waited=0
+            local rc=0
+            while kill -0 "$cmd_pid" 2>/dev/null; do
+                if (( waited >= limit * 5 )); then
+                    kill -TERM "$cmd_pid" 2>/dev/null
+                    sleep 1
+                    kill -KILL "$cmd_pid" 2>/dev/null
+                    echo "command timed out after ${limit}s: $*" >&2
+                    wait "$cmd_pid" 2>/dev/null
+                    return 124
+                fi
+                sleep 0.2
+                waited=$((waited + 1))
+            done
+            wait "$cmd_pid" 2>/dev/null
+            rc=$?
+            return $rc
+        }
         verify_lock() {
             if [[ -n "$LOCK_PATH" ]]; then
                 [[ -f "$LOCK_PATH" ]] || fail "update lock is missing"
@@ -517,7 +545,7 @@ public enum UpdateInstaller {
             rm -rf "$stale"
         done
         rm -rf "$TARGET_PENDING"
-        if ! "$DITTO" "$SOURCE_APP" "$TARGET_PENDING"; then
+        if ! run_bounded 300 "$DITTO" "$SOURCE_APP" "$TARGET_PENDING"; then
             fail "unable to copy the replacement app"
         fi
         PENDING_PLIST="$TARGET_PENDING/Contents/Info.plist"
@@ -529,7 +557,7 @@ public enum UpdateInstaller {
         fi
         EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PENDING_PLIST" 2>/dev/null || true)"
         [[ -n "$EXECUTABLE_NAME" && -x "$TARGET_PENDING/Contents/MacOS/$EXECUTABLE_NAME" ]] || fail "replacement executable is missing"
-        "$CODESIGN" --verify --deep --strict "$TARGET_PENDING" || fail "replacement signature verification failed"
+        run_bounded 120 "$CODESIGN" --verify --deep --strict "$TARGET_PENDING" || fail "replacement signature verification failed"
         # Let the verified new build perform the swap. A defect in the old
         # build's helper can then no longer block updates after bootstrap.
         SWAPPER="${WALLPAPERMAC_UPDATE_SWAPPER:-$TARGET_PENDING/Contents/MacOS/$EXECUTABLE_NAME}"
@@ -540,7 +568,7 @@ public enum UpdateInstaller {
         verify_lock
         rm -rf "$TARGET_PREVIOUS"
         SWAP_STARTED=1
-        if ! "$SWAPPER" --update-swap "$TARGET_PENDING" "$TARGET_APP"; then
+        if ! run_bounded 60 "$SWAPPER" --update-swap "$TARGET_PENDING" "$TARGET_APP"; then
             fail "atomic replacement failed"
         fi
         SWAPPED=1

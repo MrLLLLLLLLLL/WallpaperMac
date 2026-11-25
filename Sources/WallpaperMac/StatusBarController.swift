@@ -220,4 +220,7 @@ extension Notification.Name {
     static let wallpaperMacStatusToggleMute = Notification.Name("WallpaperMacStatusToggleMute")
     static let wallpaperMacStatusHideHiddenWallpapers = Notification.Name("WallpaperMacStatusHideHiddenWallpapers")
     static let wallpaperMacPlaybackStateChanged = Notification.Name("WallpaperMacPlaybackStateChanged")
+    /// Posted by AppDelegate on termination so the library can flush deferred
+    /// JSON writes before the process exits.
+    static let wallpaperMacFlushPersistence = Notification.Name("WallpaperMacFlushPersistence")
 }

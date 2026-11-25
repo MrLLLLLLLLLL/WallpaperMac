@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 public enum WallpaperFitMode: String, Codable, CaseIterable, Equatable, Sendable {
     case fill
@@ -75,13 +76,15 @@ public struct PlaybackPolicy: Codable, Equatable, Sendable {
             (pauseInFullScreenApps && isFullScreenAppActive)
     }
 
-    /// Per-display suspension: battery applies to every screen, while a
-    /// fullscreen app only pauses the screen that contains its window.
+    /// Per-display suspension: a sleeping screen or inactive session always
+    /// suspends; battery applies to every screen, while a fullscreen app only
+    /// pauses the screen that contains its window.
     public func shouldPauseDynamicWallpaper(
         displayID: String,
         activity: PlaybackActivityState
     ) -> Bool {
-        (pauseOnBattery && activity.isOnBattery) ||
+        activity.requiresSuspension ||
+            (pauseOnBattery && activity.isOnBattery) ||
             (pauseInFullScreenApps && activity.fullScreenDisplayIDs.contains(displayID))
     }
 }
@@ -89,10 +92,27 @@ public struct PlaybackPolicy: Codable, Equatable, Sendable {
 public struct PlaybackActivityState: Equatable, Sendable {
     public var isOnBattery: Bool
     public var fullScreenDisplayIDs: Set<String>
+    /// True while the screens are asleep (display sleep / lid closed).
+    public var isScreenAsleep: Bool
+    /// True while the login session is not active (locked / fast user switch).
+    public var isSessionInactive: Bool
 
-    public init(isOnBattery: Bool = false, fullScreenDisplayIDs: Set<String> = []) {
+    public init(
+        isOnBattery: Bool = false,
+        fullScreenDisplayIDs: Set<String> = [],
+        isScreenAsleep: Bool = false,
+        isSessionInactive: Bool = false
+    ) {
         self.isOnBattery = isOnBattery
         self.fullScreenDisplayIDs = fullScreenDisplayIDs
+        self.isScreenAsleep = isScreenAsleep
+        self.isSessionInactive = isSessionInactive
+    }
+
+    /// A sleeping screen or an inactive session must always suspend dynamic
+    /// wallpaper regardless of the user's battery/fullscreen preferences.
+    public var requiresSuspension: Bool {
+        isScreenAsleep || isSessionInactive
     }
 }
 
@@ -102,6 +122,38 @@ public enum ApplicationState: String, Codable, CaseIterable, Equatable, Sendable
     case applied
     case failed
     case disconnected
+}
+
+/// Geometry helpers for deciding whether a window rect (Quartz global
+/// coordinates, origin at the main screen's top-left) represents a fullscreen
+/// window on a screen (Cocoa frame, origin at bottom-left). Kept as pure
+/// functions so the coordinate handling is unit-testable without AppKit.
+public enum FullscreenGeometry {
+    /// Converts a Quartz window rect to the Cocoa coordinate space using the
+    /// main (primary) screen height.
+    public static func cocoaRect(fromQuartz rect: CGRect, primaryScreenHeight: CGFloat) -> CGRect {
+        CGRect(
+            x: rect.minX,
+            y: primaryScreenHeight - rect.maxY,
+            width: rect.width,
+            height: rect.height
+        )
+    }
+
+    /// True when the (already Cocoa-space) rect covers essentially the whole
+    /// screen frame. An intersection-area test tolerates menu-bar insets and
+    /// rounding, unlike exact edge comparison.
+    public static func isFullscreen(
+        rect: CGRect,
+        on screenFrame: CGRect,
+        tolerance: CGFloat = 0.97
+    ) -> Bool {
+        guard screenFrame.width > 0, screenFrame.height > 0 else { return false }
+        let intersection = rect.intersection(screenFrame)
+        guard !intersection.isNull else { return false }
+        let covered = (intersection.width * intersection.height) / (screenFrame.width * screenFrame.height)
+        return covered >= tolerance
+    }
 }
 
 public struct DisplayAssignment: Identifiable, Codable, Equatable, Sendable {

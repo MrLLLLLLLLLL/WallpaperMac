@@ -14,6 +14,8 @@ final class SystemActivityMonitor {
     private var observers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
     private var timer: Timer?
     private var lastState: PlaybackActivityState?
+    private var isScreenAsleep = false
+    private var isSessionInactive = false
 
     init(onChange: @escaping (PlaybackActivityState) -> Void) {
         self.onChange = onChange
@@ -29,6 +31,54 @@ final class SystemActivityMonitor {
             }
         }
         observers.append((workspaceCenter, activationToken))
+
+        // Display sleep / wake and session lock / fast-user-switch all change
+        // whether rendering is worthwhile. Without these, wallpapers keep
+        // decoding and drawing while the lid is closed or the screen is locked.
+        let sleepToken = workspaceCenter.addObserver(
+            forName: NSWorkspace.screensDidSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.isScreenAsleep = true
+                self?.evaluate()
+            }
+        }
+        observers.append((workspaceCenter, sleepToken))
+        let wakeToken = workspaceCenter.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.isScreenAsleep = false
+                self?.evaluate()
+            }
+        }
+        observers.append((workspaceCenter, wakeToken))
+        let resignToken = workspaceCenter.addObserver(
+            forName: NSWorkspace.sessionDidResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.isSessionInactive = true
+                self?.evaluate()
+            }
+        }
+        observers.append((workspaceCenter, resignToken))
+        let activeToken = workspaceCenter.addObserver(
+            forName: NSWorkspace.sessionDidBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.isSessionInactive = false
+                self?.evaluate()
+            }
+        }
+        observers.append((workspaceCenter, activeToken))
 
         let screenToken = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
@@ -57,7 +107,9 @@ final class SystemActivityMonitor {
     func evaluate() {
         let state = PlaybackActivityState(
             isOnBattery: isUsingBatteryPower(),
-            fullScreenDisplayIDs: frontmostFullScreenDisplayIDs()
+            fullScreenDisplayIDs: frontmostFullScreenDisplayIDs(),
+            isScreenAsleep: isScreenAsleep,
+            isSessionInactive: isSessionInactive
         )
         guard state != lastState else { return }
         lastState = state
@@ -96,6 +148,7 @@ final class SystemActivityMonitor {
             return []
         }
         let screens = NSScreen.screens
+        let primaryHeight = screens.first?.frame.height ?? 0
         let pid = application.processIdentifier
         var result = Set<String>()
         for info in windowInfo {
@@ -108,12 +161,13 @@ final class SystemActivityMonitor {
             }
             var rect = CGRect.zero
             guard CGRectMakeWithDictionaryRepresentation(bounds, &rect) else { continue }
+            // CGWindowList rects are Quartz (origin top-left of the main
+            // screen); NSScreen.frame is Cocoa (origin bottom-left). Convert
+            // before comparing, otherwise stacked/offset secondary displays
+            // never match and the fullscreen pause silently stops working.
+            let cocoaRect = FullscreenGeometry.cocoaRect(fromQuartz: rect, primaryScreenHeight: primaryHeight)
             guard let screen = screens.first(where: { screen in
-                let frame = screen.frame
-                return abs(rect.minX - frame.minX) < 2 &&
-                    abs(rect.minY - frame.minY) < 2 &&
-                    abs(rect.width - frame.width) < 2 &&
-                    abs(rect.height - frame.height) < 2
+                FullscreenGeometry.isFullscreen(rect: cocoaRect, on: screen.frame)
             }) else { continue }
             result.insert(DisplayIdentityProvider.identity(for: screen).profileID)
         }

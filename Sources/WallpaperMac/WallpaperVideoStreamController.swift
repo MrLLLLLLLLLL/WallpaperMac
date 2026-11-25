@@ -33,6 +33,9 @@ final class WallpaperVideoStreamController {
     private var isTornDown = false
     private var isRequestingFrames = false
     private var process: Process?
+    /// Tracks whether the ffmpeg child is currently SIGSTOPped so resume never
+    /// sends SIGCONT to a process that exited in the meantime.
+    private var isProcessSuspended = false
     private var outputHandle: FileHandle?
     private var bufferedData: VideoFrameBuffer
     private var generation = 0
@@ -192,7 +195,27 @@ final class WallpaperVideoStreamController {
         if !isPlaying {
             isRequestingFrames = false
         }
+        let childPID = process?.processIdentifier
+        // Decide signal transitions under the lock; the flag itself is only
+        // read/written here and in teardown (both hold stateLock).
+        var sendSignal: Int32?
+        if let childPID {
+            if isPlaying, isProcessSuspended {
+                sendSignal = SIGCONT
+                isProcessSuspended = false
+            } else if !isPlaying, !isProcessSuspended {
+                sendSignal = SIGSTOP
+                isProcessSuspended = true
+            }
+        }
         stateLock.unlock()
+
+        // Suspend/resume the ffmpeg child so a paused stream stops consuming
+        // CPU/GPU but keeps its decoder state for instant resume. Without
+        // SIGSTOP the child would sit blocked on a full pipe holding tens of MB.
+        if let childPID, let sendSignal {
+            kill(childPID, sendSignal)
+        }
 
         if isPlaying {
             frameQueue.async { [weak self] in
@@ -214,6 +237,8 @@ final class WallpaperVideoStreamController {
         isRequestingFrames = false
         generation += 1
         let process = self.process
+        let wasSuspended = isProcessSuspended
+        isProcessSuspended = false
         let handle = self.outputHandle
         let presentationLayer = self.presentationLayer
         let tileLayers = self.tileLayers
@@ -223,9 +248,12 @@ final class WallpaperVideoStreamController {
         stateLock.unlock()
 
         // Order matters: terminate first so the pipe hits EOF and any blocked
-        // read() on frameQueue returns. Closing the handle while read is still
-        // blocked races FileHandle's own lock and can crash.
+        // read() on frameQueue returns. A SIGSTOPped process would not handle
+        // terminate, so continue it first.
         if let process, process.isRunning {
+            if wasSuspended {
+                kill(process.processIdentifier, SIGCONT)
+            }
             process.terminate()
         }
         handle?.readabilityHandler = nil

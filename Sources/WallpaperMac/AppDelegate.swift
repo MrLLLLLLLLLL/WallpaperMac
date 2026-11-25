@@ -125,4 +125,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
     }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // Give queued JSON writes a chance to reach disk before the process
+        // exits, so a fast queue change right before quitting is not lost.
+        NotificationCenter.default.post(name: .wallpaperMacFlushPersistence, object: nil)
+        // Brief grace period for the async flush scheduled by the observer.
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.5))
+    }
 }
