@@ -140,6 +140,7 @@ final class LibraryViewModel: ObservableObject {
     @Published var isDropTargeted = false
     @Published var isImporting = false
     @Published var isWebURLImportPresented = false
+    @Published var isSteamWorkshopImportPresented = false
     @Published var pendingImportURLs: [URL] = []
     @Published private(set) var pendingImportCandidates: [WallpaperImportCandidate] = []
     @Published private(set) var pendingWebEntryCandidates: [URL] = []
@@ -900,6 +901,158 @@ final class LibraryViewModel: ObservableObject {
                 guard let self, self.isCurrentLibrarySession(session) else { return }
                 self.lastError = error.localizedDescription
             }
+        }
+    }
+
+    // MARK: - Steam Workshop import
+
+    private lazy var steamWorkshopCoordinator = WorkshopDownloadCoordinator()
+
+    /// Anonymous metadata lookup; returns nil when the text is not a link.
+    func resolveSteamWorkshopLink(_ raw: String) async throws -> WorkshopMetadata? {
+        try await steamWorkshopCoordinator.resolveAndFetch(rawLink: raw)
+    }
+
+    /// Downloads one workshop item via SteamCMD and imports it into the library.
+    /// Returns the plan so the sheet can explain unsupported types.
+    func downloadSteamWorkshopItem(
+        itemID: String,
+        username: String,
+        password: String,
+        steamGuardCode: String?,
+        onProgress: @escaping @Sendable (String?, Double?) -> Void
+    ) async throws -> WorkshopImportPlan {
+        let context = WorkshopDownloadCoordinator.Context(
+            rootDirectory: WorkshopDownloadCoordinator.defaultRootDirectory(),
+            credentials: .init(
+                username: username,
+                password: password,
+                steamGuardCode: steamGuardCode
+            )
+        )
+
+        let plan = try await steamWorkshopCoordinator.downloadAndPlan(
+            itemID: itemID,
+            context: context
+        ) { phase in
+            switch phase {
+            case .downloading(let status, let fraction):
+                onProgress(status, fraction)
+            case .installingSteamCMD(let state):
+                switch state {
+                case .downloading(let name, let received, let expected):
+                    if let expected, expected > 0 {
+                        onProgress("安装 SteamCMD：\(name)", Double(received) / Double(expected))
+                    } else {
+                        onProgress("安装 SteamCMD：\(name)", nil)
+                    }
+                case .extracting(let name):
+                    onProgress("解压 SteamCMD：\(name)", nil)
+                case .checking:
+                    onProgress("检查 SteamCMD…", nil)
+                case .committing:
+                    onProgress("完成 SteamCMD 安装…", nil)
+                default:
+                    onProgress("准备 SteamCMD…", nil)
+                }
+            default:
+                break
+            }
+        }
+
+        guard plan.isSupported else { return plan }
+
+        // Staging must be cleaned on every path after a supported download
+        // (success, rename, or import failure) — use a local helper and call
+        // it before every exit so no early return can leak the download.
+        let cleanupStaging = { [steamWorkshopCoordinator, context] in
+            await steamWorkshopCoordinator.cleanupStaging(itemID: itemID, context: context)
+        }
+
+        let worker = storeWorker
+        let session = librarySessionID
+        do {
+        let importResult: WallpaperImportResult = try await withCheckedThrowingContinuation { continuation in
+            Task { [weak self] in
+                guard let self else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                do {
+                    let result: WallpaperImportResult
+                    switch plan {
+                    case .video(let sourceURL, _):
+                        result = try await worker.importItems(
+                            at: [sourceURL],
+                            entryURL: nil,
+                            storageMode: .managedCopy
+                        )
+                    case .webProject(let directory, let entryFile, _):
+                        // Backslash entries come from Windows-authored
+                        // project.json; resolveEntry normalizes and contains.
+                        let entry = WorkshopImportPlanner.resolveEntry(entryFile, in: directory)
+                        result = try await worker.importItems(
+                            at: [directory],
+                            entryURL: entry,
+                            storageMode: .managedCopy
+                        )
+                    case .unsupported:
+                        throw WorkshopUnsupportedReason.unknownType(nil)
+                    }
+                    continuation.resume(returning: result)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+
+        // Apply the workshop title when the importer fell back to a raw
+        // filename / numeric id (store worker is an actor — await off main).
+        if let title = plan.titleOverride,
+           let imported = importResult.snapshot.items.first(where: { importResult.importedIDs.contains($0.id) }),
+           imported.name != title {
+            var renamed = imported
+            renamed.name = title
+            if (try? await worker.save(items: [renamed])) != nil,
+               let refreshed = try? await worker.snapshot() {
+                await MainActor.run { [weak self] in
+                    guard let self, self.isCurrentLibrarySession(session) else { return }
+                    self.applyMutationSnapshot(refreshed)
+                    self.selectedWallpaperID = importResult.importedIDs.last
+                    if !importResult.importedIDs.isEmpty || !importResult.failures.isEmpty {
+                        self.importSummary = ImportSummary(
+                            importedCount: importResult.importedIDs.count,
+                            failures: importResult.failures
+                        )
+                    }
+                }
+                await cleanupStaging()
+                return plan
+            }
+        }
+
+        await MainActor.run { [weak self] in
+            guard let self, self.isCurrentLibrarySession(session) else { return }
+            self.applyMutationSnapshot(importResult.snapshot)
+            self.selectedWallpaperID = importResult.importedIDs.last
+            if !importResult.importedIDs.isEmpty || !importResult.failures.isEmpty {
+                self.importSummary = ImportSummary(
+                    importedCount: importResult.importedIDs.count,
+                    failures: importResult.failures
+                )
+            }
+            // importSummary already raises a modal alert — do not stack a
+            // toast behind it. Only surface failures when nothing imported.
+            if importResult.importedIDs.isEmpty, !importResult.failures.isEmpty {
+                self.lastError = importResult.failures.joined(separator: "\n")
+            }
+        }
+
+        await cleanupStaging()
+        return plan
+        } catch {
+            await cleanupStaging()
+            throw error
         }
     }
 
@@ -1790,6 +1943,9 @@ struct MainView: View {
         .sheet(isPresented: $model.isWebURLImportPresented) {
             WebWallpaperURLImportSheet { model.importWebWallpaper($0) }
         }
+        .sheet(isPresented: $model.isSteamWorkshopImportPresented) {
+            SteamWorkshopBrowseSheet(model: model)
+        }
         .sheet(isPresented: $model.isNewGroupSheetPresented, onDismiss: {
             model.discardPendingGroupAssignment()
         }) {
@@ -1884,6 +2040,9 @@ struct MainView: View {
         .onAppear { model.prepareLibrary() }
         .onReceive(NotificationCenter.default.publisher(for: .wallpaperMacShowDisplaysOverview)) { _ in
             model.destination = .displaysOverview
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .wallpaperMacShowSteamWorkshopBrowse)) { _ in
+            model.isSteamWorkshopImportPresented = true
         }
     }
 
@@ -2832,6 +2991,7 @@ private struct LibraryContentView: View {
                     hasItems: !model.wallpapers.isEmpty,
                     importAction: { model.importWallpapers() },
                     importURLAction: { model.isWebURLImportPresented = true },
+                    importWorkshopAction: { model.isSteamWorkshopImportPresented = true },
                     clearFiltersAction: {
                         model.searchText = ""
                         model.selectedType = nil
@@ -3071,6 +3231,7 @@ private struct LibraryContentView: View {
         Menu {
             Button("导入文件或文件夹") { model.importWallpapers() }
             Button("导入网址") { model.isWebURLImportPresented = true }
+            Button("浏览 Steam 创意工坊…") { model.isSteamWorkshopImportPresented = true }
         } label: {
             if compact {
                 Image(systemName: "plus")
@@ -3843,6 +4004,7 @@ private struct EmptyLibraryView: View {
     let hasItems: Bool
     let importAction: () -> Void
     let importURLAction: () -> Void
+    var importWorkshopAction: (() -> Void)? = nil
     var clearFiltersAction: (() -> Void)? = nil
 
     var body: some View {
@@ -3878,6 +4040,9 @@ private struct EmptyLibraryView: View {
                 Menu {
                     Button("导入文件或文件夹", action: importAction)
                     Button("导入网址", action: importURLAction)
+                    if let importWorkshopAction {
+                        Button("浏览 Steam 创意工坊…", action: importWorkshopAction)
+                    }
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "plus")

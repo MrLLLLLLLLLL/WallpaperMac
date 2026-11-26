@@ -80,6 +80,11 @@ private struct SettingsView: View {
     @State private var hideHiddenHotKey = HotKeyShortcut.defaultHideHidden
     @State private var hotKeyMessage: String?
     @State private var isRecordingHotKey = false
+    @State private var steamLoggedIn = false
+    @State private var steamUsername: String = UserDefaults.standard.string(forKey: SteamSessionStore.usernameDefaultsKey) ?? ""
+    @State private var steamLoginError: String?
+    @State private var isSteamLoginPresented = false
+    private let steamLoginService = SteamLoginService()
 
     private var applicationVersionInfo: ApplicationVersionInfo {
         ApplicationVersionInfo(
@@ -392,6 +397,58 @@ private struct SettingsView: View {
                 }
             }
 
+        case .steam:
+            settingsSection("下载账号") {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        ThemeStatusDot(
+                            color: steamLoggedIn ? AppTheme.Palette.applied : AppTheme.Palette.textTertiary,
+                            size: 5
+                        )
+                        Text(steamLoggedIn
+                             ? "已登录：\(steamUsername.isEmpty ? "（未知账号）" : steamUsername)"
+                             : "未登录")
+                            .font(AppTheme.Typography.body)
+                            .foregroundStyle(AppTheme.Palette.text)
+                        Spacer()
+                        if steamLoggedIn {
+                            Button("退出登录") {
+                                Task { await steamLogout() }
+                            }
+                            .buttonStyle(QuietButtonStyle(compact: true))
+                        } else {
+                            Button("登录…") {
+                                isSteamLoginPresented = true
+                            }
+                            .buttonStyle(AccentActionButtonStyle(compact: true))
+                        }
+                    }
+                    Text("浏览创意工坊列表不需要登录；下载壁纸需要拥有 Wallpaper Engine 的 Steam 账号。密码只交给 SteamCMD 的 stdin，本应用不保存密码；登录成功后会话缓存在本地 SteamHome。")
+                        .font(AppTheme.Typography.micro)
+                        .foregroundStyle(AppTheme.Palette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let steamLoginError {
+                        Text(steamLoginError)
+                            .font(AppTheme.Typography.micro)
+                            .foregroundStyle(AppTheme.Palette.danger)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Button("打开创意工坊浏览…") {
+                        (NSApp.delegate as? AppDelegate)?.showMainWindow()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            NotificationCenter.default.post(name: .wallpaperMacShowSteamWorkshopBrowse, object: nil)
+                        }
+                    }
+                    .buttonStyle(QuietButtonStyle(compact: true))
+                }
+            }
+            .sheet(isPresented: $isSteamLoginPresented, onDismiss: {
+                Task { await refreshSteamLoginState() }
+            }) {
+                SteamLoginSheet {}
+            }
+            .onAppear { Task { await refreshSteamLoginState() } }
+
         case .startup:
             settingsSection("启动") {
                 settingsToggle("登录时启动", description: "登录 macOS 后自动打开 WallpaperMac。", binding: $launchAtLogin)
@@ -456,6 +513,21 @@ private struct SettingsView: View {
                 }
             }
         }
+    }
+
+    @MainActor
+    private func refreshSteamLoginState() async {
+        steamLoggedIn = await steamLoginService.isLoggedIn
+        if let name = await steamLoginService.savedUsername {
+            steamUsername = name
+        }
+    }
+
+    @MainActor
+    private func steamLogout() async {
+        await steamLoginService.logout()
+        await refreshSteamLoginState()
+        steamLoginError = nil
     }
 
     private func settingsSection<Content: View>(
@@ -753,6 +825,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
     case appearance
     case playback
     case interaction
+    case steam
     case startup
     case about
 
@@ -764,6 +837,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         case .appearance: return "外观"
         case .playback: return "播放"
         case .interaction: return "交互"
+        case .steam: return "Steam 工坊"
         case .startup: return "启动与更新"
         case .about: return "关于"
         }
@@ -775,6 +849,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         case .appearance: return "六套基于一天光线的界面主题"
         case .playback: return "静音、循环、适配与节能策略"
         case .interaction: return "网页壁纸点击与快捷键"
+        case .steam: return "创意工坊下载账号"
         case .startup: return "登录项与软件更新"
         case .about: return "版本、构建与项目信息"
         }
@@ -786,6 +861,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         case .appearance: return "circle.lefthalf.filled"
         case .playback: return "play.circle"
         case .interaction: return "cursorarrow.click"
+        case .steam: return "gamecontroller"
         case .startup: return "arrow.triangle.2.circlepath"
         case .about: return "info.circle"
         }
@@ -967,10 +1043,12 @@ enum SettingsKey {
     static let originalDesktopImages = "WallpaperMac.originalDesktopImages"
     static let lastSyncedDesktopImages = "WallpaperMac.lastSyncedDesktopImages"
     static let automaticUpdateBlockedVersion = "WallpaperMac.automaticUpdateBlockedVersion"
+    static let steamWorkshopAccount = "WallpaperMac.steamWorkshopAccount"
 }
 
 extension Notification.Name {
     static let wallpaperMacSettingsChanged = Notification.Name("WallpaperMacSettingsChanged")
     static let wallpaperMacRequestLibraryMigration = Notification.Name("WallpaperMacRequestLibraryMigration")
     static let wallpaperMacShowDisplaysOverview = Notification.Name("WallpaperMacShowDisplaysOverview")
+    static let wallpaperMacShowSteamWorkshopBrowse = Notification.Name("WallpaperMacShowSteamWorkshopBrowse")
 }

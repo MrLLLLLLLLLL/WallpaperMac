@@ -2,7 +2,7 @@
 
 WallpaperMac 是一个原生 macOS 壁纸引擎与壁纸库管理器，支持图片、视频、本地 HTML 项目和 HTTP/HTTPS 网页壁纸，并提供多显示器、播放队列、隐藏壁纸、主题、自动更新和锁屏图片同步。
 
-开发版本：**0.2.16** · 最新发布版：**0.2.15** · 平台：**macOS 13+** · 构建：**Swift Package Manager** · 许可证：**GPL-3.0-or-later**
+开发版本：**0.2.17** · 最新发布版：**0.2.16** · 平台：**macOS 13+** · 构建：**Swift Package Manager** · 许可证：**GPL-3.0-or-later**
 
 ## 文档导航
 

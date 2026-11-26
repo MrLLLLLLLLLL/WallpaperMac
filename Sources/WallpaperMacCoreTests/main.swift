@@ -1063,6 +1063,827 @@ func testDisplayQueuesStayIndependent() throws {
     try expect(first.transition != second.transition, "display queues should keep independent transitions")
 }
 
+// MARK: - Steam Workshop import tests
+
+func testWorkshopLinkParsesSupportedForms() throws {
+    let forms = [
+        "https://steamcommunity.com/sharedfiles/filedetails/?id=3445534475",
+        "https://steamcommunity.com/workshop/filedetails/?id=3445534475&searchtext=",
+        "http://steamcommunity.com/sharedfiles/filedetails/?id=3445534475",
+        "steam://url/CommunityFilePage/3445534475",
+        "3445534475",
+        "  3445534475  "
+    ]
+    for form in forms {
+        let link = try require(WorkshopLink.parse(form), "should parse: \(form)")
+        try expect(link.itemID, equals: "3445534475", "id from \(form)")
+    }
+}
+
+func testWorkshopLinkRejectsInvalidInput() throws {
+    let invalids = [
+        "",
+        "   ",
+        "1234",            // too short (could be a year)
+        "2026",            // year
+        "https://example.com/filedetails/?id=3445534475",
+        "https://steamcommunity.com/profiles/76561198000000000",
+        "not a link",
+        "steam://url/OtherPage/3445534475",
+        "https://steamcommunity.com/sharedfiles/filedetails/?id=abc",
+        "9999999999999999999999999" // > 20 digits
+    ]
+    for input in invalids {
+        try expect(WorkshopLink.parse(input) == nil, "should reject: \(input)")
+    }
+}
+
+func testWorkshopMetadataParsesSteamResponse() throws {
+    let json = """
+    {"response":{"result":1,"resultcount":1,"publishedfiledetails":[{
+      "publishedfileid":"3445534475",
+      "result":1,
+      "title":"Castorice Scene",
+      "description":"A scene wallpaper",
+      "file_size":"89533472",
+      "preview_url":"https://images.steamusercontent.com/ugc/1/ABC/",
+      "consumer_app_id":431960,
+      "time_updated":1748876686,
+      "tags":[{"tag":"Wallpaper"},{"tag":"Scene"},{"tag":"Everyone"}]
+    }]}}
+    """
+    let metadata = try WorkshopMetadataParser.parse(
+        data: Data(json.utf8),
+        requestedID: "3445534475"
+    )
+    try expect(metadata.itemID, equals: "3445534475", "item id")
+    try expect(metadata.title, equals: "Castorice Scene", "title")
+    try expect(metadata.fileSizeBytes, equals: 89_533_472, "size parses from string")
+    try expect(metadata.isAvailable, equals: true, "result 1 is available")
+    try expect(metadata.isWallpaperEngineItem, equals: true, "consumer app 431960")
+    try expect(metadata.kindFromTags, equals: .scene, "Scene tag wins")
+    try expect(metadata.unsupportedReason, equals: .scene, "scene is unsupported in v1")
+    try expect(
+        metadata.previewURL?.absoluteString,
+        equals: "https://images.steamusercontent.com/ugc/1/ABC/",
+        "preview url"
+    )
+}
+
+func testWorkshopMetadataTypeTagsAndAvailability() throws {
+    func make(tags: [String], result: Int = 1, app: Int? = 431960) -> WorkshopMetadata {
+        WorkshopMetadata(
+            itemID: "1",
+            title: "t",
+            itemDescription: "",
+            tags: tags,
+            fileSizeBytes: nil,
+            previewURL: nil,
+            consumerAppID: app,
+            timeUpdated: nil,
+            isAvailable: result == 1
+        )
+    }
+
+    try expect(make(tags: ["Video"]).kindFromTags, equals: .video, "Video tag")
+    try expect(make(tags: ["Web"]).kindFromTags, equals: .web, "Web tag")
+    try expect(make(tags: ["Application"]).kindFromTags, equals: .application, "Application tag")
+    try expect(make(tags: ["Anime"]).kindFromTags, equals: nil, "no type tag")
+    try expect(
+        make(tags: ["Scene", "Video"]).kindFromTags,
+        equals: .scene,
+        "Application/Scene win over Video when both present"
+    )
+    try expect(make(tags: ["Video"]).unsupportedReason, equals: nil, "video is supported")
+    try expect(make(tags: ["Video"]).unsupportedReason == nil, equals: true, "video has no reason")
+    try expect(make(tags: [], result: 0).unsupportedReason, equals: .unavailable, "result != 1")
+    try expect(make(tags: ["Video"], app: 730).unsupportedReason, equals: .wrongApp(730), "wrong appid")
+}
+
+func testWorkshopMetadataUnavailableResponse() throws {
+    let json = """
+    {"response":{"result":1,"resultcount":1,"publishedfiledetails":[{
+      "publishedfileid":"999","result":9
+    }]}}
+    """
+    let metadata = try WorkshopMetadataParser.parse(data: Data(json.utf8), requestedID: "999")
+    try expect(metadata.isAvailable, equals: false, "result 9 is unavailable")
+    try expect(metadata.unsupportedReason, equals: .unavailable, "unavailable reason")
+}
+
+func testWorkshopProjectManifestParsesVideoAndWeb() throws {
+    let videoJSON = """
+    {"title":"Aurora Drift","description":"d","type":"video","file":"Aurora.mp4","preview":"preview.jpg"}
+    """
+    let video = try WorkshopProjectManifest.parse(data: Data(videoJSON.utf8))
+    try expect(video.kind, equals: .video, "video kind")
+    try expect(video.file, equals: "Aurora.mp4", "video file")
+    try expect(video.title, equals: "Aurora Drift", "title")
+
+    let webJSON = #"{"type":"web","file":"index.html"}"#
+    let web = try WorkshopProjectManifest.parse(data: Data(webJSON.utf8))
+    try expect(web.kind, equals: .web, "web kind")
+    try expect(web.file, equals: "index.html", "web entry")
+
+    let sceneJSON = #"{"type":"scene","file":"scene.json"}"#
+    let scene = try WorkshopProjectManifest.parse(data: Data(sceneJSON.utf8))
+    try expect(scene.kind, equals: .scene, "scene kind")
+
+    let unknown = try WorkshopProjectManifest.parse(data: Data("{}".utf8))
+    try expect(unknown.kind, equals: .unknown, "missing type is unknown")
+}
+
+func testWorkshopImportPlannerRoutesSupportedTypes() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("wm-plan-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    // Video project
+    let videoDir = root.appendingPathComponent("video-item", isDirectory: true)
+    try FileManager.default.createDirectory(at: videoDir, withIntermediateDirectories: true)
+    try Data("fake-video".utf8).write(to: videoDir.appendingPathComponent("clip.mp4"))
+    try Data(#"{"type":"video","file":"clip.mp4","title":"Clip"}"#.utf8)
+        .write(to: videoDir.appendingPathComponent("project.json"))
+
+    let videoPlan = WorkshopImportPlanner.plan(directory: videoDir)
+    guard case .video(let source, let title) = videoPlan else {
+        throw TestFailure(message: "expected video plan, got \(videoPlan)")
+    }
+    try expect(source.lastPathComponent, equals: "clip.mp4", "video source file")
+    try expect(title, equals: "Clip", "video title from manifest")
+    try expect(videoPlan.isSupported, equals: true, "video supported")
+
+    // Web project with nested entry
+    let webDir = root.appendingPathComponent("web-item", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: webDir.appendingPathComponent("pages", isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    try Data("<html></html>".utf8).write(to: webDir.appendingPathComponent("pages/home.html"))
+    try Data(#"{"type":"web","file":"pages/home.html"}"#.utf8)
+        .write(to: webDir.appendingPathComponent("project.json"))
+
+    let webPlan = WorkshopImportPlanner.plan(directory: webDir)
+    guard case .webProject(let directory, let entry, _) = webPlan else {
+        throw TestFailure(message: "expected web plan, got \(webPlan)")
+    }
+    try expect(directory, equals: webDir, "web directory")
+    try expect(entry, equals: "pages/home.html", "web entry path")
+    try expect(webPlan.isSupported, equals: true, "web supported")
+
+    // Scene rejected
+    let sceneDir = root.appendingPathComponent("scene-item", isDirectory: true)
+    try FileManager.default.createDirectory(at: sceneDir, withIntermediateDirectories: true)
+    try Data(#"{"type":"scene","file":"scene.json"}"#.utf8)
+        .write(to: sceneDir.appendingPathComponent("project.json"))
+    let scenePlan = WorkshopImportPlanner.plan(directory: sceneDir)
+    guard case .unsupported(.scene) = scenePlan else {
+        throw TestFailure(message: "expected scene rejection, got \(scenePlan)")
+    }
+    try expect(scenePlan.isSupported, equals: false, "scene unsupported")
+
+    // Application rejected
+    let appDir = root.appendingPathComponent("app-item", isDirectory: true)
+    try FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
+    try Data(#"{"type":"application","file":"run.exe"}"#.utf8)
+        .write(to: appDir.appendingPathComponent("project.json"))
+    let appPlan = WorkshopImportPlanner.plan(directory: appDir)
+    guard case .unsupported(.application) = appPlan else {
+        throw TestFailure(message: "expected application rejection, got \(appPlan)")
+    }
+
+    // Missing entry file
+    let missingDir = root.appendingPathComponent("missing-item", isDirectory: true)
+    try FileManager.default.createDirectory(at: missingDir, withIntermediateDirectories: true)
+    try Data(#"{"type":"video","file":"gone.mp4"}"#.utf8)
+        .write(to: missingDir.appendingPathComponent("project.json"))
+    let missingPlan = WorkshopImportPlanner.plan(directory: missingDir)
+    guard case .unsupported(.entryFileMissingOnDisk("gone.mp4")) = missingPlan else {
+        throw TestFailure(message: "expected missing entry, got \(missingPlan)")
+    }
+
+    // No project.json
+    let emptyDir = root.appendingPathComponent("empty-item", isDirectory: true)
+    try FileManager.default.createDirectory(at: emptyDir, withIntermediateDirectories: true)
+    let emptyPlan = WorkshopImportPlanner.plan(directory: emptyDir)
+    guard case .unsupported(.unknownType(nil)) = emptyPlan else {
+        throw TestFailure(message: "expected unknown type, got \(emptyPlan)")
+    }
+}
+
+func testWorkshopImportPlannerHandlesBackslashAndTraversalEntries() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("wm-entry-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    // Windows-authored backslash path resolves to nested file.
+    try FileManager.default.createDirectory(
+        at: root.appendingPathComponent("videos", isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    try Data("x".utf8).write(to: root.appendingPathComponent("videos/clip.mp4"))
+    let backslash = WorkshopImportPlanner.resolveEntry("videos\\clip.mp4", in: root)
+    try expect(
+        backslash.path.hasSuffix("videos/clip.mp4"),
+        equals: true,
+        "backslash entry normalizes"
+    )
+
+    // Traversal outside root fails closed.
+    let escape = WorkshopImportPlanner.resolveEntry("../../etc/passwd", in: root)
+    try expect(
+        escape.path.contains(".invalid-entry"),
+        equals: true,
+        "traversal is rejected"
+    )
+}
+
+func testSteamCMDCommandBuildsLoginWithoutPassword() throws {
+    let command = SteamCMDCommand(
+        account: "tester",
+        itemID: "3445534475",
+        forceInstallDirectory: "/tmp/staging"
+    )
+    try expect(command.arguments.contains("+login"), equals: true, "has login")
+    try expect(
+        command.arguments.contains(where: { $0.contains("secret") || $0.lowercased().contains("password") }),
+        equals: false,
+        "password must never appear in argv"
+    )
+    try expect(
+        command.arguments.contains("-inhibitbootstrap"),
+        equals: true,
+        "inhibits mid-download self-update"
+    )
+    let loginIndex = try require(
+        command.arguments.firstIndex(of: "+login"),
+        "login index"
+    )
+    try expect(
+        command.arguments[loginIndex + 1],
+        equals: "tester",
+        "account follows +login"
+    )
+    let workshopIndex = try require(
+        command.arguments.firstIndex(of: "+workshop_download_item"),
+        "workshop index"
+    )
+    try expect(command.arguments[workshopIndex + 1], equals: "431960", "WE appid")
+    try expect(command.arguments[workshopIndex + 2], equals: "3445534475", "item id")
+    try expect(command.arguments.last, equals: "+quit", "quits after")
+
+    let expected = command.expectedContentDirectory.path
+    try expect(
+        expected.contains("steamapps/workshop/content/431960/3445534475"),
+        equals: true,
+        "expected content path"
+    )
+    let candidates = command.candidateContentDirectories()
+    try expect(candidates.count, equals: 3, "content/downloads/temp candidates")
+    try expect(
+        candidates.contains { $0.path.contains("/downloads/431960/3445534475") },
+        equals: true,
+        "downloads candidate present"
+    )
+}
+
+func testSteamCMDOutputParserDetectsPasswordPromptAndSuccess() throws {
+    let parser = SteamCMDOutputParser()
+    parser.noteExpectedItemID("3445534475")
+
+    let passwordEvents = parser.consume("Cached credentials not found.\npassword: ")
+    try expect(
+        passwordEvents.contains(.prompt(.password)),
+        equals: true,
+        "password prompt detected without newline"
+    )
+
+    let loginEvents = parser.consume("\nLogging in user 'tester' to Steam Public...\n")
+    try expect(parser.current.openPrompt, equals: nil, "password prompt cleared after login starts")
+
+    let progressEvents = parser.consume("[ 42%] Downloading item 3445534475...\n")
+    try expect(
+        progressEvents.contains(where: {
+            if case .progress(let f) = $0, let f { return abs(f - 0.42) < 0.001 }
+            return false
+        }),
+        equals: true,
+        "progress 42% parsed"
+    )
+
+    let successLine = #"Success. Downloaded item 3445534475 to "/tmp/staging/steamapps/workshop/content/431960/3445534475""#
+    let successEvents = parser.consume(successLine + "\n")
+    try expect(
+        successEvents.contains {
+            if case .succeeded(let id, let path) = $0 {
+                return id == "3445534475" && path?.contains("431960/3445534475") == true
+            }
+            return false
+        },
+        equals: true,
+        "success with path parsed"
+    )
+    try expect(parser.current.didSucceed, equals: true, "success recorded")
+    try expect(parser.current.failure, equals: nil, "no failure on success")
+}
+
+func testSteamCMDOutputParserClassifiesFailures() throws {
+    // Invalid password (real SteamCMD line from local probe)
+    let passwordParser = SteamCMDOutputParser()
+    let pwEvents = passwordParser.consume(
+        "Logging in user 'x' to Steam Public...ERROR (Invalid Password)\n"
+    )
+    try expect(
+        pwEvents.contains(.failed(.invalidPassword)),
+        equals: true,
+        "invalid password classified"
+    )
+    try expect(passwordParser.current.failure, equals: .invalidPassword, "failure recorded")
+
+    // No subscription — ownership requirement
+    let subParser = SteamCMDOutputParser()
+    let subEvents = subParser.consume(
+        "ERROR! Workshop item download failed (No subscription)\n"
+    )
+    try expect(
+        subEvents.contains(.failed(.noSubscription)),
+        equals: true,
+        "no subscription classified"
+    )
+
+    // Steam Guard rejection
+    let guardParser = SteamCMDOutputParser()
+    let guardEvents = guardParser.consume("FAILED (Two-factor code mismatch)\n")
+    try expect(
+        guardEvents.contains(.failed(.twoFactorRejected)),
+        equals: true,
+        "two-factor mismatch classified"
+    )
+
+    // C++ log noise with parentheses must NOT count as failure
+    let noiseParser = SteamCMDOutputParser()
+    let noiseEvents = noiseParser.consume(
+        "src/common/iopollinghelpers_osx.cpp (109) : Unexpected thread race\n"
+    )
+    try expect(noiseEvents.contains { if case .failed = $0 { return true }; return false },
+               equals: false,
+               "log noise is not a failure")
+    try expect(noiseParser.current.failure, equals: nil, "no failure from noise")
+}
+
+func testSteamCMDOutputParserDetectsSteamGuardPrompt() throws {
+    let parser = SteamCMDOutputParser()
+    let events = parser.consume("Steam Guard code: ")
+    try expect(events.contains(.prompt(.steamGuard)), equals: true, "guard prompt detected")
+    try expect(parser.current.sawSteamGuardChallenge, equals: true, "challenge recorded")
+
+    let twoFactor = SteamCMDOutputParser()
+    let tfEvents = twoFactor.consume("two-factor code: ")
+    try expect(tfEvents.contains(.prompt(.steamGuard)), equals: true, "two-factor prompt")
+}
+
+func testSteamCMDInstallerParsesValveManifest() throws {
+    let manifestText = """
+    "osx"
+    {
+    \t"version"\t\t"1794537082"
+    \t"ostype"\t\t"macos1015"
+    \t"steamcmd_public_all"
+    \t{
+    \t\t"file"\t\t"steamcmd_public_all.zip.5a294ec531ae00e2fd9f94c280007cd605076692"
+    \t\t"size"\t\t"60349"
+    \t\t"sha2"\t\t"dfa7b42940635dd870337eeb9bd1084ff88ddd25c94c3fecf2a5d7262f993d75"
+    \t}
+    \t"steamcmd_bins_osx"
+    \t{
+    \t\t"file"\t\t"steamcmd_bins_osx.zip.d9863bb289f65bd96e776ac6f99669e55136a3f0"
+    \t\t"size"\t\t"19746053"
+    \t\t"sha2"\t\t"ef9f5b1a8580fb6148871b0893b700e7b94e81186bc91ef07af2d95a800aaaad"
+    \t}
+    \t"steamcmd_osx"
+    \t{
+    \t\t"file"\t\t"steamcmd_osx.zip.6bbc1e7314dedcf49293f7b80d2ab667de4bbd3d"
+    \t\t"size"\t\t"4024837"
+    \t\t"sha2"\t\t"3f554ad38ae87a431f3788bf4cacd29a5484c93d61f399810f150a2af0804a1c"
+    \t\t"IsBootstrapperPackage"\t\t"1"
+    \t}
+    }
+    "kvsign2"
+    {
+    \t"osx"\t\t"078d0a3f"
+    }
+    """
+    let manifest = try SteamCMDInstaller.parseManifest(manifestText)
+    try expect(manifest.version, equals: "1794537082", "version")
+    try expect(manifest.packages.count, equals: 3, "three packages")
+    let names = Set(manifest.packages.map(\.name))
+    try expect(
+        names.isSuperset(of: ["steamcmd_osx", "steamcmd_bins_osx"]),
+        equals: true,
+        "required packages present"
+    )
+    let bins = try require(manifest.packages.first(where: { $0.name == "steamcmd_bins_osx" }), "bins")
+    try expect(bins.size, equals: 19_746_053, "bins size")
+    try expect(bins.sha1, equals: "d9863bb289f65bd96e776ac6f99669e55136a3f0", "sha1 from filename")
+    try expect(
+        bins.url.absoluteString.contains("steamcmd_bins_osx.zip."),
+        equals: true,
+        "package url on Valve CDN"
+    )
+
+    // Missing required package must fail closed.
+    let incomplete = """
+    "osx"
+    {
+    \t"version"\t\t"1"
+    \t"steamcmd_public_all"
+    \t{
+    \t\t"file"\t\t"steamcmd_public_all.zip.abc"
+    \t\t"size"\t\t"1"
+    \t\t"sha2"\t\t"\(String(repeating: "a", count: 64))"
+    \t}
+    }
+    """
+    do {
+        _ = try SteamCMDInstaller.parseManifest(incomplete)
+        throw TestFailure(message: "incomplete manifest should throw")
+    } catch let error as SteamCMDInstaller.InstallError {
+        try expect(error, equals: .malformedManifest, "incomplete manifest fails closed")
+    }
+
+    // Garbage input fails closed.
+    do {
+        _ = try SteamCMDInstaller.parseManifest("not a manifest {")
+        throw TestFailure(message: "garbage should throw")
+    } catch is SteamCMDInstaller.InstallError {
+        // expected
+    }
+}
+
+func testSteamCMDSessionRunsFakeDownloaderEndToEnd() async throws {
+    // A fake steamcmd that mimics prompts, validates the password it reads
+    // from stdin, and creates the workshop content tree on success.
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("wm-fake-steam-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let script = root.appendingPathComponent("steamcmd")
+    let scriptBody = """
+    #!/bin/bash
+    set -e
+    # Parse +force_install_dir from argv
+    INSTALL_DIR=""
+    prev=""
+    for arg in "$@"; do
+      if [ "$prev" = "+force_install_dir" ]; then INSTALL_DIR="$arg"; fi
+      prev="$arg"
+    done
+    if [ -z "$INSTALL_DIR" ]; then INSTALL_DIR="$PWD"; fi
+
+    echo "Cached credentials not found."
+    printf "password: "
+    read -r PASS
+    if [ "$PASS" != "correct-horse" ]; then
+      echo "Logging in user 'tester' to Steam Public...ERROR (Invalid Password)"
+      exit 0
+    fi
+    echo "Logging in user 'tester' to Steam Public...OK"
+    echo "Waiting for user info...OK"
+    echo "[ 10%] Downloading item 3445534475..."
+    OUT="$INSTALL_DIR/steamapps/workshop/content/431960/3445534475"
+    mkdir -p "$OUT"
+    echo '{"type":"video","file":"clip.mp4","title":"Fake"}' > "$OUT/project.json"
+    echo "fake-video-bytes" > "$OUT/clip.mp4"
+    echo "[100%] Downloading item 3445534475..."
+    echo "Success. Downloaded item 3445534475 to \\"$OUT\\""
+    exit 0
+    """
+    try scriptBody.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+    let staging = root.appendingPathComponent("staging", isDirectory: true)
+    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+
+    let command = SteamCMDCommand(
+        account: "tester",
+        itemID: "3445534475",
+        forceInstallDirectory: staging.path
+    )
+    let session = SteamCMDSession(executable: script, timeout: 30)
+
+    // Wrong password → classified failure
+    let badResult = try await session.run(
+        command: command,
+        credentials: .init(username: "tester", password: "wrong"),
+        environment: ["PATH": "/usr/bin:/bin"],
+        workingDirectory: staging
+    )
+    try expect(badResult.succeeded, equals: false, "wrong password fails")
+    try expect(badResult.failure, equals: .invalidPassword, "invalid password classified")
+
+    // Fresh staging for the good attempt
+    try? FileManager.default.removeItem(at: staging)
+    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+
+    var progressSeen: [String] = []
+    let goodResult = try await session.run(
+        command: command,
+        credentials: .init(username: "tester", password: "correct-horse"),
+        environment: ["PATH": "/usr/bin:/bin"],
+        workingDirectory: staging
+    ) { progress in
+        if let status = progress.status { progressSeen.append(status) }
+    }
+
+    try expect(goodResult.succeeded, equals: true, "correct password succeeds: \(goodResult.failure ?? .timeout) \(goodResult.outputTail)")
+    let downloaded = try require(goodResult.downloadedDirectory, "downloaded directory exists")
+    try expect(
+        FileManager.default.fileExists(atPath: downloaded.appendingPathComponent("project.json").path),
+        equals: true,
+        "project.json present"
+    )
+
+    // Plan the import from the fake download
+    let plan = WorkshopImportPlanner.plan(directory: downloaded)
+    guard case .video(let source, let title) = plan else {
+        throw TestFailure(message: "expected video plan from fake download, got \(plan)")
+    }
+    try expect(source.lastPathComponent, equals: "clip.mp4", "video entry")
+    try expect(title, equals: "Fake", "title from project.json")
+    try expect(
+        progressSeen.contains { $0.contains("Downloading item") || $0.contains("password") || $0.contains("Logging in") },
+        equals: true,
+        "progress callbacks fired"
+    )
+}
+
+func testWorkshopDownloadCoordinatorResolveRejectsNonLinks() async throws {
+    let coordinator = WorkshopDownloadCoordinator()
+    let result = try await coordinator.resolveAndFetch(rawLink: "not a workshop link")
+    try expect(result == nil, equals: true, "non-link returns nil without network")
+
+    let year = try await coordinator.resolveAndFetch(rawLink: "2026")
+    try expect(year == nil, equals: true, "bare year is not a link")
+}
+
+func testWorkshopUnsupportedReasonUserMessagesAreActionable() throws {
+    let reasons: [WorkshopUnsupportedReason] = [
+        .unavailable, .scene, .application, .wrongApp(730),
+        .unknownType("preset"), .missingEntryFile("a"), .entryFileMissingOnDisk("b")
+    ]
+    for reason in reasons {
+        let message = reason.userMessage
+        try expect(message.count > 10, equals: true, "message for \(reason) is substantive")
+        try expect(message.contains("Wallpaper") || message.contains("壁纸") || message.contains("条目") || message.contains("类型") || message.contains("入口") || message.contains("Steam") || message.contains("macOS"),
+                   equals: true,
+                   "message for \(reason) names the domain")
+    }
+}
+
+func testSteamCMDFailureSurfacesChineseLocalizedText() throws {
+    let failures: [SteamCMDFailure] = [
+        .invalidPassword, .noSubscription, .missingSteamGuardCode,
+        .rateLimited, .timeout, .exitedBeforeCompletion(signInAccepted: true)
+    ]
+    for failure in failures {
+        let description = try require(failure.errorDescription, "errorDescription for \(failure)")
+        try expect(description.count > 8, equals: true, "substantive message for \(failure)")
+        // Bridged NSError must expose the same localized Chinese text
+        // (LocalizedError.errorDescription), not the English enum default.
+        try expect(
+            (failure as NSError).localizedDescription,
+            equals: description,
+            "NSError bridge uses LocalizedError text for \(failure)"
+        )
+        try expect(
+            description.contains("operation couldn") == false,
+            equals: true,
+            "not the English NSError boilerplate for \(failure)"
+        )
+    }
+    try expect(
+        SteamCMDFailure.invalidPassword.errorDescription,
+        equals: SteamCMDFailure.invalidPassword.userMessage,
+        "errorDescription mirrors userMessage"
+    )
+}
+
+func testWorkshopMetadataRejectsNonNumericItemID() throws {
+    let malicious = """
+    {"response":{"result":1,"resultcount":1,"publishedfiledetails":[{
+      "publishedfileid":"../../etc","result":1,"title":"x"
+    }]}}
+    """
+    do {
+        _ = try WorkshopMetadataParser.parse(data: Data(malicious.utf8), requestedID: "1")
+        throw TestFailure(message: "non-numeric id should be rejected")
+    } catch let error as WorkshopMetadataError {
+        try expect(error, equals: .emptyResponse, "malicious id fails closed")
+    }
+}
+
+func testWorkshopDownloadCoordinatorRejectsTraversalItemID() async throws {
+    let coordinator = WorkshopDownloadCoordinator()
+    let context = WorkshopDownloadCoordinator.Context(
+        rootDirectory: FileManager.default.temporaryDirectory
+            .appendingPathComponent("wm-ctx-\(UUID().uuidString)", isDirectory: true),
+        credentials: .init(username: "u", password: "p")
+    )
+    do {
+        _ = try await coordinator.downloadAndPlan(itemID: "../../evil", context: context)
+        throw TestFailure(message: "traversal itemID should throw")
+    } catch let error as SteamCMDFailure {
+        try expect(error, equals: .itemUnavailable, "traversal id classified as unavailable")
+    } catch {
+        throw TestFailure(message: "unexpected error \(error)")
+    }
+}
+
+func testWorkshopPlanTitleOverride() throws {
+    let video = WorkshopImportPlan.video(
+        sourceURL: URL(fileURLWithPath: "/tmp/a.mp4"),
+        title: "Aurora Drift"
+    )
+    try expect(video.titleOverride, equals: "Aurora Drift", "video title override")
+    let web = WorkshopImportPlan.webProject(
+        directory: URL(fileURLWithPath: "/tmp/p"),
+        entryFile: "index.html",
+        title: "Home"
+    )
+    try expect(web.titleOverride, equals: "Home", "web title override")
+    let unsupported = WorkshopImportPlan.unsupported(.scene)
+    try expect(unsupported.titleOverride == nil, equals: true, "unsupported has no title")
+}
+
+func testResolveEntryBlocksSymlinkEscape() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("wm-sym-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inside = root.appendingPathComponent("inside", isDirectory: true)
+    try FileManager.default.createDirectory(at: inside, withIntermediateDirectories: true)
+    try Data("x".utf8).write(to: inside.appendingPathComponent("ok.html"))
+
+    // Symlink inside project pointing outside
+    let outside = FileManager.default.temporaryDirectory
+        .appendingPathComponent("wm-outside-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: outside) }
+    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+    try Data("secret".utf8).write(to: outside.appendingPathComponent("secret.html"))
+    let link = root.appendingPathComponent("escape")
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+
+    let blocked = WorkshopImportPlanner.resolveEntry("escape/secret.html", in: root)
+    try expect(
+        blocked.path.contains(".invalid-entry"),
+        equals: true,
+        "symlink escape is blocked"
+    )
+    let allowed = WorkshopImportPlanner.resolveEntry("inside/ok.html", in: root)
+    try expect(
+        FileManager.default.fileExists(atPath: allowed.path),
+        equals: true,
+        "legitimate nested entry still resolves"
+    )
+}
+
+func testWorkshopBrowseURLBuildsFiltersAndPaging() throws {
+    let all = WorkshopBrowseClient.browseURL(search: "rain", page: 2, kindFilter: nil)
+    let allString = all.absoluteString
+    try expect(allString.contains("appid=431960"), equals: true, "app id")
+    try expect(allString.contains("searchtext=rain"), equals: true, "search")
+    try expect(allString.contains("p=2"), equals: true, "page")
+    try expect(allString.contains("requiredtags"), equals: false, "no tag filter for nil")
+
+    let video = WorkshopBrowseClient.browseURL(search: "", page: 1, kindFilter: .video)
+    try expect(
+        video.absoluteString.contains("requiredtags%5B%5D=Video") || video.absoluteString.contains("requiredtags[]=Video"),
+        equals: true,
+        "video tag filter"
+    )
+}
+
+func testWorkshopBrowseItemIDsFromHTMLMarkers() throws {
+    let html = """
+    <a href="https://steamcommunity.com/sharedfiles/filedetails/?id=111111111">x</a>
+    <script>{"publishedfileid":"222222222"}</script>
+    <div data-publishedfileid="333333333"></div>
+    <span>publishedfileid\\":\\"444444444</span>
+    <a href="?id=012345">leading zero rejected</a>
+    <a href="?id=99">too short</a>
+    """
+    let ids = WorkshopBrowseClient.itemIDs(in: html, limit: 10)
+    try expect(ids, equals: ["111111111", "222222222", "333333333", "444444444"], "document order unique ids")
+}
+
+func testWorkshopBrowseItemKindFromTags() throws {
+    let video = WorkshopBrowseItem(
+        id: "1", title: "v", previewURL: nil, tags: ["Video", "Anime"],
+        fileSizeBytes: 10, itemDescription: ""
+    )
+    try expect(video.kind, equals: .video, "video kind")
+    try expect(video.isImportable, equals: true, "video importable")
+
+    let scene = WorkshopBrowseItem(
+        id: "2", title: "s", previewURL: nil, tags: ["Scene"],
+        fileSizeBytes: nil, itemDescription: ""
+    )
+    try expect(scene.kind, equals: .scene, "scene kind")
+    try expect(scene.isImportable, equals: false, "scene not importable")
+
+    let app = WorkshopBrowseItem(
+        id: "3", title: "a", previewURL: nil, tags: ["Application"],
+        fileSizeBytes: nil, itemDescription: ""
+    )
+    try expect(app.isImportable, equals: false, "application not importable")
+}
+
+func testSteamSessionStoreLoginStateAndLogout() throws {
+    let suite = "wm.steam.session.\(UUID().uuidString)"
+    let defaults = try require(UserDefaults(suiteName: suite), "suite")
+    defer { defaults.removePersistentDomain(forName: suite) }
+
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("wm-steam-session-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let config = SteamSessionConfiguration.standard(rootDirectory: root)
+    let store = SteamSessionStore(defaults: defaults)
+
+    try expect(store.isLoggedIn(configuration: config), equals: false, "starts logged out")
+    try expect(store.savedUsername, equals: nil, "no username")
+
+    // Fake a SteamCMD login cache
+    try FileManager.default.createDirectory(at: config.steamHomeDirectory, withIntermediateDirectories: true)
+    try Data("host \"valve\"".utf8).write(
+        to: config.steamHomeDirectory.appendingPathComponent("config.vdf")
+    )
+    store.saveUsername("tester")
+    try expect(store.isLoggedIn(configuration: config), equals: true, "username + cache = logged in")
+
+    store.logout(configuration: config)
+    try expect(store.savedUsername, equals: nil, "logout clears username")
+    try expect(
+        FileManager.default.fileExists(
+            atPath: config.steamHomeDirectory.appendingPathComponent("config.vdf").path
+        ),
+        equals: false,
+        "logout removes config.vdf"
+    )
+    try expect(store.isLoggedIn(configuration: config), equals: false, "logged out after logout")
+}
+
+func testSteamLoginCommandNeverPutsPasswordInArgv() throws {
+    let args = SteamLoginCommand.login(account: "tester")
+    try expect(args.contains("+login"), equals: true, "has login")
+    let loginIndex = try require(args.firstIndex(of: "+login"), "login idx")
+    try expect(args[loginIndex + 1], equals: "tester", "account after login")
+    try expect(
+        args.contains { $0.lowercased().contains("password") || $0.contains("secret") },
+        equals: false,
+        "no password-like argv"
+    )
+    try expect(args.last, equals: "+quit", "quits")
+    try expect(args.contains("-inhibitbootstrap"), equals: true, "no mid-login self-update")
+}
+
+func testMetadataParserParseAllDropsBadRows() throws {
+    let json = """
+    {"response":{"result":1,"resultcount":3,"publishedfiledetails":[
+      {"publishedfileid":"111111","result":1,"title":"ok","consumer_app_id":431960},
+      {"publishedfileid":"../../evil","result":1,"title":"bad"},
+      {"publishedfileid":"222222","result":9,"title":"gone"}
+    ]}}
+    """
+    let rows = try WorkshopMetadataParser.parseAll(data: Data(json.utf8))
+    try expect(rows.count, equals: 2, "non-numeric id dropped, result 9 kept as unavailable row")
+    try expect(rows[0].itemID, equals: "111111", "first ok row")
+    try expect(rows[0].isAvailable, equals: true, "available")
+    try expect(rows[1].isAvailable, equals: false, "result 9 unavailable")
+}
+
+func testSteamSessionMarkerFlipsLoginImmediately() throws {
+    let suite = "wm.steam.marker.\(UUID().uuidString)"
+    let defaults = try require(UserDefaults(suiteName: suite), "suite")
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("wm-steam-marker-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let config = SteamSessionConfiguration.standard(rootDirectory: root)
+    let store = SteamSessionStore(defaults: defaults)
+
+    // Username alone (no SteamCMD cache, no marker) is not logged in.
+    store.saveUsername("tester")
+    try expect(store.isLoggedIn(configuration: config), equals: false, "username without marker/cache")
+
+    // Marker written on successful login flips state even before SteamCMD cache files exist.
+    store.writeSessionMarker(username: "tester", configuration: config)
+    try expect(store.isLoggedIn(configuration: config), equals: true, "marker counts as logged in")
+
+    store.logout(configuration: config)
+    try expect(store.isLoggedIn(configuration: config), equals: false, "logout clears marker")
+}
+
 let tests: [(String, () throws -> Void)] = [
     ("wallpaper metadata round trips", testWallpaperMetadataRoundTrips),
     ("legacy wallpaper JSON without metadata decodes", testLegacyWallpaperJSONWithoutMetadataDecodes),
@@ -1234,6 +2055,34 @@ let tests: [(String, () throws -> Void)] = [
     ("streams signature digests matching one-shot", testStreamingSignatureDigestMatchesOneShot),
     ("kills timed-out child processes", testProcessRunnerTimesOutAndKillsChild),
     ("cleans full staging directory on install", testInstallScriptCleansFullStagingDirectory),
+    ("parses workshop links", testWorkshopLinkParsesSupportedForms),
+    ("rejects invalid workshop links", testWorkshopLinkRejectsInvalidInput),
+    ("parses workshop metadata response", testWorkshopMetadataParsesSteamResponse),
+    ("maps workshop type tags and availability", testWorkshopMetadataTypeTagsAndAvailability),
+    ("parses unavailable workshop response", testWorkshopMetadataUnavailableResponse),
+    ("parses workshop project manifest", testWorkshopProjectManifestParsesVideoAndWeb),
+    ("routes workshop import plans by type", testWorkshopImportPlannerRoutesSupportedTypes),
+    ("hardens workshop entry paths", testWorkshopImportPlannerHandlesBackslashAndTraversalEntries),
+    ("builds steamcmd command without password", testSteamCMDCommandBuildsLoginWithoutPassword),
+    ("parses steamcmd password prompt and success", testSteamCMDOutputParserDetectsPasswordPromptAndSuccess),
+    ("classifies steamcmd failures", testSteamCMDOutputParserClassifiesFailures),
+    ("detects steam guard prompts", testSteamCMDOutputParserDetectsSteamGuardPrompt),
+    ("parses valve steamcmd manifest", testSteamCMDInstallerParsesValveManifest),
+    ("runs fake steamcmd download end to end", { try runAsyncTest { try await testSteamCMDSessionRunsFakeDownloaderEndToEnd() } }),
+    ("coordinator rejects non-links without network", { try runAsyncTest { try await testWorkshopDownloadCoordinatorResolveRejectsNonLinks() } }),
+    ("workshop unsupported messages are actionable", testWorkshopUnsupportedReasonUserMessagesAreActionable),
+    ("steamcmd failures use Chinese localized text", testSteamCMDFailureSurfacesChineseLocalizedText),
+    ("workshop metadata rejects non-numeric ids", testWorkshopMetadataRejectsNonNumericItemID),
+    ("coordinator rejects traversal item ids", { try runAsyncTest { try await testWorkshopDownloadCoordinatorRejectsTraversalItemID() } }),
+    ("workshop plan exposes title override", testWorkshopPlanTitleOverride),
+    ("resolve entry blocks symlink escape", testResolveEntryBlocksSymlinkEscape),
+    ("builds workshop browse urls", testWorkshopBrowseURLBuildsFiltersAndPaging),
+    ("extracts workshop browse ids from html", testWorkshopBrowseItemIDsFromHTMLMarkers),
+    ("maps browse item kinds from tags", testWorkshopBrowseItemKindFromTags),
+    ("steam session store login state and logout", testSteamSessionStoreLoginStateAndLogout),
+    ("steam session marker flips login immediately", testSteamSessionMarkerFlipsLoginImmediately),
+    ("steam login command keeps password out of argv", testSteamLoginCommandNeverPutsPasswordInArgv),
+    ("metadata parseAll drops bad rows", testMetadataParserParseAllDropsBadRows),
     ("keeps deleted placeholders across reorder", testQueueReorderKeepsDeletedPlaceholders)
 ]
 
@@ -1329,6 +2178,76 @@ if CommandLine.arguments.count == 7, CommandLine.arguments[1] == "--launch-detac
             semaphore.signal()
         } catch {
             FileHandle.standardError.write(Data("DETACHED_FAILED: \(error.localizedDescription)\n".utf8))
+            exit(1)
+        }
+    }
+    semaphore.wait()
+    exit(0)
+}
+
+// Live SteamCMD install smoke: fetch Valve's manifest, verify+extract every
+// package into a temp root, then launch the installed binary with +quit.
+// Network required; used by the steam workshop integration verification.
+if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--steamcmd-install-smoke" {
+    let semaphore = DispatchSemaphore(value: 0)
+    Task {
+        do {
+            let installer = SteamCMDInstaller()
+            let dest = FileManager.default.temporaryDirectory
+                .appendingPathComponent("wm-steamcmd-smoke-\(UUID().uuidString)", isDirectory: true)
+            print("STEAMCMD_SMOKE_DEST: \(dest.path)")
+            fflush(stdout)
+            let executable = try await installer.install(to: dest) { state in
+                if case .ready = state { print("STEAMCMD_SMOKE_READY") }
+                fflush(stdout)
+            }
+            // Exit 42 is SteamCMD's MAGIC_RESTART_EXITCODE: the bootstrapper
+            // updated itself and wants one relaunch. Cap the loop.
+            var finalStatus: Int32 = -1
+            for attempt in 1...3 {
+                let process = Process()
+                process.executableURL = executable
+                process.arguments = ["+quit"]
+                process.currentDirectoryURL = dest
+                process.environment = [
+                    "PATH": "/usr/bin:/bin",
+                    "HOME": dest.path,
+                    "TERM": "dumb",
+                    "LANG": "en_US.UTF-8"
+                ]
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError = FileHandle.nullDevice
+                try process.run()
+                let deadline = Date().addingTimeInterval(180)
+                while process.isRunning && Date() < deadline {
+                    Thread.sleep(forTimeInterval: 0.2)
+                }
+                if process.isRunning {
+                    process.terminate()
+                    Thread.sleep(forTimeInterval: 1)
+                    if process.isRunning {
+                        kill(process.processIdentifier, SIGKILL)
+                    }
+                    print("STEAMCMD_SMOKE_TIMEOUT")
+                    fflush(stdout)
+                    exit(1)
+                }
+                finalStatus = process.terminationStatus
+                print("STEAMCMD_SMOKE_EXIT[\(attempt)]: \(finalStatus)")
+                fflush(stdout)
+                if finalStatus != 42 { break }
+            }
+            guard finalStatus == 0 else {
+                print("STEAMCMD_SMOKE_BAD_EXIT: \(finalStatus)")
+                fflush(stdout)
+                exit(1)
+            }
+            print("STEAMCMD_INSTALL_SMOKE_PASSED")
+            fflush(stdout)
+            try? FileManager.default.removeItem(at: dest)
+            exit(0)
+        } catch {
+            FileHandle.standardError.write(Data("STEAMCMD_SMOKE_ERROR: \(error)\n".utf8))
             exit(1)
         }
     }
