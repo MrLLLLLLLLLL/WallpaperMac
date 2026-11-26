@@ -10,6 +10,8 @@ struct SteamWorkshopBrowseSheet: View {
 
     @State private var searchText = ""
     @State private var kindFilter: WorkshopKind? = nil
+    @State private var ageRating: WorkshopAgeRating? = nil
+    @State private var sort: WorkshopBrowseSort = .trending
     @State private var page = 1
     @State private var items: [WorkshopBrowseItem] = []
     @State private var hasNext = false
@@ -26,35 +28,36 @@ struct SteamWorkshopBrowseSheet: View {
     @State private var isDownloading = false
     @State private var downloadError: String?
     @State private var appeared = false
+    @State private var searchDebounce: Task<Void, Never>?
 
     private let browseClient = WorkshopBrowseClient()
     private let loginService = SteamLoginService()
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text("浏览 Steam 创意工坊")
-                    .font(.title2.weight(.semibold))
-                Spacer()
-                Button("关闭") { dismiss() }
-            }
+    private var activeFilterCount: Int {
+        var count = 0
+        if kindFilter != nil { count += 1 }
+        if ageRating != nil { count += 1 }
+        if sort != .trending { count += 1 }
+        return count
+    }
 
-            HStack(spacing: 8) {
-                TextField("搜索，或粘贴工坊链接 / ID", text: $searchText)
-                    .textFieldStyle(.roundedBorder)
-                    .accessibilityLabel("搜索创意工坊")
-                    .onSubmit { reload() }
-                Picker("类型", selection: $kindFilter) {
-                    Text("全部").tag(WorkshopKind?.none)
-                    Text("视频").tag(WorkshopKind?.some(.video))
-                    Text("网页").tag(WorkshopKind?.some(.web))
-                    Text("场景").tag(WorkshopKind?.some(.scene))
-                }
-                .pickerStyle(.menu)
-                .frame(width: 110)
-                Button("搜索") { reload() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(isLoading || isDownloading)
+    private var currentQuery: WorkshopBrowseQuery {
+        WorkshopBrowseQuery(
+            search: searchText.trimmingCharacters(in: .whitespacesAndNewlines),
+            kindFilter: kindFilter,
+            sort: sort,
+            page: page,
+            ageRating: ageRating
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            header
+            searchBar
+            filterBar
+            if activeFilterCount > 0 {
+                activeFilterStrip
             }
 
             if let loadError {
@@ -66,72 +69,16 @@ struct SteamWorkshopBrowseSheet: View {
 
             if isDownloading {
                 downloadProgressBody
-            } else if isLoading && items.isEmpty {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("正在加载工坊列表…")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.vertical, 40)
-            } else if items.isEmpty && loadError == nil {
-                Text("没有结果。换个关键词，或粘贴具体的工坊链接。")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .padding(.vertical, 40)
             } else {
-                // LazyVGrid must own the scroll region: wrapping it in a
-                // ScrollView disables cell laziness and decodes every
-                // preview at once (visible as UI stutter).
-                LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 160), spacing: 12)],
-                    spacing: 12
-                ) {
-                    ForEach(items) { item in
-                        browseTile(item)
-                    }
-                }
-                .padding(.vertical, 4)
-                .frame(maxHeight: 380)
-
-                HStack {
-                    Button("上一页") {
-                        page = max(1, page - 1)
-                        reload(append: false)
-                    }
-                    .disabled(page <= 1 || isLoading)
-                    Text("第 \(page) 页")
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                    Button("下一页") {
-                        page += 1
-                        reload(append: false)
-                    }
-                    .disabled(!hasNext || isLoading)
-                    Spacer()
-                    if let selected, selected.isImportable {
-                        Button {
-                            download(selected)
-                        } label: {
-                            Label("下载所选并导入", systemImage: "arrow.down.circle")
-                        }
-                        .buttonStyle(.borderedProminent)
-                    } else if let selected {
-                        Text(kindNote(selected))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
+                resultsBody
             }
 
-            Text("浏览不需要登录；下载需要已登录且拥有 Wallpaper Engine 的账号。场景与应用类型初版不支持导入。")
+            Text("浏览不需要登录；下载需要已登录且拥有 Wallpaper Engine 的账号。场景与应用类型暂不支持导入。")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
         }
         .padding(20)
-        .frame(width: 640, height: 560)
+        .frame(width: 760, height: 620)
         .onAppear {
             guard !appeared else { return }
             appeared = true
@@ -178,37 +125,255 @@ struct SteamWorkshopBrowseSheet: View {
         }
     }
 
-    // MARK: - Subviews
+    // MARK: - Header / search / filters
 
-    private var downloadProgressBody: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                ProgressView(value: downloadFraction)
-                if let downloadFraction {
-                    Text("\(Int(downloadFraction * 100))%")
-                        .font(.caption.monospaced())
-                        .frame(width: 40, alignment: .trailing)
+    private var header: some View {
+        HStack {
+            Text("浏览 Steam 创意工坊")
+                .font(.title2.weight(.semibold))
+            Spacer()
+            Button("关闭") { dismiss() }
+        }
+    }
+
+    private var searchBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("按名称搜索，或粘贴工坊链接 / ID", text: $searchText)
+                .textFieldStyle(.plain)
+                .accessibilityLabel("搜索创意工坊")
+                .onSubmit { reload() }
+                .onChange(of: searchText) { _ in
+                    // Debounced live search: pasted links are handled on submit.
+                    let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard WorkshopLink.parse(trimmed) == nil else { return }
+                    searchDebounce?.cancel()
+                    searchDebounce = Task {
+                        try? await Task.sleep(for: .milliseconds(400))
+                        guard !Task.isCancelled else { return }
+                        await MainActor.run {
+                            page = 1
+                            reload()
+                        }
+                    }
+                }
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                    page = 1
+                    reload()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 8).fill(AppTheme.Palette.hairline.opacity(0.35)))
+    }
+
+    private var filterBar: some View {
+        HStack(spacing: 10) {
+            Picker("类型", selection: $kindFilter) {
+                Text("全部类型").tag(WorkshopKind?.none)
+                Text("视频").tag(WorkshopKind?.some(.video))
+                Text("网页").tag(WorkshopKind?.some(.web))
+                Text("场景").tag(WorkshopKind?.some(.scene))
+            }
+            .pickerStyle(.menu)
+            .frame(width: 110)
+            .onChange(of: kindFilter) { _ in applyFilters() }
+
+            Picker("分级", selection: $ageRating) {
+                Text("全部分级").tag(WorkshopAgeRating?.none)
+                Text("全年龄").tag(WorkshopAgeRating?.some(.everyone))
+                Text("轻度成人").tag(WorkshopAgeRating?.some(.questionable))
+                Text("成人").tag(WorkshopAgeRating?.some(.mature))
+            }
+            .pickerStyle(.menu)
+            .frame(width: 110)
+            .onChange(of: ageRating) { _ in applyFilters() }
+
+            Picker("排序", selection: $sort) {
+                ForEach(WorkshopBrowseSort.allCases) { s in
+                    Text(s.title).tag(s)
                 }
             }
-            Text(downloadStatus ?? "正在下载…")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-            if let downloadError {
-                Label(downloadError, systemImage: "xmark.octagon")
+            .pickerStyle(.menu)
+            .frame(width: 110)
+            .onChange(of: sort) { _ in applyFilters() }
+
+            Spacer()
+
+            if isLoading {
+                ProgressView().controlSize(.small)
+            } else {
+                Button {
+                    reload()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.plain)
+                .help("刷新")
+            }
+        }
+    }
+
+    private var activeFilterStrip: some View {
+        HStack(spacing: 6) {
+            if let kindFilter {
+                filterChip(kindLabel(kindFilter)) {
+                    self.kindFilter = nil
+                    applyFilters()
+                }
+            }
+            if let ageRating {
+                filterChip(ageRating.title) {
+                    self.ageRating = nil
+                    applyFilters()
+                }
+            }
+            if sort != .trending {
+                filterChip(sort.title) {
+                    sort = .trending
+                    applyFilters()
+                }
+            }
+            if activeFilterCount > 1 {
+                Button("清除全部") {
+                    kindFilter = nil
+                    ageRating = nil
+                    sort = .trending
+                    applyFilters()
+                }
+                .buttonStyle(.link)
+                .font(.caption)
+            }
+            Spacer()
+        }
+    }
+
+    private func filterChip(_ label: String, onRemove: @escaping () -> Void) -> some View {
+        HStack(spacing: 4) {
+            Text(label)
+                .font(.caption)
+            Button(action: onRemove) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Capsule().fill(AppTheme.Palette.accent.opacity(0.15)))
+        .foregroundStyle(AppTheme.Palette.accent)
+    }
+
+    // MARK: - Results
+
+    @ViewBuilder
+    private var resultsBody: some View {
+        if isLoading && items.isEmpty {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("正在加载工坊列表…")
                     .font(.callout)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-                Button("返回列表") {
-                    isDownloading = false
-                    self.downloadError = nil
-                    downloadStatus = nil
-                    downloadFraction = nil
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.vertical, 40)
+        } else if items.isEmpty && loadError == nil {
+            emptyState
+        } else {
+            gridAndPager
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "square.stack.3d.up.slash")
+                .font(.system(size: 28, weight: .light))
+                .foregroundStyle(.tertiary)
+            Text("没有匹配的结果")
+                .font(.callout.weight(.medium))
+            Text("换个关键词、放宽筛选条件，或粘贴具体的工坊链接。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if activeFilterCount > 0 {
+                Button("清除筛选") {
+                    kindFilter = nil
+                    ageRating = nil
+                    sort = .trending
+                    applyFilters()
                 }
                 .buttonStyle(.bordered)
             }
         }
-        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.vertical, 36)
+    }
+
+    private var gridAndPager: some View {
+        VStack(spacing: 8) {
+            // LazyVGrid must own the scroll region: wrapping it in a
+            // ScrollView disables cell laziness and decodes every
+            // preview at once (visible as UI stutter).
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 170), spacing: 12)],
+                spacing: 12
+            ) {
+                ForEach(items) { item in
+                    browseTile(item)
+                }
+            }
+            .padding(.vertical, 4)
+            .frame(maxHeight: 380)
+
+            HStack {
+                Button {
+                    page = max(1, page - 1)
+                    reload()
+                } label: {
+                    Label("上一页", systemImage: "chevron.left")
+                }
+                .disabled(page <= 1 || isLoading)
+
+                Text("第 \(page) 页")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+
+                Button {
+                    page += 1
+                    reload()
+                } label: {
+                    Label("下一页", systemImage: "chevron.right")
+                }
+                .disabled(!hasNext || isLoading)
+
+                Spacer()
+
+                if let selected, selected.isImportable {
+                    Button {
+                        download(selected)
+                    } label: {
+                        Label("下载所选并导入", systemImage: "arrow.down.circle")
+                    }
+                    .buttonStyle(.borderedProminent)
+                } else if let selected {
+                    Text(kindNote(selected))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    Text("\(items.count) 项结果")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 
     private func browseTile(_ item: WorkshopBrowseItem) -> some View {
@@ -246,6 +411,17 @@ struct SteamWorkshopBrowseSheet: View {
                             lineWidth: isSelected ? 2 : 1
                         )
                 )
+                .overlay(alignment: .topTrailing) {
+                    if let rating = item.ageRating, rating != .everyone {
+                        Text(rating == .mature ? "R-18" : "PG-13")
+                            .font(.system(size: 8, weight: .bold))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill(.black.opacity(0.65)))
+                            .foregroundStyle(.white)
+                            .padding(5)
+                    }
+                }
 
                 Text(item.title)
                     .font(.caption.weight(.medium))
@@ -281,16 +457,61 @@ struct SteamWorkshopBrowseSheet: View {
             .foregroundStyle(color)
     }
 
+    private func kindLabel(_ kind: WorkshopKind) -> String {
+        switch kind {
+        case .video: return "视频"
+        case .web: return "网页"
+        case .scene: return "场景"
+        case .application: return "应用"
+        case .unknown: return "未知"
+        }
+    }
+
     private func kindNote(_ item: WorkshopBrowseItem) -> String {
         switch item.kind {
         case .scene:
-            return "场景壁纸依赖 Wallpaper Engine 渲染器，初版不支持导入。"
+            return "场景壁纸依赖 Wallpaper Engine 渲染器，暂不支持导入。"
         case .application:
             return "应用壁纸是 Windows 程序，无法在 macOS 运行。"
         default:
             return "该条目暂不可导入。"
         }
     }
+
+    // MARK: - Download progress
+
+    private var downloadProgressBody: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                ProgressView(value: downloadFraction)
+                if let downloadFraction {
+                    Text("\(Int(downloadFraction * 100))%")
+                        .font(.caption.monospaced())
+                        .frame(width: 40, alignment: .trailing)
+                }
+            }
+            Text(downloadStatus ?? "正在下载…")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            if let downloadError {
+                Label(downloadError, systemImage: "xmark.octagon")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("返回列表") {
+                    isDownloading = false
+                    self.downloadError = nil
+                    downloadStatus = nil
+                    downloadFraction = nil
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(.vertical, 8)
+    }
+
+    // MARK: - Detail sheet
 
     private func itemDetailSheet(_ item: WorkshopBrowseItem) -> some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -299,6 +520,13 @@ struct SteamWorkshopBrowseSheet: View {
                 .lineLimit(3)
             HStack(spacing: 8) {
                 kindBadge(item.kind)
+                if let rating = item.ageRating {
+                    Text(rating.title)
+                        .font(.caption)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(AppTheme.Palette.hairline.opacity(0.5)))
+                }
                 Text("ID \(item.id)")
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
@@ -314,13 +542,14 @@ struct SteamWorkshopBrowseSheet: View {
                         image.resizable().scaledToFit()
                     }
                 }
-                .frame(maxHeight: 220)
+                .frame(maxHeight: 240)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
             }
             if !item.itemDescription.isEmpty {
                 Text(item.itemDescription)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(6)
+                    .lineLimit(8)
             }
             if item.isImportable {
                 Button {
@@ -342,10 +571,15 @@ struct SteamWorkshopBrowseSheet: View {
             }
         }
         .padding(20)
-        .frame(width: 460)
+        .frame(width: 500)
     }
 
     // MARK: - Actions
+
+    private func applyFilters() {
+        page = 1
+        reload()
+    }
 
     private func ensureLoginThenBrowse() async {
         let loggedIn = await loginService.isLoggedIn
@@ -372,26 +606,20 @@ struct SteamWorkshopBrowseSheet: View {
         }
     }
 
-    private func reload(append: Bool = false) {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func reload() {
+        let queryText = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         // Pasted link / bare id jumps straight to that item.
-        if let link = WorkshopLink.parse(query) {
+        if let link = WorkshopLink.parse(queryText) {
             loadSingle(link.itemID)
             return
         }
         isLoading = true
         loadError = nil
-        if !append { items = [] }
-        let page = self.page
-        let filter = kindFilter
+        items = []
+        let query = currentQuery
         Task { @MainActor in
             do {
-                let result = try await browseClient.browse(
-                    search: query,
-                    page: page,
-                    kindFilter: filter
-                )
-                // Drop session if Steam redirected to sign-in mid-browse.
+                let result = try await browseClient.browse(for: query)
                 items = result.items
                 hasNext = result.hasNext
                 isLoading = false
@@ -414,6 +642,7 @@ struct SteamWorkshopBrowseSheet: View {
     private func loadSingle(_ id: String) {
         isLoading = true
         loadError = nil
+        items = []
         Task { @MainActor in
             do {
                 let item = try await browseClient.lookup(itemID: id)

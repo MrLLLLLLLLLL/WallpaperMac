@@ -33,6 +33,14 @@ public struct WorkshopBrowseItem: Identifiable, Equatable, Sendable {
         return .unknown
     }
 
+    /// Steam attaches exactly one of these to every Workshop item.
+    public var ageRating: WorkshopAgeRating? {
+        if tags.contains("Everyone") { return .everyone }
+        if tags.contains("Questionable") { return .questionable }
+        if tags.contains("Mature") { return .mature }
+        return nil
+    }
+
     /// v1 can import only video and web items.
     public var isImportable: Bool {
         kind == .video || kind == .web
@@ -87,35 +95,26 @@ public actor WorkshopBrowseClient {
         self.metadataClient = metadataClient
     }
 
-    /// Builds the public browse URL. `kindFilter` maps to Steam's requiredtags
-    /// (AND semantics) — pass a single type or nil for all types.
-    public static func browseURL(
-        search: String,
-        page: Int,
-        kindFilter: WorkshopKind?
-    ) -> URL {
+    /// Builds the public browse URL from a query. `kindFilter` maps to Steam's
+    /// requiredtags (AND semantics); excluded types go to `excludedtags[]`.
+    public static func browseURL(for query: WorkshopBrowseQuery) -> URL {
         var items: [(String, String)] = [
             ("appid", String(appID)),
             ("section", "readytouseitems"),
-            ("browsesort", "trend"),
-            ("days", "30"),
-            ("searchtext", search),
-            ("p", String(max(1, page))),
+            ("browsesort", query.sort.rawValue),
+            ("days", String(query.sort.days)),
+            ("searchtext", query.search),
+            ("p", String(query.page)),
             ("numperpage", String(pageSize)),
             ("l", "english")
         ]
-        if let kindFilter {
-            let tag: String = switch kindFilter {
-            case .video: "Video"
-            case .web: "Web"
-            case .scene: "Scene"
-            case .application: "Application"
-            case .unknown: ""
-            }
-            if !tag.isEmpty {
-                items.append(("requiredtags[]", tag))
-            }
+        if let tag = query.kindTag {
+            items.append(("requiredtags[]", tag))
         }
+        if let rating = query.ageRating {
+            items.append(("requiredtags[]", rating.rawValue))
+        }
+        items.append(contentsOf: query.excludedKindTags.map { ("excludedtags[]", $0) })
         let unreserved = CharacterSet(
             charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
         )
@@ -128,6 +127,19 @@ public actor WorkshopBrowseClient {
                 + (value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? "")
         }.joined(separator: "&")
         return components.url!
+    }
+
+    /// Convenience wrapper kept for call sites that only need type filtering.
+    public static func browseURL(
+        search: String,
+        page: Int,
+        kindFilter: WorkshopKind?
+    ) -> URL {
+        browseURL(for: WorkshopBrowseQuery(
+            search: search,
+            kindFilter: kindFilter,
+            page: page
+        ))
     }
 
     /// Extracts published-file ids from a browse page in document order.
@@ -188,7 +200,14 @@ public actor WorkshopBrowseClient {
         page: Int,
         kindFilter: WorkshopKind?
     ) async throws -> WorkshopBrowsePage {
-        let url = Self.browseURL(search: search, page: page, kindFilter: kindFilter)
+        try await browse(for: WorkshopBrowseQuery(search: search, kindFilter: kindFilter, page: page))
+    }
+
+    /// One browse page for a full query (sort, age rating, exclusions).
+    public func browse(
+        for query: WorkshopBrowseQuery
+    ) async throws -> WorkshopBrowsePage {
+        let url = Self.browseURL(for: query)
         var request = URLRequest(url: url)
         request.timeoutInterval = 25
         request.setValue(
@@ -215,13 +234,13 @@ public actor WorkshopBrowseClient {
         guard !ids.isEmpty else {
             // First page with no ids is a layout/network problem; later pages
             // legitimately run out of results.
-            if page <= 1 { throw BrowseError.layoutChanged }
-            return WorkshopBrowsePage(items: [], page: page, hasNext: false)
+            if query.page <= 1 { throw BrowseError.layoutChanged }
+            return WorkshopBrowsePage(items: [], page: query.page, hasNext: false)
         }
 
         let tiles = try await enrich(ids: ids)
-        let hasNext = Self.hasNextPage(html: pageHTML, currentPage: page) && tiles.count > 1
-        return WorkshopBrowsePage(items: tiles, page: page, hasNext: hasNext)
+        let hasNext = Self.hasNextPage(html: pageHTML, currentPage: query.page) && tiles.count > 1
+        return WorkshopBrowsePage(items: tiles, page: query.page, hasNext: hasNext)
     }
 
     /// Looks up a single item (paste-a-link path) as a page of one.

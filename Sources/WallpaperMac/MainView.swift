@@ -1007,13 +1007,15 @@ final class LibraryViewModel: ObservableObject {
         }
 
         // Apply the workshop title when the importer fell back to a raw
-        // filename / numeric id (store worker is an actor — await off main).
+        // filename / numeric id. update(item:) merges into the existing index;
+        // save(items:) would *replace* wallpapers.json with this one row and
+        // erase every previously imported wallpaper.
         if let title = plan.titleOverride,
            let imported = importResult.snapshot.items.first(where: { importResult.importedIDs.contains($0.id) }),
            imported.name != title {
             var renamed = imported
             renamed.name = title
-            if (try? await worker.save(items: [renamed])) != nil,
+            if (try? await worker.update(item: renamed)) != nil,
                let refreshed = try? await worker.snapshot() {
                 await MainActor.run { [weak self] in
                     guard let self, self.isCurrentLibrarySession(session) else { return }

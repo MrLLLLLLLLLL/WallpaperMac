@@ -1935,6 +1935,97 @@ func testSteamLoginGateNeverRepromptsAfterDismiss() throws {
     )
 }
 
+func testRenameUpdateKeepsOtherWallpapers() throws {
+    // Regression: the workshop title-override rename must not wipe the rest
+    // of the library. save(items: [one]) is a full replace; update(item:) merges.
+    let fixture = try Fixture()
+    let first = WallpaperItem(
+        id: UUID(), name: "existing", type: .image,
+        sourceURL: fixture.root.appendingPathComponent("a.jpg"),
+        storageMode: .externalReference
+    )
+    let second = WallpaperItem(
+        id: UUID(), name: "imported", type: .image,
+        sourceURL: fixture.root.appendingPathComponent("b.jpg"),
+        storageMode: .externalReference
+    )
+    try fixture.store.save(items: [first, second])
+
+    var renamed = second
+    renamed.name = "Workshop Title"
+    _ = try fixture.store.update(item: renamed)
+
+    let items = try fixture.store.items()
+    try expect(items.count, equals: 2, "rename via update must keep every wallpaper")
+    try expect(
+        items.first(where: { $0.id == first.id })?.name,
+        equals: "existing",
+        "unrelated wallpaper must survive"
+    )
+    try expect(
+        items.first(where: { $0.id == second.id })?.name,
+        equals: "Workshop Title",
+        "renamed wallpaper must keep the new title"
+    )
+}
+
+func testWorkshopBrowseQueryBuildsSortAndRating() throws {
+    let base = WorkshopBrowseQuery()
+    try expect(base.kindTag, equals: nil, "no type filter by default")
+    try expect(base.excludedKindTags, equals: ["Application"], "hides Application by default")
+    try expect(base.sort, equals: .trending, "default sort trending")
+
+    // Type filter pins the type and suppresses sibling exclusions.
+    let video = WorkshopBrowseQuery(kindFilter: .video, sort: .topRated)
+    try expect(video.kindTag, equals: "Video", "video tag")
+    try expect(video.excludedKindTags, equals: [], "no exclusions when a type is pinned")
+    let videoURL = WorkshopBrowseClient.browseURL(for: video)
+    let videoString = videoURL.absoluteString
+    try expect(videoString.contains("browsesort=toprated"), equals: true, "sort in URL")
+    try expect(
+        videoString.contains("requiredtags%5B%5D=Video") || videoString.contains("requiredtags[]=Video"),
+        equals: true,
+        "video requiredtag"
+    )
+
+    // Age rating adds a second required tag; exclusions survive when no type pin.
+    let rated = WorkshopBrowseQuery(ageRating: .everyone)
+    let ratedURL = WorkshopBrowseClient.browseURL(for: rated)
+    let ratedString = ratedURL.absoluteString
+    try expect(
+        ratedString.contains("Everyone"),
+        equals: true,
+        "age rating in requiredtags"
+    )
+    try expect(
+        ratedString.contains("excludedtags%5B%5D=Application") || ratedString.contains("excludedtags[]=Application"),
+        equals: true,
+        "Application excluded alongside rating"
+    )
+
+    // Page clamps to 1.
+    try expect(WorkshopBrowseQuery(page: 0).page, equals: 1, "page clamped")
+}
+
+func testWorkshopBrowseItemAgeRatingFromTags() throws {
+    let everyone = WorkshopBrowseItem(
+        id: "1", title: "a", previewURL: nil,
+        tags: ["Video", "Everyone"], fileSizeBytes: nil, itemDescription: ""
+    )
+    try expect(everyone.ageRating, equals: .everyone, "Everyone tag")
+    let mature = WorkshopBrowseItem(
+        id: "2", title: "b", previewURL: nil,
+        tags: ["Video", "Mature"], fileSizeBytes: nil, itemDescription: ""
+    )
+    try expect(mature.ageRating, equals: .mature, "Mature tag")
+    try expect(mature.isImportable, equals: true, "rating does not block import")
+    let none = WorkshopBrowseItem(
+        id: "3", title: "c", previewURL: nil,
+        tags: ["Video"], fileSizeBytes: nil, itemDescription: ""
+    )
+    try expect(none.ageRating, equals: nil, "missing rating tag is nil")
+}
+
 let tests: [(String, () throws -> Void)] = [
     ("wallpaper metadata round trips", testWallpaperMetadataRoundTrips),
     ("legacy wallpaper JSON without metadata decodes", testLegacyWallpaperJSONWithoutMetadataDecodes),
@@ -2126,8 +2217,11 @@ let tests: [(String, () throws -> Void)] = [
     ("workshop metadata rejects non-numeric ids", testWorkshopMetadataRejectsNonNumericItemID),
     ("coordinator rejects traversal item ids", { try runAsyncTest { try await testWorkshopDownloadCoordinatorRejectsTraversalItemID() } }),
     ("workshop plan exposes title override", testWorkshopPlanTitleOverride),
+    ("rename update keeps other wallpapers", testRenameUpdateKeepsOtherWallpapers),
     ("resolve entry blocks symlink escape", testResolveEntryBlocksSymlinkEscape),
     ("builds workshop browse urls", testWorkshopBrowseURLBuildsFiltersAndPaging),
+    ("builds browse query sort and rating", testWorkshopBrowseQueryBuildsSortAndRating),
+    ("parses age rating from tags", testWorkshopBrowseItemAgeRatingFromTags),
     ("extracts workshop browse ids from html", testWorkshopBrowseItemIDsFromHTMLMarkers),
     ("maps browse item kinds from tags", testWorkshopBrowseItemKindFromTags),
     ("steam session store login state and logout", testSteamSessionStoreLoginStateAndLogout),
