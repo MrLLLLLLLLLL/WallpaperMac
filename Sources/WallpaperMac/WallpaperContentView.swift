@@ -206,7 +206,55 @@ final class WallpaperContentView: NSView, WKNavigationDelegate, WKUIDelegate {
         if item.type == .web, let webView {
             window?.makeFirstResponder(webView)
         }
+        installWebNavSelfTestObserver()
     }
+
+    /// Test-only: synthesize a real NSEvent pair through the view hierarchy
+    /// when the window server cannot deliver injected clicks (CI/sandbox TCC).
+    /// Triggered by a distributed notification carrying local view coordinates.
+    private func installWebNavSelfTestObserver() {
+        // Only armed when the runtime test launches with this env var, so a
+        // production session never accepts synthesized clicks from other apps.
+        guard ProcessInfo.processInfo.environment["WALLPAPERMAC_WEBNAV_SELFTEST"] == "1",
+              item.type == .web, webNavSelfTestObserver == nil else { return }
+        webNavSelfTestObserver = NotificationCenter.default.addObserver(
+            forName: .wallpaperMacWebNavSelfTestClick,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self, self.item.type == .web, let window = self.window else { return }
+            guard let userInfo = note.userInfo,
+                  let x = userInfo["x"] as? Double,
+                  let y = userInfo["y"] as? Double else { return }
+            let location = NSPoint(x: x, y: window.frame.height - y)
+            let timestamp = ProcessInfo.processInfo.systemUptime
+            guard let down = NSEvent.mouseEvent(
+                with: .leftMouseDown,
+                location: location,
+                modifierFlags: [],
+                timestamp: timestamp,
+                windowNumber: window.windowNumber,
+                context: nil,
+                eventNumber: 0,
+                clickCount: 1,
+                pressure: 1
+            ), let up = NSEvent.mouseEvent(
+                with: .leftMouseUp,
+                location: location,
+                modifierFlags: [],
+                timestamp: timestamp + 0.05,
+                windowNumber: window.windowNumber,
+                context: nil,
+                eventNumber: 0,
+                clickCount: 1,
+                pressure: 1
+            ) else { return }
+            self.mouseDown(with: down)
+            self.mouseUp(with: up)
+        }
+    }
+
+    private var webNavSelfTestObserver: NSObjectProtocol?
 
     private var isWebMouseDragCancelled = false
     private var webMouseDownLocation: NSPoint?

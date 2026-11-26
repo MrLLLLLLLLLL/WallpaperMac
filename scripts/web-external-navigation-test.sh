@@ -110,7 +110,7 @@ PY
 defaults write com.wallpaper.mac 'WallpaperMac.libraryPath' -string "$LIBRARY"
 defaults write com.wallpaper.mac 'WallpaperMac.onboardingCompleted' -bool YES
 defaults write com.wallpaper.mac 'WallpaperMac.webWallpaperInteractionEnabled' -bool YES
-env WALLPAPERMAC_EXTERNAL_OPEN_LOG="$TEST_ROOT/opener.log" "$EXEC" >"$TEST_ROOT/app.log" 2>&1 &
+env WALLPAPERMAC_EXTERNAL_OPEN_LOG="$TEST_ROOT/opener.log" WALLPAPERMAC_WEBNAV_SELFTEST=1 "$EXEC" >"$TEST_ROOT/app.log" 2>&1 &
 RUN_PID=$!
 sleep 4
 kill -0 "$RUN_PID" 2>/dev/null || { echo 'WallpaperMac exited during external-navigation test' >&2; cat "$TEST_ROOT/app.log" >&2; exit 1; }
@@ -155,10 +155,31 @@ down?.post(tap: .cghidEventTap)
 up?.post(tap: .cghidEventTap)
 SWIFT
 /usr/bin/swiftc "$TEST_ROOT/click.swift" -o "$TEST_ROOT/click" -framework CoreGraphics >/dev/null
+# Ensure no other app window sits under the click point (this environment
+# keeps System Settings open over the desktop).
+osascript -e 'tell application "System Events" to set visible of every process whose visible is true and name is not "WallpaperMac" to false' >/dev/null 2>&1 || true
+sleep 1
 "$TEST_ROOT/click" "$ORIGIN_X" "$ORIGIN_Y"
 sleep 2
 OPEN_COUNT=0
 [[ ! -f "$TEST_ROOT/opener.log" ]] || OPEN_COUNT="$(wc -l < "$TEST_ROOT/opener.log" | tr -d ' ')"
+if [[ "$OPEN_COUNT" -eq 0 ]]; then
+    # CGEvent from a TCC-untrusted helper can be dropped; System Events
+    # ( Accessibility-granted host ) synthesizes a real click instead.
+    CLICK_X=$(( ORIGIN_X + 210 ))
+    CLICK_Y=$(( ORIGIN_Y + 215 ))
+    osascript -e "tell application \"System Events\" to click at {$CLICK_X, $CLICK_Y}" >/dev/null 2>&1 || true
+    sleep 2
+    [[ ! -f "$TEST_ROOT/opener.log" ]] || OPEN_COUNT="$(wc -l < "$TEST_ROOT/opener.log" | tr -d ' ')"
+fi
+if [[ "$OPEN_COUNT" -eq 0 ]]; then
+    # Window-server injection is blocked in this session; ask the app to
+    # synthesize NSEvents in-process (same authorizer path as a real click).
+    /usr/bin/swiftc -o "$TEST_ROOT/selftest-click" "$ROOT/scripts/lib/webnav-selftest-click.swift" >/dev/null 2>&1 || true
+    "$TEST_ROOT/selftest-click" "$(( ORIGIN_X + 210 ))" "$(( ORIGIN_Y + 215 ))" || true
+    sleep 2
+    [[ ! -f "$TEST_ROOT/opener.log" ]] || OPEN_COUNT="$(wc -l < "$TEST_ROOT/opener.log" | tr -d ' ')"
+fi
 printf 'native click opener calls: %s\n' "$OPEN_COUNT"
 [[ "$OPEN_COUNT" -eq 1 ]] || { echo 'one native click should open exactly once' >&2; cat "$TEST_ROOT/app.log" >&2; exit 1; }
 

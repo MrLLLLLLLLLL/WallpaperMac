@@ -2307,6 +2307,106 @@ if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--steamcmd-ins
     exit(0)
 }
 
+
+// Real-machine Steam login + workshop download smoke. Credentials come from
+// the environment only (WALLPAPERMAC_STEAM_USER / WALLPAPERMAC_STEAM_PASS)
+// and are never written to disk or argv.
+if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--steam-live-test" {
+    let itemID = CommandLine.arguments[2]
+    guard let user = ProcessInfo.processInfo.environment["WALLPAPERMAC_STEAM_USER"],
+          let pass = ProcessInfo.processInfo.environment["WALLPAPERMAC_STEAM_PASS"],
+          !user.isEmpty, !pass.isEmpty else {
+        FileHandle.standardError.write(Data("STEAM_LIVE_MISSING_CREDENTIALS\n".utf8))
+        exit(2)
+    }
+    let semaphore = DispatchSemaphore(value: 0)
+    Task {
+        do {
+            let coordinator = WorkshopDownloadCoordinator()
+            let context = WorkshopDownloadCoordinator.Context(
+                rootDirectory: WorkshopDownloadCoordinator.defaultRootDirectory(),
+                credentials: .init(username: user, password: pass, steamGuardCode: nil)
+            )
+            print("STEAM_LIVE_ENSURE_STEAMCMD")
+            fflush(stdout)
+            let plan = try await coordinator.downloadAndPlan(itemID: itemID, context: context) { phase in
+                switch phase {
+                case .installingSteamCMD(let state):
+                    if case .ready = state { print("STEAM_LIVE_STEAMCMD_READY") }
+                case .downloading(let status, let fraction):
+                    if let status {
+                        let pct = fraction.map { String(Int($0 * 100)) + "%" } ?? "-"
+                        print("STEAM_LIVE_PROGRESS \(pct) \(status)")
+                    }
+                default:
+                    break
+                }
+                fflush(stdout)
+            }
+            // Import into an isolated temp library (full end-to-end).
+            let tempRoot = FileManager.default.temporaryDirectory
+                .appendingPathComponent("wm-live-e2e-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: tempRoot.appendingPathComponent("Library"),
+                withIntermediateDirectories: true
+            )
+            let worker = WallpaperStoreWorker(
+                libraryURL: tempRoot.appendingPathComponent("Library", isDirectory: true)
+            )
+
+            switch plan {
+            case .video(let source, let title):
+                print("STEAM_LIVE_PLAN video title=\(title) source=\(source.lastPathComponent)")
+                let result = try await worker.importItems(
+                    at: [source], entryURL: nil, storageMode: .managedCopy
+                )
+                print("STEAM_LIVE_IMPORT ids=\(result.importedIDs.count) failures=\(result.failures)")
+                guard let id = result.importedIDs.first else {
+                    FileHandle.standardError.write(Data("STEAM_LIVE_IMPORT_EMPTY\n".utf8))
+                    exit(1)
+                }
+                let items = try await worker.snapshot().items
+                let item = items.first { $0.id == id }
+                print("STEAM_LIVE_ITEM name=\(item?.name ?? "?") type=\(item?.type.rawValue ?? "?")")
+                let exists = item.map { FileManager.default.fileExists(atPath: $0.sourceURL.path) } ?? false
+                print("STEAM_LIVE_ASSET_EXISTS \(exists)")
+                guard exists else {
+                    FileHandle.standardError.write(Data("STEAM_LIVE_ASSET_MISSING\n".utf8))
+                    exit(1)
+                }
+            case .webProject(let dir, let entry, let title):
+                print("STEAM_LIVE_PLAN web title=\(title) entry=\(entry)")
+                let entryURL = WorkshopImportPlanner.resolveEntry(entry, in: dir)
+                let result = try await worker.importItems(
+                    at: [dir], entryURL: entryURL, storageMode: .managedCopy
+                )
+                print("STEAM_LIVE_IMPORT ids=\(result.importedIDs.count) failures=\(result.failures)")
+                guard result.importedIDs.first != nil else {
+                    FileHandle.standardError.write(Data("STEAM_LIVE_IMPORT_EMPTY\n".utf8))
+                    exit(1)
+                }
+            case .unsupported(let reason):
+                print("STEAM_LIVE_UNSUPPORTED \(reason.userMessage)")
+                print("STEAM_LIVE_DOWNLOAD_FAILED_UNSUPPORTED")
+                exit(1)
+            }
+            fflush(stdout)
+            try? FileManager.default.removeItem(at: context.stagingDirectory.appendingPathComponent(itemID))
+            try? FileManager.default.removeItem(at: tempRoot)
+            print("STEAM_LIVE_DOWNLOAD_PASSED")
+            exit(0)
+        } catch let error as SteamCMDFailure {
+            FileHandle.standardError.write(Data("STEAM_LIVE_FAILURE \(error.userMessage)\n".utf8))
+            exit(1)
+        } catch {
+            FileHandle.standardError.write(Data("STEAM_LIVE_ERROR \(error)\n".utf8))
+            exit(1)
+        }
+    }
+    semaphore.wait()
+    exit(0)
+}
+
 var failures = 0
 for (name, test) in tests {
     do {

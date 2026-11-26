@@ -97,39 +97,45 @@ actor SteamLoginService {
         let stdinHandle = stdinPipe.fileHandleForWriting
         let answered = LoginAnswered()
 
+        let parserBox = LoginParserBox(parser)
         let reader = Task {
-            let handle = stdoutPipe.fileHandleForReading
-            while true {
-                let chunk = handle.availableData
-                if chunk.isEmpty { break }
-                let text = String(data: chunk, encoding: .utf8)
-                    ?? String(decoding: chunk, as: UTF8.self)
-                for event in parser.consume(text) {
-                    switch event {
-                    case .prompt(.password):
-                        if answered.markPassword() {
-                            var data = Data(credentials.password.utf8)
-                            data.append(0x0A)
-                            try? stdinHandle.write(contentsOf: data)
-                        }
-                    case .prompt(.steamGuard):
-                        if let code = credentials.steamGuardCode, answered.markGuard() {
-                            var data = Data(code.utf8)
-                            data.append(0x0A)
-                            try? stdinHandle.write(contentsOf: data)
-                        } else if credentials.steamGuardCode == nil {
-                            // No code supplied: abort rather than hang.
-                            if answered.markGuard() {
-                                answered.markGuardMissing()
-                                process.terminate()
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                let handle = stdoutPipe.fileHandleForReading
+                handle.readabilityHandler = { h in
+                    let chunk = h.availableData
+                    if chunk.isEmpty {
+                        h.readabilityHandler = nil
+                        cont.resume()
+                        return
+                    }
+                    let text = String(data: chunk, encoding: .utf8)
+                        ?? String(decoding: chunk, as: UTF8.self)
+                    for event in parserBox.parser.consume(text) {
+                        switch event {
+                        case .prompt(.password):
+                            if answered.markPassword() {
+                                var data = Data(credentials.password.utf8)
+                                data.append(0x0A)
+                                try? stdinHandle.write(contentsOf: data)
                             }
+                        case .prompt(.steamGuard):
+                            if let code = credentials.steamGuardCode, answered.markGuard() {
+                                var data = Data(code.utf8)
+                                data.append(0x0A)
+                                try? stdinHandle.write(contentsOf: data)
+                            } else if credentials.steamGuardCode == nil {
+                                if answered.markGuard() {
+                                    answered.markGuardMissing()
+                                    process.terminate()
+                                }
+                            }
+                        default:
+                            break
                         }
-                    default:
-                        break
                     }
                 }
             }
-            for event in parser.finish() {
+            for event in parserBox.parser.finish() {
                 if case .prompt(.password) = event, answered.markPassword() {
                     var data = Data(credentials.password.utf8)
                     data.append(0x0A)
@@ -140,10 +146,14 @@ actor SteamLoginService {
 
         // Drain stderr so the child cannot block on a full pipe.
         let stderrReader = Task {
-            let handle = stderrPipe.fileHandleForReading
-            while true {
-                let chunk = handle.availableData
-                if chunk.isEmpty { break }
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                let handle = stderrPipe.fileHandleForReading
+                handle.readabilityHandler = { h in
+                    if h.availableData.isEmpty {
+                        h.readabilityHandler = nil
+                        cont.resume()
+                    }
+                }
             }
         }
 
@@ -230,4 +240,9 @@ private final class LoginAnswered: @unchecked Sendable {
         guardMissing = true
         lock.unlock()
     }
+}
+
+private final class LoginParserBox: @unchecked Sendable {
+    let parser: SteamCMDOutputParser
+    init(_ parser: SteamCMDOutputParser) { self.parser = parser }
 }

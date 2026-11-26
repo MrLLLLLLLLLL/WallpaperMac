@@ -1051,4 +1051,7 @@ extension Notification.Name {
     static let wallpaperMacRequestLibraryMigration = Notification.Name("WallpaperMacRequestLibraryMigration")
     static let wallpaperMacShowDisplaysOverview = Notification.Name("WallpaperMacShowDisplaysOverview")
     static let wallpaperMacShowSteamWorkshopBrowse = Notification.Name("WallpaperMacShowSteamWorkshopBrowse")
+    /// Test-only: in-process click synthesis when window-server injection is blocked.
+    static let wallpaperMacWebNavSelfTestClick = Notification.Name("WallpaperMacWebNavSelfTestClick")
+    static let wallpaperMacWebNavSelfTestDistributed = Notification.Name("WallpaperMacWebNavSelfTestClick")
 }

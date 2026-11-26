@@ -82,17 +82,18 @@ struct SteamWorkshopBrowseSheet: View {
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 40)
             } else {
-                ScrollView {
-                    LazyVGrid(
-                        columns: [GridItem(.adaptive(minimum: 160), spacing: 12)],
-                        spacing: 12
-                    ) {
-                        ForEach(items) { item in
-                            browseTile(item)
-                        }
+                // LazyVGrid must own the scroll region: wrapping it in a
+                // ScrollView disables cell laziness and decodes every
+                // preview at once (visible as UI stutter).
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 160), spacing: 12)],
+                    spacing: 12
+                ) {
+                    ForEach(items) { item in
+                        browseTile(item)
                     }
-                    .padding(.vertical, 4)
                 }
+                .padding(.vertical, 4)
                 .frame(maxHeight: 380)
 
                 HStack {

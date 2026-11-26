@@ -105,16 +105,24 @@ public actor SteamCMDSession {
         let group = AsyncStream<SteamCMDOutputParser.Event>.makeStream()
         let parserRef = ParserBox(parser)
 
-        // stdout reader
+        // Readers use readabilityHandler on FileHandle's private queue so a
+        // quiet SteamCMD never parks a Swift cooperative thread inside
+        // blocking availableData (that starves the pool and stutters UI).
         let stdoutTask = Task {
-            let handle = stdoutPipe.fileHandleForReading
-            while true {
-                let chunk = handle.availableData
-                if chunk.isEmpty { break }
-                let text = String(data: chunk, encoding: .utf8)
-                    ?? String(decoding: chunk, as: UTF8.self)
-                for event in parserRef.parser.consume(text) {
-                    group.continuation.yield(event)
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                let handle = stdoutPipe.fileHandleForReading
+                handle.readabilityHandler = { h in
+                    let chunk = h.availableData
+                    if chunk.isEmpty {
+                        h.readabilityHandler = nil
+                        cont.resume()
+                        return
+                    }
+                    let text = String(data: chunk, encoding: .utf8)
+                        ?? String(decoding: chunk, as: UTF8.self)
+                    for event in parserRef.parser.consume(text) {
+                        group.continuation.yield(event)
+                    }
                 }
             }
             for event in parserRef.parser.finish() {
@@ -125,15 +133,21 @@ public actor SteamCMDSession {
 
         // stderr reader (status only; failures mostly come from stdout)
         let stderrTask = Task {
-            let handle = stderrPipe.fileHandleForReading
-            while true {
-                let chunk = handle.availableData
-                if chunk.isEmpty { break }
-                let text = String(data: chunk, encoding: .utf8)
-                    ?? String(decoding: chunk, as: UTF8.self)
-                stderrBuffer.append(text)
-                for event in parserRef.parser.consume(text) {
-                    group.continuation.yield(event)
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                let handle = stderrPipe.fileHandleForReading
+                handle.readabilityHandler = { h in
+                    let chunk = h.availableData
+                    if chunk.isEmpty {
+                        h.readabilityHandler = nil
+                        cont.resume()
+                        return
+                    }
+                    let text = String(data: chunk, encoding: .utf8)
+                        ?? String(decoding: chunk, as: UTF8.self)
+                    stderrBuffer.append(text)
+                    for event in parserRef.parser.consume(text) {
+                        group.continuation.yield(event)
+                    }
                 }
             }
         }

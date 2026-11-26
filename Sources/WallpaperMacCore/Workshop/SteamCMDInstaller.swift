@@ -282,7 +282,7 @@ public actor SteamCMDInstaller {
             }
 
             onState?(.extracting(package: package.name))
-            try extract(zip: zipURL, into: staging)
+            try await extract(zip: zipURL, into: staging)
         }
 
         onState?(.committing)
@@ -381,7 +381,7 @@ public actor SteamCMDInstaller {
     /// breakpad package stores Windows backslash paths — normalize after.
     /// stderr goes to a temp file (never a pipe) so a verbose archive cannot
     /// deadlock `waitUntilExit`, matching `ProcessRunner`'s rule.
-    private func extract(zip: URL, into directory: URL) throws {
+    private func extract(zip: URL, into directory: URL) async throws {
         let stderrURL = fileManager.temporaryDirectory
             .appendingPathComponent("wm-steamcmd-extract-\(UUID().uuidString).log")
         fileManager.createFile(atPath: stderrURL.path, contents: nil)
@@ -401,22 +401,33 @@ public actor SteamCMDInstaller {
             throw InstallError.extractionFailed(error.localizedDescription)
         }
 
-        let deadline = Date().addingTimeInterval(120)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.02)
-        }
-        if process.isRunning {
-            process.terminate()
-            let killDeadline = Date().addingTimeInterval(2)
-            while process.isRunning && Date() < killDeadline {
-                Thread.sleep(forTimeInterval: 0.02)
-            }
-            if process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
-                while process.isRunning {
-                    Thread.sleep(forTimeInterval: 0.02)
+        // Wait off the cooperative pool: extract can take seconds and a
+        // Thread.sleep loop here would stutter every other async task.
+        let waited = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            DispatchQueue.global(qos: .utility).async {
+                let deadline = Date().addingTimeInterval(120)
+                while process.isRunning && Date() < deadline {
+                    Thread.sleep(forTimeInterval: 0.05)
                 }
+                if process.isRunning {
+                    process.terminate()
+                    let killDeadline = Date().addingTimeInterval(2)
+                    while process.isRunning && Date() < killDeadline {
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
+                    if process.isRunning {
+                        kill(process.processIdentifier, SIGKILL)
+                        while process.isRunning {
+                            Thread.sleep(forTimeInterval: 0.05)
+                        }
+                    }
+                    cont.resume(returning: false)
+                    return
+                }
+                cont.resume(returning: true)
             }
+        }
+        guard waited else {
             throw InstallError.extractionFailed("解压超时")
         }
         guard process.terminationStatus == 0 else {

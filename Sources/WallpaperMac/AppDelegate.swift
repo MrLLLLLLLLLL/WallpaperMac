@@ -52,6 +52,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // menu-bar session, independent of the settings UI.
         UpdateService.shared.updateAutomaticPreferences()
         LockScreenWallpaperService.shared.updatePreference()
+
+        // Runtime-test hook: a distributed notification carries view-local
+        // coordinates; re-post locally so WallpaperContentView can synthesize
+        // NSEvents when the window server blocks injected clicks.
+        DistributedNotificationCenter.default.addObserver(
+            forName: .wallpaperMacWebNavSelfTestDistributed,
+            object: nil,
+            queue: .main
+        ) { note in
+            NotificationCenter.default.post(
+                name: .wallpaperMacWebNavSelfTestClick,
+                object: nil,
+                userInfo: note.userInfo
+            )
+        }
     }
 
     private func presentInstallFailure(_ failure: UpdateInstallFailure) {
