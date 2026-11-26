@@ -138,27 +138,25 @@ struct SteamWorkshopBrowseSheet: View {
         }
         .sheet(isPresented: $needsLogin, onDismiss: {
             Task { @MainActor in
-                if loginSheetCancelled {
-                    // Closing/cancelling the gate login also closes browse.
-                    loginSheetCancelled = false
-                    dismiss()
-                    return
-                }
-                if loginSheetCompleted {
-                    loginSheetCompleted = false
-                    if items.isEmpty && !isLoading {
-                        reload()
-                    }
-                    return
-                }
-                // Sheet dismissed without an explicit outcome (swipe, etc.):
-                // treat as cancel so we never loop the login prompt.
+                let succeeded = loginSheetCompleted
+                let cancelled = loginSheetCancelled
+                loginSheetCompleted = false
+                loginSheetCancelled = false
                 let loggedIn = await loginService.isLoggedIn
-                if loggedIn {
+                switch SteamLoginGate.decide(
+                    isLoggedIn: loggedIn,
+                    sheetDismissed: true,
+                    loginSucceeded: succeeded,
+                    loginCancelled: cancelled
+                ) {
+                case .showLogin:
+                    // Never re-enter from onDismiss — that was the loop.
+                    break
+                case .continueBrowsing:
                     if items.isEmpty && !isLoading {
                         reload()
                     }
-                } else {
+                case .closeBrowse:
                     dismiss()
                 }
             }
@@ -350,7 +348,13 @@ struct SteamWorkshopBrowseSheet: View {
 
     private func ensureLoginThenBrowse() async {
         let loggedIn = await loginService.isLoggedIn
-        if !loggedIn {
+        switch SteamLoginGate.decide(
+            isLoggedIn: loggedIn,
+            sheetDismissed: false,
+            loginSucceeded: false,
+            loginCancelled: false
+        ) {
+        case .showLogin:
             // Only prompt once per gate; onDismiss owns the follow-up so a
             // closed login sheet cannot re-enter this path and loop.
             if !needsLogin {
@@ -358,10 +362,12 @@ struct SteamWorkshopBrowseSheet: View {
                 loginSheetCancelled = false
                 needsLogin = true
             }
-            return
-        }
-        if items.isEmpty && !isLoading {
-            reload()
+        case .continueBrowsing:
+            if items.isEmpty && !isLoading {
+                reload()
+            }
+        case .closeBrowse:
+            dismiss()
         }
     }
 

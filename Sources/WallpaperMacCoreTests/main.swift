@@ -1884,6 +1884,57 @@ func testSteamSessionMarkerFlipsLoginImmediately() throws {
     try expect(store.isLoggedIn(configuration: config), equals: false, "logout clears marker")
 }
 
+func testSteamLoginGateNeverRepromptsAfterDismiss() throws {
+    // First open, not logged in → show login.
+    try expect(
+        SteamLoginGate.decide(isLoggedIn: false, sheetDismissed: false, loginSucceeded: false, loginCancelled: false),
+        equals: .showLogin,
+        "first open prompts"
+    )
+    // Already logged in → browse, no sheet.
+    try expect(
+        SteamLoginGate.decide(isLoggedIn: true, sheetDismissed: false, loginSucceeded: false, loginCancelled: false),
+        equals: .continueBrowsing,
+        "logged in continues"
+    )
+    // Login succeeded then sheet dismissed → continue, never showLogin (the loop bug).
+    try expect(
+        SteamLoginGate.decide(isLoggedIn: true, sheetDismissed: true, loginSucceeded: true, loginCancelled: false),
+        equals: .continueBrowsing,
+        "success continues"
+    )
+    // Success flag set even if isLoggedIn check lags → still continue (marker race).
+    try expect(
+        SteamLoginGate.decide(isLoggedIn: false, sheetDismissed: true, loginSucceeded: true, loginCancelled: false),
+        equals: .continueBrowsing,
+        "success flag wins over lagging isLoggedIn"
+    )
+    // Cancel closes browse, never re-shows login.
+    try expect(
+        SteamLoginGate.decide(isLoggedIn: false, sheetDismissed: true, loginSucceeded: false, loginCancelled: true),
+        equals: .closeBrowse,
+        "cancel closes browse"
+    )
+    // Swipe dismiss without outcome and still logged out → close browse (no loop).
+    try expect(
+        SteamLoginGate.decide(isLoggedIn: false, sheetDismissed: true, loginSucceeded: false, loginCancelled: false),
+        equals: .closeBrowse,
+        "orphan dismiss closes browse"
+    )
+    // Swipe dismiss after already logged in → continue.
+    try expect(
+        SteamLoginGate.decide(isLoggedIn: true, sheetDismissed: true, loginSucceeded: false, loginCancelled: false),
+        equals: .continueBrowsing,
+        "orphan dismiss when logged in continues"
+    )
+    // Cancel must win even if somehow also marked success.
+    try expect(
+        SteamLoginGate.decide(isLoggedIn: true, sheetDismissed: true, loginSucceeded: true, loginCancelled: true),
+        equals: .closeBrowse,
+        "explicit cancel wins"
+    )
+}
+
 let tests: [(String, () throws -> Void)] = [
     ("wallpaper metadata round trips", testWallpaperMetadataRoundTrips),
     ("legacy wallpaper JSON without metadata decodes", testLegacyWallpaperJSONWithoutMetadataDecodes),
@@ -2081,6 +2132,7 @@ let tests: [(String, () throws -> Void)] = [
     ("maps browse item kinds from tags", testWorkshopBrowseItemKindFromTags),
     ("steam session store login state and logout", testSteamSessionStoreLoginStateAndLogout),
     ("steam session marker flips login immediately", testSteamSessionMarkerFlipsLoginImmediately),
+    ("steam login gate never reprompts after dismiss", testSteamLoginGateNeverRepromptsAfterDismiss),
     ("steam login command keeps password out of argv", testSteamLoginCommandNeverPutsPasswordInArgv),
     ("metadata parseAll drops bad rows", testMetadataParserParseAllDropsBadRows),
     ("keeps deleted placeholders across reorder", testQueueReorderKeepsDeletedPlaceholders)
