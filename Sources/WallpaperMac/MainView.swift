@@ -995,8 +995,10 @@ final class LibraryViewModel: ObservableObject {
                 entryURL: entry,
                 storageMode: .managedCopy
             )
-        case .unsupported:
-            throw WorkshopUnsupportedReason.unknownType(nil)
+        case .unsupported(let reason):
+            // Surface the real reason (missing entry, wrong type, scene…)
+            // instead of collapsing everything into "unknown type".
+            throw reason
         }
 
         // Apply the workshop title when the importer fell back to a raw

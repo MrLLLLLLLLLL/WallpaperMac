@@ -1193,6 +1193,93 @@ func testWorkshopProjectManifestParsesVideoAndWeb() throws {
     try expect(unknown.kind, equals: .unknown, "missing type is unknown")
 }
 
+func testWorkshopManifestToleratesAuthoringQuirks() throws {
+    // Trailing commas, line/block comments, BOM, and capitalized types are
+    // common in hand-authored Wallpaper Engine project.json files.
+    let quirky = "\u{FEFF}"
+        + "{\n"
+        + "  // the entry point\n"
+        + "  \"type\": \"Web\",\n"
+        + "  \"file\": \"./pages/Home.HTML\",\n"
+        + "  \"title\": \"Quirky\",\n"
+        + "  \"preview\": \"preview.gif\",\n"
+        + "}"
+    let parsed = try WorkshopProjectManifest.parse(data: Data(quirky.utf8))
+    try expect(parsed.kind, equals: .web, "capitalized Web type parses")
+    try expect(parsed.file, equals: "./pages/Home.HTML", "file preserved verbatim")
+    try expect(parsed.title, equals: "Quirky", "title from commented manifest")
+
+    let blockComment = """
+    {
+      /* block
+         comment */
+      "type": "VIDEO",
+      "file": "clip.mp4",
+    }
+    """
+    let video = try WorkshopProjectManifest.parse(data: Data(blockComment.utf8))
+    try expect(video.kind, equals: .video, "VIDEO with block comment and trailing comma")
+
+    // Empty strings behave like absent fields.
+    let blank = #"{"type":"web","file":"  ","title":""}"#
+    let blankManifest = try WorkshopProjectManifest.parse(data: Data(blank.utf8))
+    try expect(blankManifest.file, equals: nil, "blank file is nil")
+    try expect(blankManifest.title, equals: nil, "blank title is nil")
+
+    // Truly malformed JSON still fails closed.
+    do {
+        _ = try WorkshopProjectManifest.parse(data: Data("{ type: web ".utf8))
+        throw TestFailure(message: "malformed JSON must not parse")
+    } catch is DecodingError {
+        // expected
+    }
+}
+
+func testWorkshopPlannerFallsBackWhenEntryDeclaredButMissing() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("wm-fallback-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    // Web: declared entry missing, index.html exists → import index.html.
+    let webDir = root.appendingPathComponent("web-stale", isDirectory: true)
+    try FileManager.default.createDirectory(at: webDir, withIntermediateDirectories: true)
+    try Data("<html></html>".utf8).write(to: webDir.appendingPathComponent("index.html"))
+    try Data(#"{"type":"web","file":"old-entry.html"}"#.utf8)
+        .write(to: webDir.appendingPathComponent("project.json"))
+    let webPlan = WorkshopImportPlanner.plan(directory: webDir)
+    guard case .webProject(_, let webEntry, _) = webPlan else {
+        throw TestFailure(message: "expected fallback web plan, got \(webPlan)")
+    }
+    try expect(webEntry, equals: "index.html", "web fallback prefers existing index.html")
+
+    // Web: no declared entry and no conventional name → first HTML in tree.
+    let nestedDir = root.appendingPathComponent("web-nested", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: nestedDir.appendingPathComponent("site", isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    try Data("<html></html>".utf8).write(to: nestedDir.appendingPathComponent("site/page.html"))
+    try Data(#"{"type":"web"}"#.utf8)
+        .write(to: nestedDir.appendingPathComponent("project.json"))
+    let nestedPlan = WorkshopImportPlanner.plan(directory: nestedDir)
+    guard case .webProject(_, let nestedEntry, _) = nestedPlan else {
+        throw TestFailure(message: "expected nested web plan, got \(nestedPlan)")
+    }
+    try expect(nestedEntry, equals: "site/page.html", "web fallback finds nested html")
+
+    // Case-mismatched declared entry still resolves on disk.
+    let caseDir = root.appendingPathComponent("web-case", isDirectory: true)
+    try FileManager.default.createDirectory(at: caseDir, withIntermediateDirectories: true)
+    try Data("<html></html>".utf8).write(to: caseDir.appendingPathComponent("index.html"))
+    try Data(#"{"type":"web","file":"INDEX.HTML"}"#.utf8)
+        .write(to: caseDir.appendingPathComponent("project.json"))
+    let casePlan = WorkshopImportPlanner.plan(directory: caseDir)
+    guard case .webProject(_, _, _) = casePlan else {
+        throw TestFailure(message: "case-mismatched entry should still import, got \(casePlan)")
+    }
+}
+
 func testWorkshopImportPlannerRoutesSupportedTypes() throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("wm-plan-\(UUID().uuidString)", isDirectory: true)
@@ -1252,7 +1339,8 @@ func testWorkshopImportPlannerRoutesSupportedTypes() throws {
         throw TestFailure(message: "expected application rejection, got \(appPlan)")
     }
 
-    // Missing entry file
+    // Declared entry missing: still reported as missing-on-disk (a video
+    // fallback must not mask a typo in `file`).
     let missingDir = root.appendingPathComponent("missing-item", isDirectory: true)
     try FileManager.default.createDirectory(at: missingDir, withIntermediateDirectories: true)
     try Data(#"{"type":"video","file":"gone.mp4"}"#.utf8)
@@ -1262,7 +1350,40 @@ func testWorkshopImportPlannerRoutesSupportedTypes() throws {
         throw TestFailure(message: "expected missing entry, got \(missingPlan)")
     }
 
-    // No project.json
+    // Declared entry missing but the project has another video: import the
+    // fallback so a stale `file` field does not reject a valid download.
+    let staleDir = root.appendingPathComponent("stale-file-item", isDirectory: true)
+    try FileManager.default.createDirectory(at: staleDir, withIntermediateDirectories: true)
+    try Data("fallback-video".utf8).write(to: staleDir.appendingPathComponent("actual.mp4"))
+    try Data(#"{"type":"video","file":"renamed.mp4"}"#.utf8)
+        .write(to: staleDir.appendingPathComponent("project.json"))
+    let stalePlan = WorkshopImportPlanner.plan(directory: staleDir)
+    guard case .video(let staleSource, _) = stalePlan else {
+        throw TestFailure(message: "expected fallback video plan, got \(stalePlan)")
+    }
+    try expect(staleSource.lastPathComponent, equals: "actual.mp4", "video fallback picks existing file")
+
+    // No project.json: infer from content — a lone video file imports.
+    let bareVideoDir = root.appendingPathComponent("bare-video-item", isDirectory: true)
+    try FileManager.default.createDirectory(at: bareVideoDir, withIntermediateDirectories: true)
+    try Data("bare-video".utf8).write(to: bareVideoDir.appendingPathComponent("movie.mp4"))
+    let bareVideoPlan = WorkshopImportPlanner.plan(directory: bareVideoDir)
+    guard case .video(let bareSource, _) = bareVideoPlan else {
+        throw TestFailure(message: "expected inferred video plan, got \(bareVideoPlan)")
+    }
+    try expect(bareSource.lastPathComponent, equals: "movie.mp4", "inferred video entry")
+
+    // No project.json but a web project with a conventional entry: import it.
+    let bareWebDir = root.appendingPathComponent("bare-web-item", isDirectory: true)
+    try FileManager.default.createDirectory(at: bareWebDir, withIntermediateDirectories: true)
+    try Data("<html></html>".utf8).write(to: bareWebDir.appendingPathComponent("index.html"))
+    let bareWebPlan = WorkshopImportPlanner.plan(directory: bareWebDir)
+    guard case .webProject(_, let bareEntry, _) = bareWebPlan else {
+        throw TestFailure(message: "expected inferred web plan, got \(bareWebPlan)")
+    }
+    try expect(bareEntry, equals: "index.html", "inferred web entry")
+
+    // Truly empty folder with no project.json remains rejected.
     let emptyDir = root.appendingPathComponent("empty-item", isDirectory: true)
     try FileManager.default.createDirectory(at: emptyDir, withIntermediateDirectories: true)
     let emptyPlan = WorkshopImportPlanner.plan(directory: emptyDir)
@@ -2211,6 +2332,8 @@ let tests: [(String, () throws -> Void)] = [
     ("maps workshop type tags and availability", testWorkshopMetadataTypeTagsAndAvailability),
     ("parses unavailable workshop response", testWorkshopMetadataUnavailableResponse),
     ("parses workshop project manifest", testWorkshopProjectManifestParsesVideoAndWeb),
+    ("tolerates workshop manifest authoring quirks", testWorkshopManifestToleratesAuthoringQuirks),
+    ("falls back when workshop entry is stale", testWorkshopPlannerFallsBackWhenEntryDeclaredButMissing),
     ("routes workshop import plans by type", testWorkshopImportPlannerRoutesSupportedTypes),
     ("hardens workshop entry paths", testWorkshopImportPlannerHandlesBackslashAndTraversalEntries),
     ("builds steamcmd command without password", testSteamCMDCommandBuildsLoginWithoutPassword),
