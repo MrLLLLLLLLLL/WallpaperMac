@@ -78,7 +78,16 @@ struct SteamWorkshopBrowseSheet: View {
                 .foregroundStyle(.tertiary)
         }
         .padding(20)
-        .frame(width: 760, height: 620)
+        // Resizable sheet: min/ideal sizes let the window grow with the
+        // content instead of clipping it at a fixed frame.
+        .frame(
+            minWidth: 700,
+            idealWidth: 860,
+            maxWidth: .infinity,
+            minHeight: 520,
+            idealHeight: 660,
+            maxHeight: .infinity
+        )
         .onAppear {
             guard !appeared else { return }
             appeared = true
@@ -283,7 +292,7 @@ struct SteamWorkshopBrowseSheet: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            .frame(maxWidth: .infinity, alignment: .center)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             .padding(.vertical, 40)
         } else if items.isEmpty && loadError == nil {
             emptyState
@@ -312,25 +321,33 @@ struct SteamWorkshopBrowseSheet: View {
                 .buttonStyle(.bordered)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .center)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         .padding(.vertical, 36)
     }
 
     private var gridAndPager: some View {
         VStack(spacing: 8) {
-            // LazyVGrid must own the scroll region: wrapping it in a
-            // ScrollView disables cell laziness and decodes every
-            // preview at once (visible as UI stutter).
-            LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 170), spacing: 12)],
-                spacing: 12
-            ) {
-                ForEach(items) { item in
-                    browseTile(item)
+            // ScrollView owns vertical scrolling; LazyVGrid inside it keeps
+            // cell laziness (only visible tiles decode their previews).
+            // The pager/action bar sits *outside* the scroll area so it is
+            // never clipped by a long result list.
+            ScrollView {
+                LazyVGrid(
+                    // Fixed five flexible columns: the default sheet width
+                    // shows exactly five tiles per row, each narrower than the
+                    // old adaptive layout; resizing the sheet scales the tiles
+                    // instead of changing the column count.
+                    columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 5),
+                    spacing: 10
+                ) {
+                    ForEach(items) { item in
+                        browseTile(item)
+                    }
                 }
+                .padding(.vertical, 4)
+                .frame(maxWidth: .infinity)
             }
-            .padding(.vertical, 4)
-            .frame(maxHeight: 380)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             HStack {
                 Button {
@@ -374,6 +391,7 @@ struct SteamWorkshopBrowseSheet: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func browseTile(_ item: WorkshopBrowseItem) -> some View {
