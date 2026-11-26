@@ -972,38 +972,31 @@ final class LibraryViewModel: ObservableObject {
         let worker = storeWorker
         let session = librarySessionID
         do {
-        let importResult: WallpaperImportResult = try await withCheckedThrowingContinuation { continuation in
-            Task { [weak self] in
-                guard let self else {
-                    continuation.resume(throwing: CancellationError())
-                    return
-                }
-                do {
-                    let result: WallpaperImportResult
-                    switch plan {
-                    case .video(let sourceURL, _):
-                        result = try await worker.importItems(
-                            at: [sourceURL],
-                            entryURL: nil,
-                            storageMode: .managedCopy
-                        )
-                    case .webProject(let directory, let entryFile, _):
-                        // Backslash entries come from Windows-authored
-                        // project.json; resolveEntry normalizes and contains.
-                        let entry = WorkshopImportPlanner.resolveEntry(entryFile, in: directory)
-                        result = try await worker.importItems(
-                            at: [directory],
-                            entryURL: entry,
-                            storageMode: .managedCopy
-                        )
-                    case .unsupported:
-                        throw WorkshopUnsupportedReason.unknownType(nil)
-                    }
-                    continuation.resume(returning: result)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
+        // If the user cancelled while SteamCMD was finishing, do not begin the
+        // library import; the existing catch cleans staging and rethrows.
+        try Task.checkCancellation()
+        // Await the importer directly so Task cancellation from the browse
+        // sheet propagates into file I/O; the previous continuation-wrapped
+        // Task could not be cancelled once the copy had started.
+        let importResult: WallpaperImportResult
+        switch plan {
+        case .video(let sourceURL, _):
+            importResult = try await worker.importItems(
+                at: [sourceURL],
+                entryURL: nil,
+                storageMode: .managedCopy
+            )
+        case .webProject(let directory, let entryFile, _):
+            // Backslash entries come from Windows-authored
+            // project.json; resolveEntry normalizes and contains.
+            let entry = WorkshopImportPlanner.resolveEntry(entryFile, in: directory)
+            importResult = try await worker.importItems(
+                at: [directory],
+                entryURL: entry,
+                storageMode: .managedCopy
+            )
+        case .unsupported:
+            throw WorkshopUnsupportedReason.unknownType(nil)
         }
 
         // Apply the workshop title when the importer fell back to a raw
@@ -1920,7 +1913,11 @@ final class LibraryViewModel: ObservableObject {
 }
 
 struct MainView: View {
-    @StateObject private var model = LibraryViewModel()
+    @ObservedObject var model: LibraryViewModel
+
+    init(model: LibraryViewModel) {
+        self.model = model
+    }
     @ObservedObject private var themeStore = ThemeStore.shared
     @AppStorage(SettingsKey.onboardingCompleted) private var onboardingCompleted = false
 
@@ -2042,9 +2039,6 @@ struct MainView: View {
         .onAppear { model.prepareLibrary() }
         .onReceive(NotificationCenter.default.publisher(for: .wallpaperMacShowDisplaysOverview)) { _ in
             model.destination = .displaysOverview
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .wallpaperMacShowSteamWorkshopBrowse)) { _ in
-            model.isSteamWorkshopImportPresented = true
         }
     }
 

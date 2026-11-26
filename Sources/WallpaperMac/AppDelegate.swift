@@ -109,6 +109,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         activateApplication()
     }
 
+    /// Shows the main window and opens the Workshop browse sheet through the
+    /// controller-owned model, avoiding any async notification race.
+    func showSteamWorkshopBrowse() {
+        showMainWindow()
+        mainWindowController?.presentSteamWorkshopBrowse()
+    }
+
     func showSettingsWindow() {
         if settingsWindowController == nil {
             settingsWindowController = SettingsWindowController()

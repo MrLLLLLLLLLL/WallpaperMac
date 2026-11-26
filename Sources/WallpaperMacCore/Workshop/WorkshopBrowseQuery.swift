@@ -54,8 +54,8 @@ public struct WorkshopBrowseQuery: Equatable, Sendable {
     /// Nil shows every rating.
     public var ageRating: WorkshopAgeRating?
     /// Types to exclude even when `kindFilter` is nil. Defaults to
-    /// Application (never importable on macOS) so the grid shows only
-    /// realistic wallpaper types unless the user asks for them.
+    /// Application and Scene (neither is importable on macOS) so the grid
+    /// shows only realistic wallpaper types unless the user asks for them.
     public var excludedKinds: Set<WorkshopKind>
 
     public init(
@@ -64,7 +64,7 @@ public struct WorkshopBrowseQuery: Equatable, Sendable {
         sort: WorkshopBrowseSort = .trending,
         page: Int = 1,
         ageRating: WorkshopAgeRating? = nil,
-        excludedKinds: Set<WorkshopKind> = [.application]
+        excludedKinds: Set<WorkshopKind> = [.application, .scene]
     ) {
         self.search = search
         self.kindFilter = kindFilter

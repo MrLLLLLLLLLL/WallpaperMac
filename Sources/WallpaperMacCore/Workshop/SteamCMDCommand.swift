@@ -411,7 +411,7 @@ public enum SteamCMDFailure: Error, Equatable, Sendable, LocalizedError {
         case .missingSteamGuardCode:
             return "Steam 要求 Steam Guard 验证码。请勾选“需要 Steam Guard 验证码”并填写当前验证码后重试。"
         case .sessionExpired:
-            return "Steam 登录会话已失效。请到 设置 → Steam 工坊 重新登录后再下载。"
+            return "Steam 登录会话已失效，请重新登录后重试。"
         case .unknown(let text):
             return "SteamCMD 错误：\(text)"
         }

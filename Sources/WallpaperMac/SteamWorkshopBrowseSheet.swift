@@ -1,9 +1,10 @@
 import SwiftUI
+import AppKit
 import WallpaperMacCore
 
 /// Browse the Wallpaper Engine Workshop with preview tiles, then download and
-/// import a selected video/web item. Opens the login sheet first when there
-/// is no Steam session.
+/// import a selected video/web item. Browsing is anonymous; the login sheet
+/// appears only when a download needs a Steam session.
 struct SteamWorkshopBrowseSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: LibraryViewModel
@@ -17,16 +18,23 @@ struct SteamWorkshopBrowseSheet: View {
     @State private var hasNext = false
     @State private var isLoading = false
     @State private var loadError: String?
-    @State private var needsLogin = false
-    /// Set when the login sheet finishes: success continues browsing;
-    /// cancel/close dismisses the browse sheet as well (no re-prompt loop).
+    @State private var isNetworkLoadError = false
+    @State private var showDownloadLogin = false
+    /// Set when the login sheet finishes: success continues the pending download;
+    /// cancel/close only dismisses the login sheet, leaving browse open.
     @State private var loginSheetCompleted = false
     @State private var loginSheetCancelled = false
+    @State private var pendingDownloadItem: WorkshopBrowseItem?
+    /// True when the current login presentation is retrying an expired session.
+    /// Recovery requires an explicit onLoggedIn success, never a stale isLoggedIn.
+    @State private var isSessionRecoveryLogin = false
     @State private var selected: WorkshopBrowseItem?
     @State private var downloadStatus: String?
     @State private var downloadFraction: Double?
     @State private var isDownloading = false
     @State private var downloadError: String?
+    @State private var downloadErrorIsSessionExpired = false
+    @State private var downloadTask: Task<Void, Never>?
     @State private var appeared = false
     @State private var searchDebounce: Task<Void, Never>?
 
@@ -61,10 +69,20 @@ struct SteamWorkshopBrowseSheet: View {
             }
 
             if let loadError {
-                Label(loadError, systemImage: "wifi.exclamationmark")
-                    .font(.callout)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 8) {
+                    Label(loadError, systemImage: "wifi.exclamationmark")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if isNetworkLoadError {
+                        Button(action: openNetworkSettings) {
+                            Label("打开网络设置", systemImage: "network")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("检查网络连接和代理配置")
+                    }
+                }
             }
 
             if isDownloading {
@@ -91,30 +109,44 @@ struct SteamWorkshopBrowseSheet: View {
         .onAppear {
             guard !appeared else { return }
             appeared = true
-            Task { await ensureLoginThenBrowse() }
+            // Browsing is anonymous; only downloading requires a Steam session.
+            reload()
         }
-        .sheet(isPresented: $needsLogin, onDismiss: {
+        .onDisappear {
+            // Closing the sheet during an active download must not leave an
+            // invisible SteamCMD job running.
+            cancelDownload()
+        }
+        .sheet(isPresented: $showDownloadLogin, onDismiss: {
             Task { @MainActor in
                 let succeeded = loginSheetCompleted
                 let cancelled = loginSheetCancelled
+                let wasRecovery = isSessionRecoveryLogin
                 loginSheetCompleted = false
                 loginSheetCancelled = false
-                let loggedIn = await loginService.isLoggedIn
-                switch SteamLoginGate.decide(
-                    isLoggedIn: loggedIn,
-                    sheetDismissed: true,
-                    loginSucceeded: succeeded,
-                    loginCancelled: cancelled
-                ) {
-                case .showLogin:
-                    // Never re-enter from onDismiss — that was the loop.
-                    break
-                case .continueBrowsing:
-                    if items.isEmpty && !isLoading {
-                        reload()
+                isSessionRecoveryLogin = false
+                if wasRecovery {
+                    // Session-expiry recovery: only an explicit login success
+                    // may retry. A stale isLoggedIn must not trigger it, and
+                    // cancel/orphaned dismissal keeps the error view visible.
+                    if succeeded, let item = pendingDownloadItem {
+                        pendingDownloadItem = nil
+                        startDownload(item)
                     }
-                case .closeBrowse:
-                    dismiss()
+                    return
+                }
+                let loggedIn = await loginService.isLoggedIn
+                if succeeded || loggedIn, let item = pendingDownloadItem {
+                    pendingDownloadItem = nil
+                    startDownload(item)
+                } else {
+                    // Cancel or failed login: keep the browse sheet open and
+                    // clear only the pending download.
+                    pendingDownloadItem = nil
+                    if cancelled {
+                        downloadStatus = nil
+                        downloadFraction = nil
+                    }
                 }
             }
         }) {
@@ -190,10 +222,10 @@ struct SteamWorkshopBrowseSheet: View {
                 Text("全部类型").tag(WorkshopKind?.none)
                 Text("视频").tag(WorkshopKind?.some(.video))
                 Text("网页").tag(WorkshopKind?.some(.web))
-                Text("场景").tag(WorkshopKind?.some(.scene))
+                Text("场景（暂不支持）").tag(WorkshopKind?.some(.scene))
             }
             .pickerStyle(.menu)
-            .frame(width: 110)
+            .frame(width: 150)
             .onChange(of: kindFilter) { _ in applyFilters() }
 
             Picker("分级", selection: $ageRating) {
@@ -479,7 +511,7 @@ struct SteamWorkshopBrowseSheet: View {
         switch kind {
         case .video: return "视频"
         case .web: return "网页"
-        case .scene: return "场景"
+        case .scene: return "场景（暂不支持）"
         case .application: return "应用"
         case .unknown: return "未知"
         }
@@ -517,13 +549,34 @@ struct SteamWorkshopBrowseSheet: View {
                     .font(.callout)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
-                Button("返回列表") {
-                    isDownloading = false
-                    self.downloadError = nil
-                    downloadStatus = nil
-                    downloadFraction = nil
+                HStack(spacing: 10) {
+                    if downloadErrorIsSessionExpired {
+                        Button("重新登录") {
+                            // Recovery requires explicit success; do not clear
+                            // the error until the login sheet confirms it.
+                            isSessionRecoveryLogin = true
+                            loginSheetCompleted = false
+                            loginSheetCancelled = false
+                            showDownloadLogin = true
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                    Button("返回列表") {
+                        resetDownloadUI()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
-                .buttonStyle(.bordered)
+            } else {
+                HStack {
+                    Spacer()
+                    Button("取消下载") {
+                        cancelDownload()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
             }
         }
         .padding(.vertical, 8)
@@ -599,31 +652,6 @@ struct SteamWorkshopBrowseSheet: View {
         reload()
     }
 
-    private func ensureLoginThenBrowse() async {
-        let loggedIn = await loginService.isLoggedIn
-        switch SteamLoginGate.decide(
-            isLoggedIn: loggedIn,
-            sheetDismissed: false,
-            loginSucceeded: false,
-            loginCancelled: false
-        ) {
-        case .showLogin:
-            // Only prompt once per gate; onDismiss owns the follow-up so a
-            // closed login sheet cannot re-enter this path and loop.
-            if !needsLogin {
-                loginSheetCompleted = false
-                loginSheetCancelled = false
-                needsLogin = true
-            }
-        case .continueBrowsing:
-            if items.isEmpty && !isLoading {
-                reload()
-            }
-        case .closeBrowse:
-            dismiss()
-        }
-    }
-
     private func reload() {
         let queryText = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         // Pasted link / bare id jumps straight to that item.
@@ -632,7 +660,7 @@ struct SteamWorkshopBrowseSheet: View {
             return
         }
         isLoading = true
-        loadError = nil
+        clearLoadError()
         items = []
         let query = currentQuery
         Task { @MainActor in
@@ -646,20 +674,42 @@ struct SteamWorkshopBrowseSheet: View {
                 if case .emptyPage = error {
                     items = []
                     hasNext = false
-                    loadError = nil
+                    clearLoadError()
                 } else {
-                    loadError = error.localizedDescription
+                    setLoadError(error)
                 }
             } catch {
                 isLoading = false
-                loadError = error.localizedDescription
+                setLoadError(error)
             }
         }
     }
 
+    private func clearLoadError() {
+        loadError = nil
+        isNetworkLoadError = false
+    }
+
+    private func setLoadError(_ error: Error) {
+        loadError = error.localizedDescription
+        isNetworkLoadError = false
+        if let browseError = error as? WorkshopBrowseClient.BrowseError,
+           case .network = browseError {
+            isNetworkLoadError = true
+        } else if let metadataError = error as? WorkshopMetadataError,
+                  case .network = metadataError {
+            isNetworkLoadError = true
+        }
+    }
+
+    private func openNetworkSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.Network-Settings.extension") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     private func loadSingle(_ id: String) {
         isLoading = true
-        loadError = nil
+        clearLoadError()
         items = []
         Task { @MainActor in
             do {
@@ -671,18 +721,39 @@ struct SteamWorkshopBrowseSheet: View {
                 isLoading = false
             } catch {
                 isLoading = false
-                loadError = error.localizedDescription
+                setLoadError(error)
             }
         }
     }
 
     private func download(_ item: WorkshopBrowseItem) {
+        // Prevent a second tap during the async session check from replacing
+        // the pending item or opening another login presentation.
+        guard pendingDownloadItem == nil, !isDownloading else { return }
+        pendingDownloadItem = item
+        selected = nil
+        isSessionRecoveryLogin = false
+        Task { @MainActor in
+            let loggedIn = await loginService.isLoggedIn
+            if loggedIn {
+                startDownload(item)
+            } else {
+                // Gate only the download; browsing stays open behind the sheet.
+                loginSheetCompleted = false
+                loginSheetCancelled = false
+                showDownloadLogin = true
+            }
+        }
+    }
+
+    private func startDownload(_ item: WorkshopBrowseItem) {
         isDownloading = true
         downloadError = nil
+        downloadErrorIsSessionExpired = false
         downloadStatus = "准备中…"
         downloadFraction = nil
-        selected = nil
-        Task { @MainActor in
+        pendingDownloadItem = item
+        downloadTask = Task { @MainActor in
             do {
                 let plan = try await model.downloadSteamWorkshopItem(
                     itemID: item.id,
@@ -691,12 +762,15 @@ struct SteamWorkshopBrowseSheet: View {
                     steamGuardCode: nil
                 ) { status, fraction in
                     Task { @MainActor in
+                        guard isDownloading else { return }
                         downloadStatus = status
                         if let fraction { downloadFraction = fraction }
                     }
                 }
                 isDownloading = false
                 downloadStatus = nil
+                downloadFraction = nil
+                pendingDownloadItem = nil
                 switch plan {
                 case .video, .webProject:
                     dismiss()
@@ -704,11 +778,41 @@ struct SteamWorkshopBrowseSheet: View {
                     downloadError = reason.userMessage
                     isDownloading = true // stay on progress panel to show error
                 }
+            } catch is CancellationError {
+                resetDownloadUI()
             } catch {
                 isDownloading = true
                 downloadError = error.localizedDescription
+                downloadErrorIsSessionExpired = isSessionExpiredError(error)
                 downloadStatus = nil
             }
         }
+    }
+
+    private func cancelDownload() {
+        downloadTask?.cancel()
+        downloadTask = nil
+    }
+
+    /// Restores the browse list after cancellation or "返回列表" without
+    /// touching the current query, filters, page, or loaded items.
+    private func resetDownloadUI() {
+        cancelDownload()
+        isDownloading = false
+        downloadError = nil
+        downloadErrorIsSessionExpired = false
+        downloadStatus = nil
+        downloadFraction = nil
+        pendingDownloadItem = nil
+        isSessionRecoveryLogin = false
+    }
+
+    private func isSessionExpiredError(_ error: Error) -> Bool {
+        if let failure = error as? SteamCMDFailure, failure == .sessionExpired {
+            return true
+        }
+        let message = error.localizedDescription.lowercased()
+        return message.contains("会话") || message.contains("登录已过期")
+            || message.contains("session") || message.contains("expired")
     }
 }

@@ -91,6 +91,7 @@ public actor WorkshopDownloadCoordinator {
         context: Context,
         onPhase: (@Sendable (Phase) -> Void)? = nil
     ) async throws -> WorkshopImportPlan {
+        try Task.checkCancellation()
         // itemID becomes a directory name; digits only, never traversal.
         guard itemID.allSatisfy({ $0.isASCII && $0.isNumber }),
               itemID.count >= 6, itemID.count <= 20 else {
@@ -104,6 +105,7 @@ public actor WorkshopDownloadCoordinator {
         let executable = try await ensureSteamCMD(context: context) { state in
             onPhase?(.installingSteamCMD(state))
         }
+        try Task.checkCancellation()
 
         // Fresh staging per item so a previous partial cannot masquerade.
         // Login cache lives in the persistent Steam home, NOT here — a failed
@@ -116,6 +118,15 @@ public actor WorkshopDownloadCoordinator {
         }
         try fileManager.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: context.steamHomeDirectory, withIntermediateDirectories: true)
+
+        // Every exit except a supported plan removes this item's staging.
+        // The flag flips only after planning succeeds and the plan is supported.
+        var preserveStaging = false
+        defer {
+            if !preserveStaging {
+                try? fileManager.removeItem(at: stagingRoot)
+            }
+        }
 
         let command = SteamCMDCommand(
             account: credentials.username,
@@ -138,37 +149,28 @@ public actor WorkshopDownloadCoordinator {
 
         onPhase?(.downloading(status: "启动 SteamCMD…", fraction: nil))
         let session = SteamCMDSession(executable: executable)
-        let result: SteamCMDSession.Result
-        do {
-            result = try await session.run(
-                command: command,
-                credentials: credentials,
-                environment: environment,
-                workingDirectory: stagingRoot
-            ) { progress in
-                onPhase?(.downloading(status: progress.status, fraction: progress.fraction))
-            }
-        } catch {
-            // Drop partial workshop bytes; the Steam home keeps any login.
-            try? fileManager.removeItem(at: stagingRoot)
-            throw error
+        let result = try await session.run(
+            command: command,
+            credentials: credentials,
+            environment: environment,
+            workingDirectory: stagingRoot
+        ) { progress in
+            onPhase?(.downloading(status: progress.status, fraction: progress.fraction))
         }
 
+        try Task.checkCancellation()
         if let failure = result.failure {
-            try? fileManager.removeItem(at: stagingRoot)
             throw failure
         }
         guard let downloaded = result.downloadedDirectory else {
-            try? fileManager.removeItem(at: stagingRoot)
             throw SteamCMDFailure.loggedInButDownloadFailed("未找到下载内容")
         }
 
         onPhase?(.planning)
         let plan = WorkshopImportPlanner.plan(directory: downloaded, fileManager: fileManager)
+        try Task.checkCancellation()
 
-        if !plan.isSupported {
-            try? fileManager.removeItem(at: stagingRoot)
-        }
+        preserveStaging = plan.isSupported
         return plan
     }
 

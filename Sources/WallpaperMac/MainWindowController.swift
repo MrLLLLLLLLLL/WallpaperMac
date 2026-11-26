@@ -5,6 +5,9 @@ import SwiftUI
 @MainActor
 final class MainWindowController: NSWindowController {
     private var themeCancellable: AnyCancellable?
+    /// Owned here so routes like Settings → Workshop can mutate presentation
+    /// state synchronously without racing a NotificationCenter subscriber.
+    private let model = LibraryViewModel()
 
     init() {
         let window = NSWindow(
@@ -21,7 +24,7 @@ final class MainWindowController: NSWindowController {
         window.center()
         let initialTheme = ThemeStore.shared.activeTheme
         window.appearance = NSAppearance(named: initialTheme.colorScheme == .light ? .aqua : .darkAqua)
-        window.contentView = NSHostingView(rootView: MainView())
+        window.contentView = NSHostingView(rootView: MainView(model: model))
         window.minSize = NSSize(width: MainWindowMetrics.minimumWindowWidth, height: 640)
         window.contentMinSize = NSSize(width: MainWindowMetrics.minimumWindowWidth, height: 640)
         super.init(window: window)
@@ -32,6 +35,13 @@ final class MainWindowController: NSWindowController {
             .sink { [weak self] theme in
                 self?.applyThemeAppearance(theme)
             }
+    }
+
+    /// Presents the Steam Workshop browse sheet through the owned model.
+    /// Works whether the window is visible, minimized, or being re-shown:
+    /// the Boolean binding reacts immediately or when SwiftUI next renders.
+    func presentSteamWorkshopBrowse() {
+        model.isSteamWorkshopImportPresented = true
     }
 
     override func showWindow(_ sender: Any?) {

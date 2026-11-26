@@ -207,6 +207,17 @@ struct QueueWorkspaceView: View {
                 .font(AppTheme.Typography.caption)
                 .foregroundStyle(AppTheme.Palette.textSecondary)
                 .multilineTextAlignment(.center)
+            // After the library index was rebuilt from thumbnails, queue
+            // memberships could not be restored automatically. Surface that
+            // possibility only when the library actually has wallpapers;
+            // brand-new empty libraries do not need this hint.
+            if !hasHiddenMembers(for: queue), !model.wallpapers.isEmpty {
+                Text("如果恢复壁纸库前队列中有内容，需要重新添加成员。")
+                    .font(AppTheme.Typography.micro)
+                    .foregroundStyle(AppTheme.Palette.textTertiary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if !hasHiddenMembers(for: queue) {
                 Button("添加壁纸") { isPickerPresented = true }
                     .buttonStyle(AccentActionButtonStyle())

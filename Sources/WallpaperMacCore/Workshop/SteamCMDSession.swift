@@ -97,7 +97,10 @@ public actor SteamCMDSession {
         let stderrBuffer = LineBuffer()
 
         do {
+            try Task.checkCancellation()
             try process.run()
+        } catch is CancellationError {
+            throw SessionError.cancelled
         } catch {
             throw SessionError.launchFailed(error.localizedDescription)
         }
@@ -280,6 +283,10 @@ public actor SteamCMDSession {
 
         let snapshot = parserRef.parser.current
         let tail = snapshot.lastStatus ?? stderrBuffer.tail
+
+        // Close the race where cancellation arrives just as SteamCMD exits;
+        // never import a result the user already cancelled.
+        try Task.checkCancellation()
 
         if snapshot.didSucceed {
             let dir = Self.locateDownloadedItem(

@@ -434,10 +434,7 @@ private struct SettingsView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     Button("打开创意工坊浏览…") {
-                        (NSApp.delegate as? AppDelegate)?.showMainWindow()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            NotificationCenter.default.post(name: .wallpaperMacShowSteamWorkshopBrowse, object: nil)
-                        }
+                        (NSApp.delegate as? AppDelegate)?.showSteamWorkshopBrowse()
                     }
                     .buttonStyle(QuietButtonStyle(compact: true))
                 }
@@ -1050,7 +1047,6 @@ extension Notification.Name {
     static let wallpaperMacSettingsChanged = Notification.Name("WallpaperMacSettingsChanged")
     static let wallpaperMacRequestLibraryMigration = Notification.Name("WallpaperMacRequestLibraryMigration")
     static let wallpaperMacShowDisplaysOverview = Notification.Name("WallpaperMacShowDisplaysOverview")
-    static let wallpaperMacShowSteamWorkshopBrowse = Notification.Name("WallpaperMacShowSteamWorkshopBrowse")
     /// Test-only: in-process click synthesis when window-server injection is blocked.
     static let wallpaperMacWebNavSelfTestClick = Notification.Name("WallpaperMacWebNavSelfTestClick")
     static let wallpaperMacWebNavSelfTestDistributed = Notification.Name("WallpaperMacWebNavSelfTestClick")

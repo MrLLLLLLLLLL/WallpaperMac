@@ -1,14 +1,15 @@
 import SwiftUI
 import WallpaperMacCore
 
-/// Steam account login form. Used both from Settings and as the gate sheet
-/// when the user opens Workshop browse without a session.
+/// Steam account login form. Used from Settings and when a Workshop download
+/// needs a session; browsing itself is anonymous.
 struct SteamLoginSheet: View {
     @Environment(\.dismiss) private var dismiss
-    /// Called after a successful login so the caller can continue (e.g. open browse).
+    /// Called after a successful login so the caller can continue (e.g. start
+    /// the pending Workshop download).
     var onLoggedIn: (() -> Void)?
     /// Called when the user cancels or closes the sheet without logging in.
-    /// Callers that gate another sheet (browse) should close that sheet too.
+    /// Callers keep the browse sheet open; only the pending action is dropped.
     var onCancelled: (() -> Void)?
 
     @State private var username = UserDefaults.standard.string(forKey: SteamSessionStore.usernameDefaultsKey) ?? ""

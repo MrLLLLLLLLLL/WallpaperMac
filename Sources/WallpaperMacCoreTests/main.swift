@@ -1972,13 +1972,16 @@ func testRenameUpdateKeepsOtherWallpapers() throws {
 func testWorkshopBrowseQueryBuildsSortAndRating() throws {
     let base = WorkshopBrowseQuery()
     try expect(base.kindTag, equals: nil, "no type filter by default")
-    try expect(base.excludedKindTags, equals: ["Application"], "hides Application by default")
+    try expect(base.excludedKindTags, equals: ["Application", "Scene"], "hides Application and Scene by default")
     try expect(base.sort, equals: .trending, "default sort trending")
 
     // Type filter pins the type and suppresses sibling exclusions.
     let video = WorkshopBrowseQuery(kindFilter: .video, sort: .topRated)
     try expect(video.kindTag, equals: "Video", "video tag")
     try expect(video.excludedKindTags, equals: [], "no exclusions when a type is pinned")
+    let scene = WorkshopBrowseQuery(kindFilter: .scene)
+    try expect(scene.kindTag, equals: "Scene", "Scene can still be explicitly requested")
+    try expect(scene.excludedKindTags, equals: [], "explicit Scene filter overrides default exclusions")
     let videoURL = WorkshopBrowseClient.browseURL(for: video)
     let videoString = videoURL.absoluteString
     try expect(videoString.contains("browsesort=toprated"), equals: true, "sort in URL")
@@ -2001,6 +2004,11 @@ func testWorkshopBrowseQueryBuildsSortAndRating() throws {
         ratedString.contains("excludedtags%5B%5D=Application") || ratedString.contains("excludedtags[]=Application"),
         equals: true,
         "Application excluded alongside rating"
+    )
+    try expect(
+        ratedString.contains("excludedtags%5B%5D=Scene") || ratedString.contains("excludedtags[]=Scene"),
+        equals: true,
+        "Scene excluded alongside rating"
     )
 
     // Page clamps to 1.
