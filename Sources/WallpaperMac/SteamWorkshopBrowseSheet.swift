@@ -106,6 +106,11 @@ struct SteamWorkshopBrowseSheet: View {
             idealHeight: 660,
             maxHeight: .infinity
         )
+        // NSWindow sheets are not user-resizable by default: the SwiftUI frame
+        // above only proposes a size, it never adds .resizable to the sheet's
+        // styleMask. This hook injects it once the backing window exists so
+        // drag-resize and AX sizing both work.
+        .background(SheetResizableInjector())
         .onAppear {
             guard !appeared else { return }
             appeared = true
@@ -815,4 +820,23 @@ struct SteamWorkshopBrowseSheet: View {
         return message.contains("会话") || message.contains("登录已过期")
             || message.contains("session") || message.contains("expired")
     }
+}
+
+/// Adds `.resizable` to the sheet's backing NSWindow once, so users can
+/// drag-resize the browse sheet. SwiftUI's `.frame(minWidth:maxWidth:)`
+/// only proposes a size; it never changes the window style mask, which is
+/// why the sheet stayed fixed at 700×660 despite the flexible frame.
+private struct SheetResizableInjector: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        // The window is assigned after makeNSView returns.
+        DispatchQueue.main.async {
+            guard let window = view.window, !window.styleMask.contains(.resizable) else { return }
+            window.styleMask.insert(.resizable)
+            window.contentMinSize = NSSize(width: 700, height: 520)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
